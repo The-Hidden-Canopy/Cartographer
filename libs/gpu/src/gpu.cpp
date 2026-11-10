@@ -154,7 +154,7 @@ core::Result<void> validate(const ShaderDesc& descriptor) {
     return core::Result<void>::success();
 }
 
-core::Result<void> validate(const PipelineDesc& descriptor) {
+static core::Result<void> validate_pipeline(const PipelineDesc& descriptor, bool compute) {
     if (descriptor.debug_name.empty() || descriptor.shaders.empty()) {
         return core::Result<void>::failure(invalid("pipeline name and shader stages are required"));
     }
@@ -163,16 +163,33 @@ core::Result<void> validate(const PipelineDesc& descriptor) {
             return core::Result<void>::failure(invalid("pipeline contains an invalid shader handle"));
         }
     }
-    if (descriptor.sample_count == 0U || descriptor.color_format == Format::unknown) {
-        return core::Result<void>::failure(invalid("pipeline sample count and color format are required"));
+    if (compute) {
+        // Attachment formats, topology and cull state have no meaning for a
+        // compute PSO (including legacy default depth/blend flags). Do not invent
+        // an attachment to pass graphics validation.
+        if (descriptor.sample_count != 1U || descriptor.vertex_stride_bytes != 0U ||
+            !descriptor.vertex_attributes.empty()) {
+            return core::Result<void>::failure(validation(
+                "compute pipelines require one sample and no vertex-input layout"));
+        }
+    } else {
+        if (descriptor.sample_count == 0U || descriptor.color_format == Format::unknown ||
+            is_depth_format(descriptor.color_format)) {
+            return core::Result<void>::failure(invalid(
+                "graphics pipeline sample count and non-depth color format are required"));
+        }
+        if ((descriptor.depth_test || descriptor.depth_write) &&
+            !is_depth_format(descriptor.depth_format)) {
+            return core::Result<void>::failure(validation(
+                "depth-tested or depth-writing pipelines require an explicit depth format"));
+        }
     }
-    if (descriptor.depth_test && !is_depth_format(descriptor.depth_format)) {
-        return core::Result<void>::failure(
-            validation("depth-tested pipelines require an explicit depth format"));
-    }
+    const auto allowed_stages = static_cast<std::uint32_t>(compute ? ShaderStage::compute :
+        (ShaderStage::vertex | ShaderStage::fragment));
     std::set<std::pair<std::uint32_t, std::uint32_t>> bindings;
     for (const auto& binding : descriptor.descriptor_bindings) {
         if (binding.stages == ShaderStage::none ||
+            (static_cast<std::uint32_t>(binding.stages) & ~allowed_stages) != 0U ||
             !bindings.emplace(binding.set, binding.binding).second) {
             return core::Result<void>::failure(
                 validation("pipeline descriptor bindings must be unique and staged"));
@@ -219,6 +236,34 @@ core::Result<void> validate(const PipelineDesc& descriptor) {
             validation("a declared vertex stride requires explicit vertex attributes"));
     }
     return core::Result<void>::success();
+}
+
+core::Result<void> validate(const PipelineDesc& descriptor) {
+    return validate_pipeline(descriptor, false);
+}
+
+core::Result<void> validate(
+    const PipelineDesc& descriptor, std::span<const ShaderStage> resolved_shader_stages) {
+    if (resolved_shader_stages.empty() ||
+        resolved_shader_stages.size() != descriptor.shaders.size()) {
+        return core::Result<void>::failure(validation(
+            "pipeline requires resolved stage metadata for every shader handle"));
+    }
+    ShaderStage stages = ShaderStage::none;
+    for (const auto stage : resolved_shader_stages) {
+        if ((stage != ShaderStage::vertex && stage != ShaderStage::fragment &&
+             stage != ShaderStage::compute) || has_stage(stages, stage)) {
+            return core::Result<void>::failure(validation(
+                "pipeline shader stages must be single, supported and unique"));
+        }
+        stages = stages | stage;
+    }
+    const bool compute = stages == ShaderStage::compute;
+    if (!compute && stages != (ShaderStage::vertex | ShaderStage::fragment)) {
+        return core::Result<void>::failure(validation(
+            "pipeline must contain one compute shader or a vertex/fragment graphics pair"));
+    }
+    return validate_pipeline(descriptor, compute);
 }
 
 core::Result<void> validate(const DeviceCapabilities& capabilities) {

@@ -6,6 +6,7 @@
 #include <carto/core/result.hpp>
 #include <carto/core/revision.hpp>
 #include <carto/scene/scene.hpp>
+#include <carto/render/material.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -37,10 +38,28 @@ struct AuthoredCamera {
     bool active_for_review = false;
     core::Revision revision{};
 
+    // Camera display intent. Scene radiance remains linear and unexposed;
+    // apply this once after lighting, immediately before display encoding.
+    double exposure_ev = 0.0;
+    render::ToneMapMode tone_mode = render::ToneMapMode::aces_fitted;
+
     [[nodiscard]] core::Result<void> validate() const;
 };
 
 enum class AuthoredLightKind : std::uint8_t { directional, point, spot, area };
+
+// Bounded, embedded linear-radiance source, not an external image/decode
+// receipt. Full sphere: +Y up, longitude atan2(z,x), seam at -X; top row +Y.
+// Values are unexposed. Display exposure remains camera-owned.
+struct AuthoredEnvironment {
+    std::string identity;
+    std::uint32_t width = 0, height = 0;
+    std::vector<core::Vec3d> linear_radiance;
+    double rotation_radians = 0, intensity = 1; // right-handed rotation about +Y
+    bool enabled = true;
+    core::Revision revision{1};
+    [[nodiscard]] core::Result<void> validate() const;
+};
 enum class LightNormalState : std::uint8_t { steady, switchable, intermittent };
 enum class LightFailureState : std::uint8_t { none, dark, intermittent };
 
@@ -167,15 +186,20 @@ read_reference_image_source_bytes(
     const assets::ProjectAssetRegistry& registry);
 
 // Durable source intent only. Preview buffers, renderer handles, evaluated
-// exposure, switch state, and runtime light simulation are derived/external.
+// radiance, switch state, and runtime light simulation are derived/external.
 class PresentationCatalog final {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 3U;
+    static constexpr std::uint32_t kSchemaVersion = 5U;
     static constexpr std::size_t kMaxSerializedBytes = 8U * 1024U * 1024U;
     static constexpr std::size_t kMaxRecords = 4'096U;
 
-    [[nodiscard]] core::Result<void> insert_camera(AuthoredCamera camera);
-    [[nodiscard]] core::Result<void> insert_light(AuthoredLight light);
+  [[nodiscard]] core::Result<void> insert_camera(AuthoredCamera camera);
+  [[nodiscard]] core::Result<void> replace_camera(AuthoredCamera camera);
+  [[nodiscard]] core::Result<void> insert_light(AuthoredLight light);
+  [[nodiscard]] core::Result<void> set_environment(std::optional<AuthoredEnvironment> source);
+  [[nodiscard]] const std::optional<AuthoredEnvironment> &environment() const noexcept {
+      return environment_;
+  }
     [[nodiscard]] core::Result<void> insert_reference_plane(ReferenceImagePlane plane);
     [[nodiscard]] const std::map<scene::ObjectId, AuthoredCamera>& cameras() const noexcept {
         return cameras_;
@@ -186,7 +210,7 @@ public:
     [[nodiscard]] const std::map<std::string, ReferenceImagePlane>&
     reference_planes() const noexcept { return reference_planes_; }
     [[nodiscard]] bool empty() const noexcept {
-        return cameras_.empty() && lights_.empty() && reference_planes_.empty();
+        return cameras_.empty() && lights_.empty() && reference_planes_.empty() && !environment_;
     }
     [[nodiscard]] core::Result<void> validate() const;
     [[nodiscard]] std::string serialize() const;
@@ -194,9 +218,10 @@ public:
     [[nodiscard]] static core::Result<PresentationCatalog> deserialize(std::string_view text);
 
 private:
-    std::map<scene::ObjectId, AuthoredCamera> cameras_;
-    std::map<scene::ObjectId, AuthoredLight> lights_;
-    std::map<std::string, ReferenceImagePlane> reference_planes_;
+  std::optional<AuthoredEnvironment> environment_;
+  std::map<scene::ObjectId, AuthoredCamera> cameras_;
+  std::map<scene::ObjectId, AuthoredLight> lights_;
+  std::map<std::string, ReferenceImagePlane> reference_planes_;
 };
 
 } // namespace carto::project

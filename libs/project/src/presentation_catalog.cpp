@@ -135,7 +135,9 @@ core::Result<void> AuthoredCamera::validate() const {
         !std::isfinite(far_plane) || vertical_fov_radians <= 0.01 ||
         vertical_fov_radians >= kPi - 0.01 || orthographic_height <= 0.0 ||
         orthographic_height > kMaxSourceValue || near_plane <= 0.0 ||
-        far_plane <= near_plane || far_plane > kMaxSourceValue) {
+        far_plane <= near_plane || far_plane > kMaxSourceValue ||
+        !std::isfinite(exposure_ev) || std::abs(exposure_ev) > 32.0 ||
+        static_cast<unsigned>(tone_mode) > static_cast<unsigned>(render::ToneMapMode::linear_diagnostic)) {
         return core::Result<void>::failure(invalid(
             "authored camera identity, projection, range, or revision is invalid"));
     }
@@ -486,6 +488,20 @@ core::Result<void> PresentationCatalog::insert_camera(AuthoredCamera camera) {
     return core::Result<void>::success();
 }
 
+core::Result<void> PresentationCatalog::replace_camera(AuthoredCamera camera) {
+    if (auto result = camera.validate(); !result) return result;
+    const auto existing = cameras_.find(camera.object);
+    if (existing == cameras_.end() || camera.identity != existing->second.identity ||
+        camera.revision != existing->second.revision.next())
+        return core::Result<void>::failure(invalid("camera replacement requires an existing identity and newer revision"));
+    // Validate the whole candidate so active-camera uniqueness is failure-atomic.
+    auto candidate = *this;
+    candidate.cameras_.at(camera.object) = std::move(camera);
+    if (auto result = candidate.validate(); !result) return result;
+    *this = std::move(candidate);
+    return core::Result<void>::success();
+}
+
 core::Result<void> PresentationCatalog::insert_light(AuthoredLight light) {
     if (auto result = light.validate(); !result) return result;
     if (lights_.size() >= kMaxRecords) {
@@ -495,6 +511,28 @@ core::Result<void> PresentationCatalog::insert_light(AuthoredLight light) {
     const auto [iterator, inserted] = lights_.emplace(identity, std::move(light));
     static_cast<void>(iterator);
     if (!inserted) return core::Result<void>::failure(invalid("light object identity is duplicated"));
+    return core::Result<void>::success();
+}
+
+core::Result<void> AuthoredEnvironment::validate() const {
+    if (!safe_identifier(identity, 128) || revision == core::Revision{} || height < 2 ||
+        height > 64 || width != height * 2 ||
+        linear_radiance.size() != std::size_t(width) * height || !std::isfinite(rotation_radians) ||
+        std::abs(rotation_radians) > 1e6 || !std::isfinite(intensity) || intensity < 0 ||
+        intensity > 1e4)
+        return core::Result<void>::failure(
+            invalid("authored environment source exceeds its bounds"));
+    for (const auto c : linear_radiance)
+        if (!c.finite() || c.x < 0 || c.y < 0 || c.z < 0 || c.x > 1e6 || c.y > 1e6 || c.z > 1e6)
+            return core::Result<void>::failure(
+                invalid("environment radiance must be finite, nonnegative linear HDR"));
+    return core::Result<void>::success();
+}
+core::Result<void> PresentationCatalog::set_environment(std::optional<AuthoredEnvironment> source) {
+    if (source)
+        if (auto valid = source->validate(); !valid)
+            return valid;
+    environment_ = std::move(source);
     return core::Result<void>::success();
 }
 
@@ -514,6 +552,9 @@ core::Result<void> PresentationCatalog::insert_reference_plane(
 }
 
 core::Result<void> PresentationCatalog::validate() const {
+    if (environment_)
+        if (auto valid = environment_->validate(); !valid)
+            return valid;
     if (cameras_.size() > kMaxRecords || lights_.size() > kMaxRecords ||
         reference_planes_.size() > kMaxRecords) {
         return core::Result<void>::failure(validation(
@@ -559,6 +600,10 @@ core::Result<void> PresentationCatalog::validate() const {
         if (mask != 0b111U) return core::Result<void>::failure(validation(
             "reference-image view set requires exactly one front, side, and top plane"));
     }
+    if (serialize().size() > kMaxSerializedBytes) {
+        return core::Result<void>::failure(validation(
+            "presentation catalog exceeds its serialized size bound"));
+    }
     return core::Result<void>::success();
 }
 
@@ -577,7 +622,8 @@ std::string PresentationCatalog::serialize() const {
             << camera.vertical_fov_radians << ' ' << camera.orthographic_height << ' '
             << camera.near_plane << ' ' << camera.far_plane << ' '
             << std::quoted(camera.identity) << ' ' << std::quoted(camera.bookmark_identity)
-            << ' ' << std::quoted(camera.reference_image_identity) << '\n';
+            << ' ' << std::quoted(camera.reference_image_identity) << ' '
+            << camera.exposure_ev << ' ' << static_cast<unsigned>(camera.tone_mode) << '\n';
     }
     out << "LIGHTS " << lights_.size() << '\n';
     for (const auto& [identity, light] : lights_) {
@@ -623,6 +669,15 @@ std::string PresentationCatalog::serialize() const {
             << std::quoted(plane.source_locator) << ' '
             << std::quoted(plane.view_set_identity) << '\n';
     }
+    out << "ENVIRONMENT " << (environment_ ? 1 : 0) << '\n';
+    if (environment_) {
+        const auto &e = *environment_;
+        out << "ENVIRONMENT_SOURCE " << std::quoted(e.identity) << ' ' << e.revision.value() << ' '
+            << e.width << ' ' << e.height << ' ' << e.rotation_radians << ' ' << e.intensity << ' '
+            << e.enabled << '\n';
+        for (const auto c : e.linear_radiance)
+            out << "RADIANCE " << c.x << ' ' << c.y << ' ' << c.z << '\n';
+    }
     out << "END\n";
     return out.str();
 }
@@ -639,11 +694,12 @@ core::Result<PresentationCatalog> PresentationCatalog::deserialize(std::string_v
         return core::Result<PresentationCatalog>::failure(invalid(
             "presentation catalog is empty or exceeds its serialized size bound"));
     }
+    auto parse = [&](bool main_v3) -> core::Result<PresentationCatalog> {
     std::istringstream input{std::string(text)};
     input.imbue(std::locale::classic());
     std::uint32_t version = 0U;
     if (!expect(input, kMagic) || !read_unsigned(input, version) ||
-        (version != 1U && version != 2U && version != kSchemaVersion)) {
+        (version < 1U || version > kSchemaVersion)) {
         return core::Result<PresentationCatalog>::failure({
             core::ErrorCode::version_mismatch, "presentation catalog version is unsupported"});
     }
@@ -669,6 +725,13 @@ core::Result<PresentationCatalog> PresentationCatalog::deserialize(std::string_v
               std::quoted(camera.bookmark_identity) >> std::quoted(camera.reference_image_identity))) {
             return core::Result<PresentationCatalog>::failure(validation(
                 "presentation camera record is malformed"));
+        }
+        if (version >= 4U || (version == 3U && !main_v3)) {
+            unsigned tone = 0U;
+            if (!(input >> camera.exposure_ev) || !read_enum(input, 2U, tone))
+                return core::Result<PresentationCatalog>::failure(validation(
+                    "presentation camera display record is malformed"));
+            camera.tone_mode = static_cast<render::ToneMapMode>(tone);
         }
         camera.object = scene::ObjectId{object};
         camera.revision = core::Revision{revision};
@@ -753,7 +816,8 @@ core::Result<PresentationCatalog> PresentationCatalog::deserialize(std::string_v
                   plane.up.x >> plane.up.y >> plane.up.z >> plane.width_meters >>
                   plane.opacity) ||
                 !read_bool(input, visible) || !read_bool(input, locked) ||
-                (version >= 3U && !read_bool(input, camera_local_placement)) ||
+                ((version >= 5U || (version == 3U && main_v3)) &&
+                 !read_bool(input, camera_local_placement)) ||
                 !read_unsigned(input, camera_object) || !read_bool(input, has_calibration) ||
                 !(input >> first_x >> first_y >> second_x >> second_y >> known_distance >>
                   encoded_digest >> std::quoted(plane.identity) >>
@@ -786,6 +850,31 @@ core::Result<PresentationCatalog> PresentationCatalog::deserialize(std::string_v
             }
         }
     }
+    if (version >= 4) {
+        bool present = false;
+        if (!expect(input, "ENVIRONMENT") || !read_bool(input, present))
+            return core::Result<PresentationCatalog>::failure(
+                validation("environment presence record is missing"));
+        if (present) {
+            AuthoredEnvironment e;
+            std::uint64_t revision = 0;
+            if (!expect(input, "ENVIRONMENT_SOURCE") || !(input >> std::quoted(e.identity)) ||
+                !read_unsigned(input, revision) || !read_unsigned(input, e.width) ||
+                !read_unsigned(input, e.height) || !(input >> e.rotation_radians >> e.intensity) ||
+                !read_bool(input, e.enabled) || e.height < 2 || e.height > 64 ||
+                e.width != 2 * e.height)
+                return core::Result<PresentationCatalog>::failure(
+                    validation("environment source record is invalid"));
+            e.revision = core::Revision{revision};
+            e.linear_radiance.resize(std::size_t(e.width) * e.height);
+            for (auto &c : e.linear_radiance)
+                if (!expect(input, "RADIANCE") || !(input >> c.x >> c.y >> c.z))
+                    return core::Result<PresentationCatalog>::failure(
+                        validation("environment pixel record is invalid"));
+            if (auto added = catalog.set_environment(std::move(e)); !added)
+                return core::Result<PresentationCatalog>::failure(added.error());
+        }
+    }
     if (!expect(input, "END")) return core::Result<PresentationCatalog>::failure(validation(
         "presentation catalog terminal record is missing"));
     std::string trailing;
@@ -795,6 +884,27 @@ core::Result<PresentationCatalog> PresentationCatalog::deserialize(std::string_v
         return core::Result<PresentationCatalog>::failure(result.error());
     }
     return core::Result<PresentationCatalog>::success(std::move(catalog));
+    };
+    // Version 3 exists in two incompatible histories. Parse each complete
+    // grammar and accept only a unique interpretation (or identical results).
+    std::istringstream header{std::string(text)};
+    std::uint32_t version = 0U;
+    if (!expect(header, kMagic) || !read_unsigned(header, version))
+        return core::Result<PresentationCatalog>::failure({
+            core::ErrorCode::version_mismatch, "presentation catalog version is unsupported"});
+    auto main_layout = parse(true);
+    if (version != 3U) return main_layout;
+    auto realism_layout = parse(false);
+    if (main_layout && realism_layout) {
+        if (main_layout.value().serialize() != realism_layout.value().serialize())
+            return core::Result<PresentationCatalog>::failure({
+                core::ErrorCode::version_mismatch, "ambiguous presentation catalog v3 layout"});
+        return main_layout;
+    }
+    if (main_layout) return main_layout;
+    if (realism_layout) return realism_layout;
+    return core::Result<PresentationCatalog>::failure({
+        core::ErrorCode::version_mismatch, "invalid or mixed presentation catalog v3 layout"});
 }
 
 } // namespace carto::project

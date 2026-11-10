@@ -235,6 +235,56 @@ public:
                 std::clamp(position.y, minimum_y, maximum_y)};
     }
 
+    // Screen-space magnetic edges for individual detached tools/viewports.
+    // Uses only this ImGui context's windows, never another application's HWND.
+    [[nodiscard]] static ImVec2 detached_snap_position(
+        const ImGuiViewport& moving, const ImGuiPlatformIO& platform) noexcept {
+        ImVec2 result=moving.Pos;
+        if(!std::isfinite(result.x)||!std::isfinite(result.y)||moving.Size.x<=0||moving.Size.y<=0)return result;
+        const float dpi=std::isfinite(moving.DpiScale)&&moving.DpiScale>0?moving.DpiScale:1;
+        const float threshold=12*dpi,gap=8*dpi;
+        float best_x=threshold+1,best_y=threshold+1;
+        const auto x=[&](float value){const float d=std::abs(value-moving.Pos.x);if(d<=threshold&&d<best_x){best_x=d;result.x=value;}};
+        const auto y=[&](float value){const float d=std::abs(value-moving.Pos.y);if(d<=threshold&&d<best_y){best_y=d;result.y=value;}};
+        for(const auto& monitor:platform.Monitors) {
+            const float cx=moving.Pos.x+moving.Size.x*.5F,cy=moving.Pos.y+moving.Size.y*.5F;
+            if(cx>=monitor.WorkPos.x&&cx<=monitor.WorkPos.x+monitor.WorkSize.x&&cy>=monitor.WorkPos.y&&cy<=monitor.WorkPos.y+monitor.WorkSize.y) {
+                x(monitor.WorkPos.x);x(monitor.WorkPos.x+monitor.WorkSize.x-moving.Size.x);
+                y(monitor.WorkPos.y);y(monitor.WorkPos.y+monitor.WorkSize.y-moving.Size.y);
+            }
+        }
+        for(const auto* other:platform.Viewports) {
+            if(!other||other->ID==moving.ID||!other->PlatformHandle||other->Size.x<=0||other->Size.y<=0)continue;
+            const bool overlap_y=std::min(moving.Pos.y+moving.Size.y,other->Pos.y+other->Size.y)-std::max(moving.Pos.y,other->Pos.y)>8*dpi;
+            const bool overlap_x=std::min(moving.Pos.x+moving.Size.x,other->Pos.x+other->Size.x)-std::max(moving.Pos.x,other->Pos.x)>8*dpi;
+            if(overlap_y){x(other->Pos.x-moving.Size.x-gap);x(other->Pos.x+other->Size.x+gap);}
+            if(overlap_x){y(other->Pos.y-moving.Size.y-gap);y(other->Pos.y+other->Size.y+gap);}
+        }
+        return result;
+    }
+    [[nodiscard]] static bool settle_detached_window(ImGuiID id) noexcept {
+        if(!platform_windows_enabled())return false;
+        auto& platform=ImGui::GetPlatformIO();const auto* main=ImGui::GetMainViewport();
+        if(!main||id==main->ID||!platform.Platform_SetWindowPos)return false;
+        for(auto* viewport:platform.Viewports)if(viewport&&viewport->ID==id&&viewport->PlatformHandle) {
+            const auto target=detached_snap_position(*viewport,platform);
+            if(target.x==viewport->Pos.x&&target.y==viewport->Pos.y)return false;
+            viewport->Pos=target;platform.Platform_SetWindowPos(viewport,target);return true;
+        }
+        return false;
+    }
+    void finish_platform_window_drag() noexcept {
+        const auto& io=ImGui::GetIO();
+        if(!platform_windows_enabled()||io.AppFocusLost||io.KeyAlt){dragged_native_window_=0;return;}
+        const auto* moving=ImGui::GetCurrentContext()->MovingWindow;
+        if(io.MouseDown[0]) {
+            if(moving&&moving->Viewport&&moving->Viewport->ID!=ImGui::GetMainViewport()->ID)
+                dragged_native_window_=moving->Viewport->ID;
+            return;
+        }
+        if(dragged_native_window_){static_cast<void>(settle_detached_window(dragged_native_window_));dragged_native_window_=0;}
+    }
+
     static void recover_offscreen_platform_windows() noexcept {
         ImGuiIO& io = ImGui::GetIO();
         if ((io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) == 0) return;
@@ -372,6 +422,7 @@ private:
     bool rebuild_{false};
     bool focus_mode_{false};
     WorkspaceArrangement arrangement_{WorkspaceArrangement::studio};
+    ImGuiID dragged_native_window_{0};
 };
 
 } // namespace carto::studio

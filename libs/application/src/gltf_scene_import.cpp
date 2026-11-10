@@ -69,7 +69,8 @@ core::Result<DispatchReceipt> ApplicationSession::import_gltf_scene(
                             assets::BlobStoreLimits{128ULL * 1024ULL * 1024ULL, 256U});
     auto bytes = store.read(action.source_digest);
     if (!bytes) return failure(bytes.error().with_context("glTF source blob"));
-    auto imported = io::import_gltf_scene(bytes.value());
+    auto imported = io::import_gltf_scene(bytes.value(),
+        {.allow_default_material_projection = action.allow_default_material_projection});
     if (!imported) return failure(imported.error().with_context("glTF scene import"));
     if (imported.value().materials.artifact_digest != action.source_digest) {
         return refuse(core::ErrorCode::stale_data, "decoded glTF digest differs from staged source");
@@ -173,7 +174,8 @@ core::Result<DispatchReceipt> ApplicationSession::import_gltf_scene(
             }
         }
         material_ids.emplace(old_id, record.id);
-        products.push_back({Product::material, old_id, record.id});
+        if (imported.value().projected_default_material != old_id)
+            products.push_back({Product::material, old_id, record.id});
         if (auto added = catalog.insert_material(std::move(record)); !added)
             return failure(added.error().with_context("glTF material staging"));
     }
@@ -200,7 +202,18 @@ core::Result<DispatchReceipt> ApplicationSession::import_gltf_scene(
     source.kind = assets::SourceAssetKind::other;
     source.source_digest = action.source_digest;
     source.importer_identity = "carto.import.gltf-scene";
+    source.importer_version = imported.value().projected_default_material ? 2U : 1U;
     source.artifact_identity = "gltf.scene." + action.source_identity;
+    const auto material_digest = source_catalog.canonical_digest();
+    if (!material_digest) return failure(material_digest.error().with_context("glTF material lineage"));
+    // Until domain-specific source hashing is available, geometry and hierarchy
+    // both conservatively bind the entire captured source rather than implying
+    // independent change detection.
+    source.domain_digests = {
+        {assets::SourceAssetDomain::geometry, source.source_digest},
+        {assets::SourceAssetDomain::hierarchy, source.source_digest},
+        {assets::SourceAssetDomain::material, material_digest.value()},
+    };
     source.document_products = std::move(products);
     source.artifact_digest = assets::source_document_product_digest(
         source.source_digest, source.document_products);
@@ -216,7 +229,9 @@ core::Result<DispatchReceipt> ApplicationSession::import_gltf_scene(
     auto admitted = execute_command(std::make_unique<editor::ImportGltfSceneCommand>(
         admission, document_, std::move(meshes), std::move(nodes), std::move(catalog), std::move(source),
         store.root()),
-        "Import glTF Scene: " + action.justification);
+        std::string(imported.value().projected_default_material
+            ? "Import glTF Scene (two-sided default projection): " : "Import glTF Scene: ") +
+            action.justification);
     if (admitted) {
         for (const auto& warning : imported.value().warnings) {
             admitted.value().warnings.emplace_back(core::ErrorCode::unsupported, warning);

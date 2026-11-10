@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -319,7 +320,13 @@ struct DeviceCapabilities {
 [[nodiscard]] core::Result<void> validate(const TextureDesc& descriptor);
 [[nodiscard]] core::Result<void> validate(const SamplerDesc& descriptor);
 [[nodiscard]] core::Result<void> validate(const ShaderDesc& descriptor);
+// Without resolved shader metadata, validate conservatively as graphics.
 [[nodiscard]] core::Result<void> validate(const PipelineDesc& descriptor);
+// Backends must resolve opaque shader handles in their own registry and supply
+// one single stage per handle. Compute ignores attachment/depth/blend state
+// and has no vertex input; graphics retains explicit color/depth/layout checks.
+[[nodiscard]] core::Result<void> validate(
+    const PipelineDesc& descriptor, std::span<const ShaderStage> resolved_shader_stages);
 [[nodiscard]] core::Result<void> validate(const DeviceCapabilities& capabilities);
 
 using BufferRegistry = Registry<BufferTag, BufferDesc>;

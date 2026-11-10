@@ -1,4 +1,5 @@
 #include <carto/assets/blob_store.hpp>
+#include <carto/core/filesystem.hpp>
 
 #include <algorithm>
 #include <array>
@@ -247,6 +248,11 @@ std::filesystem::path BlobStore::path_for(const Sha256Digest& digest) const {
     return root_ / "sha256" / name.substr(0U, 2U) / name.substr(2U, 2U) / name;
 }
 
+static std::filesystem::path blob_path(const std::filesystem::path& root, const Sha256Digest& digest) {
+    const auto name = digest.hex();
+    return root / "sha256" / name.substr(0U, 2U) / name.substr(2U, 2U) / name;
+}
+
 core::Result<BlobRef> BlobStore::put(
     std::string_view bytes,
     std::string media_type) {
@@ -265,16 +271,18 @@ core::Result<BlobRef> BlobStore::put(
         return core::Result<BlobRef>::failure(invalid("blob media type is invalid or too long"));
     }
     const Sha256Digest digest = sha256(bytes);
-    const std::filesystem::path destination = path_for(digest);
     std::error_code error;
-    if (auto checked = validate_blob_directory_chain(root_, destination.parent_path()); !checked) {
+    const auto native_root = core::native_io_path(root_, error);
+    if (error) return core::Result<BlobRef>::failure(io_error("unable to resolve blob store root"));
+    const auto destination = blob_path(native_root, digest);
+    if (auto checked = validate_blob_directory_chain(native_root, destination.parent_path()); !checked) {
         return core::Result<BlobRef>::failure(checked.error());
     }
-    std::filesystem::create_directories(destination.parent_path(), error);
+    core::create_directories(destination.parent_path(), error);
     if (error) {
         return core::Result<BlobRef>::failure(io_error("unable to create blob directories"));
     }
-    if (auto checked = validate_blob_directory_chain(root_, destination.parent_path()); !checked) {
+    if (auto checked = validate_blob_directory_chain(native_root, destination.parent_path()); !checked) {
         return core::Result<BlobRef>::failure(checked.error());
     }
 
@@ -340,9 +348,11 @@ core::Result<BlobRef> BlobStore::put(
 }
 
 core::Result<std::vector<std::uint8_t>> BlobStore::read(const Sha256Digest& digest) const {
-    const std::filesystem::path path = path_for(digest);
     std::error_code error;
-    if (auto checked = validate_blob_directory_chain(root_, path.parent_path()); !checked) {
+    const auto native_root = core::native_io_path(root_, error);
+    if (error) return core::Result<std::vector<std::uint8_t>>::failure(io_error("unable to resolve blob store root"));
+    const auto path = blob_path(native_root, digest);
+    if (auto checked = validate_blob_directory_chain(native_root, path.parent_path()); !checked) {
         return core::Result<std::vector<std::uint8_t>>::failure(checked.error());
     }
     const auto status = std::filesystem::symlink_status(path, error);
@@ -398,11 +408,13 @@ core::Result<void> BlobStore::verify(const Sha256Digest& digest) const {
 
 core::Result<std::vector<BlobRef>> BlobStore::list() const {
     std::vector<BlobRef> entries;
-    if (auto checked = validate_blob_directory_chain(root_, root_); !checked) {
+    std::error_code error;
+    const auto native_root = core::native_io_path(root_, error);
+    if (error) return core::Result<std::vector<BlobRef>>::failure(io_error("unable to resolve blob store root"));
+    if (auto checked = validate_blob_directory_chain(native_root, native_root); !checked) {
         return core::Result<std::vector<BlobRef>>::failure(checked.error());
     }
-    std::error_code error;
-    const auto root_status = std::filesystem::symlink_status(root_, error);
+    const auto root_status = std::filesystem::symlink_status(native_root, error);
     if (error && error != std::errc::no_such_file_or_directory) {
         return core::Result<std::vector<BlobRef>>::failure(
             io_error("unable to inspect blob store root"));
@@ -415,8 +427,8 @@ core::Result<std::vector<BlobRef>> BlobStore::list() const {
         return core::Result<std::vector<BlobRef>>::failure(
             validation("blob store root is not a directory"));
     }
-    const std::filesystem::path base = root_ / "sha256";
-    if (auto checked = validate_blob_directory_chain(root_, base); !checked) {
+    const std::filesystem::path base = native_root / "sha256";
+    if (auto checked = validate_blob_directory_chain(native_root, base); !checked) {
         return core::Result<std::vector<BlobRef>>::failure(checked.error());
     }
     const auto base_status = std::filesystem::symlink_status(base, error);

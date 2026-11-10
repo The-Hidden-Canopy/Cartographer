@@ -27,6 +27,14 @@ void require(bool condition, std::string_view message) {
     }
 }
 
+void remove_v40_tables(std::string& serialized) {
+    for (const std::string table : {"RIG_TEMPLATE_BINDINGS 0\n", "AGING_LAYERS 0\n"}) {
+        const auto at = serialized.find(table);
+        require(at != std::string::npos, "fixture contains the integrated schema table");
+        serialized.erase(at, table.size());
+    }
+}
+
 class TempDirectory final {
 public:
     TempDirectory() {
@@ -404,16 +412,18 @@ void character_record_tables_migrate_from_v32() {
     auto mislabeled_v37 = schema_v37;
     if (const auto control_workspace = mislabeled_v37.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
         mislabeled_v37.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
-    mislabeled_v37.replace(0U, std::string("CARTOGRAPHER_PROJECT 39\n").size(), "CARTOGRAPHER_PROJECT 37\n");
+    remove_v40_tables(mislabeled_v37);
+    mislabeled_v37.replace(0U, ("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n").size(), "CARTOGRAPHER_PROJECT 37\n");
     require(!project::ProjectDocument::deserialize(mislabeled_v37), "v37 refuses v38 draft table");
     schema_v37 = missing_v38_drafts;
     if (const auto control_workspace = schema_v37.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
         schema_v37.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
-    schema_v37.replace(0U, std::string("CARTOGRAPHER_PROJECT 39\n").size(), "CARTOGRAPHER_PROJECT 37\n");
+    remove_v40_tables(schema_v37);
+    schema_v37.replace(0U, ("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n").size(), "CARTOGRAPHER_PROJECT 37\n");
     const auto migrated_v37 = project::ProjectDocument::deserialize(schema_v37);
     require(migrated_v37 && migrated_v37.value().unadmitted_mode_key_drafts().empty() &&
-        migrated_v37.value().serialize().starts_with("CARTOGRAPHER_PROJECT 39\n"),
-        "v37 migrates to v38 without fabricating drafts");
+        migrated_v37.value().serialize().starts_with(("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n")),
+        "v37 migrates to the current schema without fabricating drafts");
 
     std::string schema_v36 = project::ProjectDocument{}.serialize();
     const auto schema_v36_drafts = schema_v36.find("UNADMITTED_MODE_KEY_DRAFTS 0\n");
@@ -421,12 +431,13 @@ void character_record_tables_migrate_from_v32() {
     schema_v36.erase(schema_v36_drafts, std::string("UNADMITTED_MODE_KEY_DRAFTS 0\n").size());
     if (const auto control_workspace = schema_v36.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
         schema_v36.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
-    schema_v36.replace(0U, std::string("CARTOGRAPHER_PROJECT 39\n").size(),
+    remove_v40_tables(schema_v36);
+    schema_v36.replace(0U, ("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n").size(),
         "CARTOGRAPHER_PROJECT 36\n");
     const auto migrated_v36 = project::ProjectDocument::deserialize(schema_v36);
     require(migrated_v36 && migrated_v36.value().accepted_autorigs().empty() &&
-            migrated_v36.value().serialize().starts_with("CARTOGRAPHER_PROJECT 39\n"),
-        "schema v36 with its accepted-autorig table migrates to v38");
+            migrated_v36.value().serialize().starts_with(("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n")),
+        "schema v36 with its accepted-autorig table migrates to the current schema");
 
     std::string schema_v35 = project::ProjectDocument{}.serialize();
     const auto schema_v35_drafts = schema_v35.find("UNADMITTED_MODE_KEY_DRAFTS 0\n");
@@ -438,10 +449,11 @@ void character_record_tables_migrate_from_v32() {
     schema_v35.erase(v35_accepted_table, accepted_table.size());
     if (const auto control_workspace = schema_v35.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
         schema_v35.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
-    schema_v35.replace(0U, std::string("CARTOGRAPHER_PROJECT 39\n").size(),
+    remove_v40_tables(schema_v35);
+    schema_v35.replace(0U, ("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n").size(),
         "CARTOGRAPHER_PROJECT 35\n");
     const auto migrated_v35 = project::ProjectDocument::deserialize(schema_v35);
-    require(migrated_v35 && migrated_v35.value().serialize().starts_with("CARTOGRAPHER_PROJECT 39\n") &&
+    require(migrated_v35 && migrated_v35.value().serialize().starts_with(("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n")) &&
             migrated_v35.value().serialize().find(accepted_table) != std::string::npos,
         "schema v35 migrates with an empty accepted autorig table");
     std::string missing_accepted = project::ProjectDocument{}.serialize();
@@ -454,7 +466,8 @@ void character_record_tables_migrate_from_v32() {
     mislabeled_v35.erase(mislabeled_v35_drafts, std::string("UNADMITTED_MODE_KEY_DRAFTS 0\n").size());
     if (const auto control_workspace = mislabeled_v35.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
         mislabeled_v35.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
-    mislabeled_v35.replace(0U, std::string("CARTOGRAPHER_PROJECT 39\n").size(),
+    remove_v40_tables(mislabeled_v35);
+    mislabeled_v35.replace(0U, ("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n").size(),
         "CARTOGRAPHER_PROJECT 35\n");
     require(!project::ProjectDocument::deserialize(mislabeled_v35),
         "schema v35 cannot carry the schema v36 accepted autorig table");
@@ -479,12 +492,13 @@ void character_record_tables_migrate_from_v32() {
     schema_v34.erase(schema_v34.find(accepted_table), accepted_table.size());
     if (const auto control_workspace = schema_v34.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
         schema_v34.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
-    schema_v34.replace(0U, std::string("CARTOGRAPHER_PROJECT 39\n").size(),
+    remove_v40_tables(schema_v34);
+    schema_v34.replace(0U, ("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n").size(),
         "CARTOGRAPHER_PROJECT 34\n");
     const auto migrated_v34 = project::ProjectDocument::deserialize(schema_v34);
     require(migrated_v34 && migrated_v34.value().kinematic_graphs().empty() &&
-            migrated_v34.value().serialize().find("CARTOGRAPHER_PROJECT 39\n") == 0U,
-        "schema v34 migrates to v38 with an empty kinematic graph table");
+            migrated_v34.value().serialize().find(("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n")) == 0U,
+        "schema v34 migrates to the current schema with an empty kinematic graph table");
 
     std::string mislabeled_graph = project::ProjectDocument{}.serialize();
     const auto mislabeled_graph_drafts = mislabeled_graph.find("UNADMITTED_MODE_KEY_DRAFTS 0\n");
@@ -493,7 +507,8 @@ void character_record_tables_migrate_from_v32() {
     mislabeled_graph.erase(mislabeled_graph.find(accepted_table), accepted_table.size());
     if (const auto control_workspace = mislabeled_graph.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
         mislabeled_graph.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
-    mislabeled_graph.replace(0U, std::string("CARTOGRAPHER_PROJECT 39\n").size(),
+    remove_v40_tables(mislabeled_graph);
+    mislabeled_graph.replace(0U, ("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n").size(),
         "CARTOGRAPHER_PROJECT 34\n");
     require(!project::ProjectDocument::deserialize(mislabeled_graph),
         "schema v34 cannot carry schema v35 kinematic graph records");
@@ -521,16 +536,17 @@ void character_record_tables_migrate_from_v32() {
     schema_v32.erase(schema_v32.find(accepted_table), accepted_table.size());
     if (const auto control_workspace = schema_v32.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
         schema_v32.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
-    schema_v32.replace(0U, std::string("CARTOGRAPHER_PROJECT 39\n").size(),
+    remove_v40_tables(schema_v32);
+    schema_v32.replace(0U, ("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n").size(),
         "CARTOGRAPHER_PROJECT 32\n");
     const auto migrated = project::ProjectDocument::deserialize(schema_v32);
     require(migrated && migrated.value().pose_libraries().empty() &&
             migrated.value().kinematic_graphs().empty() &&
             migrated.value().weight_edit_receipts().empty() &&
             migrated.value().curve_edit_receipts().empty() &&
-            migrated.value().serialize().find("CARTOGRAPHER_PROJECT 39\n") == 0U &&
+            migrated.value().serialize().find(("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n")) == 0U &&
             migrated.value().serialize().find("POSE_LIBRARIES 0\n") != std::string::npos,
-        "schema v32 migrates to v38 with empty character record tables");
+        "schema v32 migrates to the current schema with empty character record tables");
 
     std::string fenced = project::ProjectDocument{}.serialize();
     const auto fenced_drafts = fenced.find("UNADMITTED_MODE_KEY_DRAFTS 0\n");
@@ -538,10 +554,11 @@ void character_record_tables_migrate_from_v32() {
     fenced.erase(fenced_drafts, std::string("UNADMITTED_MODE_KEY_DRAFTS 0\n").size());
     const auto header_end = fenced.find('\n');
     require(header_end != std::string::npos && fenced.substr(0U, header_end) ==
-                "CARTOGRAPHER_PROJECT 39",
+                ("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion)),
         "fixture begins at the expected current schema");
     if (const auto control_workspace = fenced.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
         fenced.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
+    remove_v40_tables(fenced);
     fenced.replace(0U, header_end, "CARTOGRAPHER_PROJECT 32");
     require(!project::ProjectDocument::deserialize(fenced),
         "schema v32 files cannot carry current character record tables");

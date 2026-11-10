@@ -1452,6 +1452,7 @@ private:
     core::Vec3d local_translation_offset_;
     std::optional<scene::SceneObject> object_;
     std::optional<project::BiologicalProxyInstanceReceipt> biological_proxy_receipt_;
+    std::optional<project::ObjectAgingLayer> aging_layer_;
 };
 
 inline constexpr std::size_t kMaxMeshInstanceBatchInstances = 4'096U;

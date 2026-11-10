@@ -44,6 +44,7 @@ core::Result<void> register_builtin_obj_providers(providers::Registry& registry)
 }
 
 core::Result<void> register_builtin_gltf_providers(providers::Registry& registry) {
+    if(auto ready=make_ready(registry,{"cartographer.gltf.import",providers::ProviderKind::geometry_import,{"geometry.import.gltf","geometry.import.glb"},{1U,0U,0U},providers::TrustClass::trusted_in_process});!ready)return ready;
     return make_ready(registry, {
         "cartographer.gltf.export",
         providers::ProviderKind::geometry_export,

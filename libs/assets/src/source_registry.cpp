@@ -288,6 +288,12 @@ core::Result<void> SourceImportRecord::validate() const {
         return core::Result<void>::failure(invalid(
             "source import identity, path, generation, kind, importer, or digests are invalid"));
     }
+    if (importer_identity == "carto.import.gltf-scene" && importer_version > 2U) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::version_mismatch,
+            "glTF scene source lineage version " + std::to_string(importer_version) +
+                " is newer than this reader supports (maximum 2)"));
+    }
     if (auto result = options.validate(); !result) return result;
     if (domain_digests.size() > kMaxDomainDigests) {
         return core::Result<void>::failure(validation(
@@ -332,7 +338,7 @@ core::Result<void> SourceImportRecord::validate() const {
     }
     if (!document_products.empty()) {
         if (kind != SourceAssetKind::other || importer_identity != "carto.import.gltf-scene" ||
-            importer_version != 1U || botanical_generation.has_value() ||
+            (importer_version != 1U && importer_version != 2U) || botanical_generation.has_value() ||
             document_products.size() > kMaxDocumentProducts) {
             return core::Result<void>::failure(validation(
                 "document product bindings require the bounded glTF scene importer"));
@@ -353,7 +359,8 @@ core::Result<void> SourceImportRecord::validate() const {
             }
             previous = key;
         }
-        if (next_index[0] == 1U || next_index[1] == 1U || next_index[2] == 1U ||
+        if (next_index[0] == 1U || next_index[1] == 1U ||
+            (importer_version == 1U && next_index[2] == 1U) ||
             artifact_digest != source_document_product_digest(source_digest, document_products)) {
             return core::Result<void>::failure(validation(
                 "document product mapping is incomplete or does not match its digest"));
@@ -436,10 +443,14 @@ core::Result<SourceImportRecord> SourceImportRecord::deserialize(std::string_vie
     input.imbue(std::locale::classic());
     std::string token;
     std::uint64_t number = 0U;
-    if (!(input >> token) || token != "SOURCE_IMPORT_RECORD" ||
-        !read_unsigned(input, number) || (number != 1U && number != 2U && number != 3U && number != 4U)) {
+    if (!(input >> token) || token != "SOURCE_IMPORT_RECORD" || !read_unsigned(input, number) || number == 0U) {
         return core::Result<SourceImportRecord>::failure(validation(
-            "source import record header or schema is unsupported"));
+            "source import record header or schema is invalid"));
+    }
+    if (number > 4U) {
+        return core::Result<SourceImportRecord>::failure(core::Diagnostic(
+            core::ErrorCode::version_mismatch,
+            "source import record schema is newer than this reader supports (maximum 4)"));
     }
     const std::uint64_t record_version = number;
     SourceImportRecord result;
@@ -815,7 +826,11 @@ core::Result<ProjectAssetRegistry> ProjectAssetRegistry::deserialize(std::string
         }
         aggregate_bytes += encoded.size();
         auto record = SourceImportRecord::deserialize(encoded);
-        if (!record || record.value().identity != identity ||
+        if (!record) {
+            return core::Result<ProjectAssetRegistry>::failure(
+                record.error().with_context("source asset record " + identity));
+        }
+        if (record.value().identity != identity ||
             !registry.records_.emplace(identity, std::move(record.value())).second) {
             return core::Result<ProjectAssetRegistry>::failure(validation(
                 "source asset record identity is duplicate or unbound"));

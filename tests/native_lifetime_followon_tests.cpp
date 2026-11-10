@@ -107,6 +107,16 @@ int main()
         require(!cancelled.may_release_submission() && !cancelled.may_publish(source));
         require(cancelled.observe_completion() && cancelled.may_release_submission());
         require(!cancelled.may_publish(source));
+        carto::studio::TextureUploadTicket rejected(source);
+        require(!rejected.reject_unaccepted_submission());
+        require(rejected.mark_submitted() && !rejected.may_release_submission());
+        require(rejected.reject_unaccepted_submission() && rejected.cancelled());
+        require(rejected.may_release_submission() && !rejected.may_publish(source) &&
+                !rejected.observe_completion() && !rejected.reject_unaccepted_submission() &&
+                !rejected.mark_submitted());
+        carto::studio::TextureUploadTicket completed(source);
+        require(completed.mark_submitted() && completed.observe_completion());
+        require(!completed.reject_unaccepted_submission() && completed.may_publish(source));
         struct FakeUpload {
             int id;
             carto::studio::TextureUploadTicket ticket;

@@ -1,172 +1,11 @@
+#include "gltf_test_payload.hpp"
 #include <array>
 #include <locale>
-#include <bit>
-#include <carto/core/json.hpp>
-#include <carto/editor/command_bus.hpp>
-#include <carto/io/gltf_export.hpp>
 #include <carto/io/gltf_material_import.hpp>
 #include <carto/io/gltf_scene_import.hpp>
-#include <carto/mesh_attributes/provenance.hpp>
-#include <carto/production/render_mesh.hpp>
-#include <carto/project/transaction.hpp>
 #include "../apps/desktop/interchange_export_feedback.hpp"
-#include <chrono>
-#include <cmath>
-#include <fstream>
-#include <iostream>
 
 namespace {
-using namespace carto;
-void check(bool v, const char *s) {
-    if (!v)
-        throw std::runtime_error(s);
-}
-template <class T> T take(core::Result<T> r) {
-    if (!r)
-        throw std::runtime_error(r.error().message);
-    return std::move(r.value());
-}
-void okay(core::Result<void> r) {
-    if (!r)
-        throw std::runtime_error(r.error().message);
-}
-std::string read(const std::filesystem::path &p) {
-    std::ifstream f(p, std::ios::binary);
-    check(bool(f), "fixture file readable");
-    return {std::istreambuf_iterator<char>(f), {}};
-}
-std::string_view member(std::string_view text, std::string_view key) {
-    auto parsed = take(core::json::parse_object(text));
-    auto m = core::json::find_member(parsed, key);
-    check(m != nullptr, "JSON member present");
-    return m->raw_value;
-}
-std::uint64_t number(std::string_view s) { return take(core::json::parse_uint(s)); }
-std::vector<std::string_view> array(std::string_view s) {
-    check(s.front() == '[' && s.back() == ']', "JSON array shape");
-    std::vector<std::string_view> result;
-    std::size_t start = 1;
-    int depth = 0;
-    bool quoted = false, escaped = false;
-    for (std::size_t i = 1; i + 1 < s.size(); ++i) {
-        char c = s[i];
-        if (quoted) {
-            if (escaped)
-                escaped = false;
-            else if (c == '\\')
-                escaped = true;
-            else if (c == '"')
-                quoted = false;
-            continue;
-        }
-        if (c == '"')
-            quoted = true;
-        else if (c == '{' || c == '[')
-            ++depth;
-        else if (c == '}' || c == ']')
-            --depth;
-        else if (c == ',' && depth == 0) {
-            result.push_back(s.substr(start, i - start));
-            start = i + 1;
-        }
-    }
-    if (s.substr(start, s.size() - 1 - start).find_first_not_of(" \r\n\t") !=
-        std::string_view::npos)
-        result.push_back(s.substr(start, s.size() - 1 - start));
-    return result;
-}
-std::uint32_t u32(std::span<const std::uint8_t> b, std::size_t p) {
-    check(p + 4 <= b.size(), "binary u32 bound");
-    return b[p] | (std::uint32_t(b[p + 1]) << 8) | (std::uint32_t(b[p + 2]) << 16) |
-           (std::uint32_t(b[p + 3]) << 24);
-}
-std::vector<std::uint8_t> unbase64(std::string_view s) {
-    constexpr std::string_view alphabet =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::vector<std::uint8_t> out;
-    std::uint32_t bits = 0;
-    unsigned count = 0;
-    for (char c : s) {
-        if (c == '=')
-            break;
-        auto n = alphabet.find(c);
-        check(n != alphabet.npos, "embedded buffer base64 alphabet");
-        bits = (bits << 6) | static_cast<unsigned>(n);
-        count += 6;
-        if (count >= 8) {
-            count -= 8;
-            out.push_back(static_cast<std::uint8_t>(bits >> count));
-        }
-    }
-    return out;
-}
-struct Payload {
-    std::string json;
-    std::vector<std::uint8_t> bytes;
-    explicit Payload(const std::filesystem::path &p) {
-        auto file = read(p);
-        if (p.extension() == ".glb") {
-            auto raw = std::span(reinterpret_cast<const std::uint8_t *>(file.data()), file.size());
-            check(u32(raw, 0) == 0x46546c67 && u32(raw, 4) == 2 && u32(raw, 8) == raw.size(),
-                  "GLB header and length");
-            auto length = u32(raw, 12);
-            check(u32(raw, 16) == 0x4e4f534a && 20ULL + length + 8 <= raw.size(), "GLB JSON chunk");
-            json = file.substr(20, length);
-            auto offset = 20 + length;
-            auto bin = u32(raw, offset);
-            check(u32(raw, offset + 4) == 0x004e4942 && offset + 8ULL + bin == raw.size(),
-                  "GLB BIN chunk");
-            bytes.assign(raw.begin() + offset + 8, raw.end());
-        } else {
-            json = std::move(file);
-            auto uri =
-                take(core::json::decode_string(member(array(member(json, "buffers"))[0], "uri")));
-            constexpr std::string_view prefix = "data:application/octet-stream;base64,";
-            check(uri.starts_with(prefix), "single embedded glTF buffer");
-            bytes = unbase64(std::string_view(uri).substr(prefix.size()));
-        }
-        check(bool(core::json::parse_object(json)), "export JSON grammar");
-        check(number(member(array(member(json, "buffers"))[0], "byteLength")) <= bytes.size(),
-              "buffer length bounded");
-    }
-    std::vector<double> accessor(std::size_t id) const {
-        auto a = array(member(json, "accessors")).at(id);
-        auto v = array(member(json, "bufferViews")).at(number(member(a, "bufferView")));
-        auto offset = number(member(v, "byteOffset"));
-        auto count = number(member(a, "count"));
-        auto component = number(member(a, "componentType"));
-        auto type = take(core::json::decode_string(member(a, "type")));
-        unsigned channels = type == "SCALAR" ? 1
-                            : type == "VEC2" ? 2
-                            : type == "VEC3" ? 3
-                            : type == "VEC4" ? 4
-                                             : 0;
-        check(channels != 0, "accessor type");
-        unsigned size = component == 5123 ? 2 : 4;
-        check(component == 5123 || component == 5125 || component == 5126, "accessor component");
-        check(count * channels * size <= number(member(v, "byteLength")) &&
-                  offset + count * channels * size <= bytes.size(),
-              "accessor views bounded");
-        std::vector<double> out;
-        for (std::size_t i = 0; i < count * channels; ++i) {
-            auto pos = offset + i * size;
-            if (component == 5126)
-                out.push_back(std::bit_cast<float>(u32(bytes, pos)));
-            else if (size == 4)
-                out.push_back(u32(bytes, pos));
-            else
-                out.push_back(bytes[pos] | (unsigned(bytes[pos + 1]) << 8));
-        }
-        return out;
-    }
-    std::string_view primitive() const {
-        return array(member(array(member(json, "meshes"))[0], "primitives"))[0];
-    }
-    std::vector<double> attribute(std::string_view name) const {
-        return accessor(number(member(member(primitive(), "attributes"), name)));
-    }
-    std::vector<double> indices() const { return accessor(number(member(primitive(), "indices"))); }
-};
 geometry::EditableMesh fixture(bool uv = true, bool smooth = false) {
     geometry::EditableMesh m;
     okay(m.insert_bulk({{{1}, {0, 0, 0}}, {{2}, {1, 0, 0}}, {{3}, {1, 1, 0}}, {{4}, {0, 1, 0}}},
@@ -246,6 +85,13 @@ Payload exported(const Scene &s, const std::filesystem::path &root, std::string 
         if (core::json::find_member(attrs, key))
             check(p.attribute(key) == binary.attribute(key), "GLB/glTF UV/tangent payload parity");
     auto node = array(member(p.json, "nodes"))[0];
+    const auto extras = member(node, "extras");
+    check(member(extras, "vanta_object_id") == member(extras, "cartographer_object_id") &&
+          member(extras, "vanta_visible") == member(extras, "visible") &&
+          member(extras, "vanta_locked") == member(extras, "locked"),
+          "VANTA scene metadata matches Cartographer identity and flags");
+    const auto binary_extras = member(array(member(binary.json, "nodes"))[0], "extras");
+    check(binary_extras == extras, "GLB and glTF preserve the same scene metadata");
     auto q = array(member(node, "rotation"));
     double norm = 0;
     for (auto v : q)
@@ -255,6 +101,39 @@ Payload exported(const Scene &s, const std::filesystem::path &root, std::string 
     near(std::stod(std::string(scale[0])), expected_scale_x, "authored scale sign preserved");
     near(std::stod(std::string(scale[1])), 3, "nonuniform scale preserved");
     return p;
+}
+void vanta_metadata_export(const std::filesystem::path& root) {
+    auto doc = take(project::ProjectDocument::create("VANTA metadata"));
+    journal::Journal journal(root / "vanta-metadata.log");
+    if (doc.revision() != core::Revision{}) {
+        const auto checkpoint = doc.serialize();
+        static_cast<void>(take(journal.append(
+            {{}, doc.revision(), "export.fixture.create",
+             {reinterpret_cast<const std::uint8_t*>(checkpoint.data()), checkpoint.size()}, std::nullopt})));
+    }
+    auto tx = take(project::ProjectTransaction::begin(doc, journal, "export.vanta.metadata"));
+    const auto mesh = take(tx.add_mesh(fixture()));
+    scene::SceneObject node;
+    node.id = scene::ObjectId{42};
+    node.name = "Hidden locked object";
+    node.mesh_asset = mesh;
+    node.visible = false;
+    node.locked = true;
+    okay(tx.insert_object(node));
+    static_cast<void>(take(tx.commit()));
+    for (const auto* extension : {".gltf", ".glb"}) {
+        const auto path = root / (std::string("vanta-metadata") + extension);
+        if (std::string_view(extension) == ".glb")
+            static_cast<void>(take(io::export_glb(doc, path)));
+        else
+            static_cast<void>(take(io::export_gltf(doc, path)));
+        const Payload payload(path);
+        const auto extras = member(array(member(payload.json, "nodes"))[0], "extras");
+        check(number(member(extras, "vanta_object_id")) == 42U &&
+              member(extras, "vanta_visible") == "false" &&
+              member(extras, "vanta_locked") == "true",
+              "VANTA metadata preserves a hidden locked object and source identity");
+    }
 }
 void normals_and_frames(const Payload &p, bool uv) {
     auto n = p.attribute("NORMAL"), pos = p.attribute("POSITION"), index = p.indices();
@@ -455,6 +334,8 @@ void constant_material_export_roundtrip(const std::filesystem::path& root) {
           "primitive records its source material region");
     const auto material = array(member(payload.json, "materials")).at(0);
     check(member(material, "doubleSided") == "true", "export preserves double-sided viewport contract");
+    check(take(core::json::decode_string(member(material, "name"))) == "Copper \"fixture\"",
+          "material export preserves and escapes its authored name");
     check(number(member(member(material, "extras"), "cartographer_material_id")) == 71U,
           "material records its source identity");
     const auto pbr = member(material, "pbrMetallicRoughness");
@@ -525,6 +406,27 @@ void constant_material_export_roundtrip(const std::filesystem::path& root) {
               number(member(member(array(member(ordered_payload.json, "materials")).at(1), "extras"),
                             "cartographer_material_id")) == 71U,
           "primitive uses the sorted material's actual glTF index");
+
+    // An extended catalog can contain an unrelated material that this glTF
+    // profile cannot represent. The used material retains its source identity
+    // without exporting a fabricated placeholder or failing on unused data.
+    const auto extended_root = root / "unused-unsupported-material";
+    std::filesystem::create_directory(extended_root);
+    auto extended = make_scene(material_mesh(), extended_root);
+    auto extended_catalog = scalar_catalog(extended.mesh);
+    render::MaterialAsset unsupported;
+    unsupported.id = 4U; unsupported.name = "Unused HDR material";
+    unsupported.revision = core::Revision{1U};
+    unsupported.definition.base_color_factor.x = 2.0;
+    okay(extended_catalog.insert_material(std::move(unsupported)));
+    set_export_catalog(extended, std::move(extended_catalog), extended_root / "material.log");
+    const auto mapped = exported(extended, extended_root, "mapped");
+    const auto mapped_materials = array(member(mapped.json, "materials"));
+    const auto mapped_index = number(member(mapped.primitive(), "material"));
+    check(mapped_materials.size() == 1U && mapped_index == 0U &&
+              number(member(member(mapped_materials.at(mapped_index), "extras"),
+                            "cartographer_material_id")) == 71U,
+          "unused unsupported catalog entry is omitted and primitive retains source material identity");
 }
 class CommaGroupedNumbers final : public std::numpunct<char> {
     char do_decimal_point() const override { return ','; }
@@ -598,6 +500,7 @@ int main(int argc, char** argv) {
              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         check(!std::filesystem::exists(root), "fixture directory must be new; prior artifacts are preserved");
         std::filesystem::create_directories(root);
+        vanta_metadata_export(root);
         const auto scalar_root = root / "constant-material";
         std::filesystem::create_directory(scalar_root);
         constant_material_export_roundtrip(scalar_root);
@@ -776,6 +679,9 @@ int main(int argc, char** argv) {
                       imported.materials.catalog.assignments().contains({1U, 1U}) &&
                       imported.materials.catalog.assignments().contains({1U, 2U}),
                   "scene import preserves both remapped assignments and active UVs");
+            check(std::any_of(imported.warnings.begin(), imported.warnings.end(), [](const auto& warning) {
+                      return warning.find("source face IDs and material-region identity") != std::string::npos;
+                  }), "import explicitly reports source region and face identity loss");
             const auto* slots = imported.meshes[0].attributes().find("cartographer.material_slot");
             check(slots != nullptr && slots->values.size() == 2U &&
                       std::get<std::uint32_t>(slots->values[0]) == 1U &&
@@ -872,6 +778,43 @@ int main(int argc, char** argv) {
         check(!tangent_export && tangent_export.error().message.find("tangent") != std::string::npos &&
                   read(good_glb) == glb_before,
               "authored tangent replacement is refused without replacing prior GLB");
+        auto stale_tangent_mesh = fixture(true, true);
+        auto stale_attributes = stale_tangent_mesh.attributes();
+        auto uv_layer = *stale_attributes.find("uv.export");
+        okay(stale_attributes.add_layer({{"cartographer.tangent.7", attributes::AttributeDomain::corner,
+                                         attributes::AttributeType::vec4},
+                                        std::vector<attributes::AttributeValue>(6, core::Vec4d{1, 0, 0, 1})}));
+        okay(stale_attributes.add_layer({{"cartographer.tangent_uv.7", attributes::AttributeDomain::corner,
+                                         attributes::AttributeType::vec2}, uv_layer.values}));
+        uv_layer.values.front() = core::Vec2d{.125, 0};
+        okay(stale_attributes.remove_layer("uv.export"));
+        okay(stale_attributes.add_layer(std::move(uv_layer)));
+        okay(stale_tangent_mesh.set_attribute_payload(std::move(stale_attributes), stale_tangent_mesh.uv_sets()));
+        auto stale_tangent_root = root / "stale-authored-tangent";
+        std::filesystem::create_directory(stale_tangent_root);
+        const auto stale_tangent_scene = make_scene(stale_tangent_mesh, stale_tangent_root);
+        const auto stale_tangent_export = io::export_glb(stale_tangent_scene.doc, good_glb);
+        check(!stale_tangent_export &&
+                  stale_tangent_export.error().message.find("tangent UV correspondence changed") != std::string::npos &&
+                  read(good_glb) == glb_before,
+              "changed UVs refuse stale authored tangents without replacing prior GLB");
+        auto invalid_frame_mesh = fixture(true, true);
+        auto invalid_frame_attributes = invalid_frame_mesh.attributes();
+        const auto current_uv = *invalid_frame_attributes.find("uv.export");
+        okay(invalid_frame_attributes.add_layer({{"cartographer.tangent.7", attributes::AttributeDomain::corner,
+                                                 attributes::AttributeType::vec4},
+                                                std::vector<attributes::AttributeValue>(6, core::Vec4d{0, 0, 1, 1})}));
+        okay(invalid_frame_attributes.add_layer({{"cartographer.tangent_uv.7", attributes::AttributeDomain::corner,
+                                                 attributes::AttributeType::vec2}, current_uv.values}));
+        okay(invalid_frame_mesh.set_attribute_payload(std::move(invalid_frame_attributes), invalid_frame_mesh.uv_sets()));
+        auto invalid_frame_root = root / "invalid-tangent-frame";
+        std::filesystem::create_directory(invalid_frame_root);
+        const auto invalid_frame_scene = make_scene(invalid_frame_mesh, invalid_frame_root);
+        const auto invalid_frame_export = io::export_glb(invalid_frame_scene.doc, good_glb);
+        check(!invalid_frame_export &&
+                  invalid_frame_export.error().message.find("tangent") != std::string::npos &&
+                  read(good_glb) == glb_before,
+              "non-orthogonal authored tangents refuse without replacing prior GLB");
         auto color_mesh = fixture();
         auto color_attributes = color_mesh.attributes();
         okay(color_attributes.add_layer({{"color.corner", attributes::AttributeDomain::corner,
@@ -907,7 +850,7 @@ int main(int argc, char** argv) {
         std::cout << "CPU export geometry: authored corner normals with/without UV, seam "
                      "splitting, tangent handedness, glTF/GLB payloads, normalized/mirrored TRS, "
                      "mesh command undo/redo, supported attribute transfer and project reopen "
-                     "passed. Materials and GPU/native visual acceptance remain open. Artifacts: "
+                     "passed. Additional material data is checked by its separate suite; GPU/native visual acceptance remains open. Artifacts: "
                   << root << '\n';
         return 0;
     } catch (const std::exception &e) {

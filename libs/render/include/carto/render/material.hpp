@@ -8,6 +8,8 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <span>
+#include <vector>
 
 namespace carto::render {
 
@@ -178,5 +180,12 @@ enum class ToneMapMode {
     core::Vec3d linear_hdr,
     ToneMapMode mode);
 [[nodiscard]] core::Result<core::Vec3d> linear_to_srgb(core::Vec3d linear_color);
+
+// Quantizes the same exposure -> tone -> sRGB contract in a batch. Inverse
+// quantization thresholds avoid per-channel transcendental work. HDR source
+// pixels remain unchanged; coverage is copied to output alpha.
+[[nodiscard]] core::Result<std::vector<std::uint8_t>> encode_display_rgba8(
+    std::span<const core::Vec3d> linear_hdr, std::span<const std::uint8_t> coverage,
+    double exposure_ev, ToneMapMode mode);
 
 } // namespace carto::render

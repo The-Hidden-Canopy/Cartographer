@@ -5,7 +5,9 @@ add_library(carto_io STATIC
     src/ply.cpp
     src/stl.cpp
     src/gltf_export.cpp
+    src/gltf_material.cpp
     src/gltf_material_import.cpp
+    src/gltf_dependency_reader.cpp
 )
 
 target_include_directories(carto_io

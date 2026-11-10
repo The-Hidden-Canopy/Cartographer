@@ -21,6 +21,8 @@ add_library(carto_project STATIC
     src/package.cpp
     src/presentation_catalog.cpp
     src/project.cpp
+    src/rig_binding.cpp
+    src/aging_layer.cpp
     src/recovery.cpp
     src/road_source.cpp
     src/sqlite_authoring_database.cpp

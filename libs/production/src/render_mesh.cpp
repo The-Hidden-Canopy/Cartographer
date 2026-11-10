@@ -169,6 +169,7 @@ struct RenderVertexKey {
     std::uint64_t color_b = 0U;
     std::uint64_t color_a = 0U;
     std::vector<std::uint64_t> additional_uv_bits;
+    std::uint64_t tangent_x = 0U, tangent_y = 0U, tangent_z = 0U, tangent_w = 0U;
 
     [[nodiscard]] auto operator<=>(const RenderVertexKey&) const noexcept = default;
 };
@@ -206,6 +207,11 @@ RenderVertexKey render_vertex_key(const RenderMeshVertex& vertex) {
         vertex.color.has_value() ? canonical_f64_bits(vertex.color->y) : 0U,
         vertex.color.has_value() ? canonical_f64_bits(vertex.color->z) : 0U,
         vertex.color.has_value() ? canonical_f64_bits(vertex.color->w) : 0U,
+        {},
+        vertex.tangent.has_value() ? canonical_f64_bits(vertex.tangent->x) : 0U,
+        vertex.tangent.has_value() ? canonical_f64_bits(vertex.tangent->y) : 0U,
+        vertex.tangent.has_value() ? canonical_f64_bits(vertex.tangent->z) : 0U,
+        vertex.tangent.has_value() ? canonical_f64_bits(vertex.tangent->w) : 0U,
     };
     result.additional_uv_bits.reserve(vertex.additional_uvs.size() * 2U);
     for (const auto uv : vertex.additional_uvs) {
@@ -1102,6 +1108,28 @@ core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
         }
     }
 
+    std::map<CornerKey, core::Vec4d> tangent_by_corner;
+    if(options.generate_tangents&&options.uv_set) {
+        const auto* layer=mesh.attributes().find("cartographer.tangent."+std::to_string(*options.uv_set));
+        // Imported authored frames remain useful until their source UVs change.
+        // Retaining both corner streams makes invalidation survive undo/reopen
+        // and generic topology transfer without a disposable host-side flag.
+        if(layer)if(const auto* original=mesh.attributes().find("cartographer.tangent_uv."+std::to_string(*options.uv_set))) {
+            const auto topology=mesh.topology();if(!topology)return core::Result<RenderMeshArtifact>::failure(topology.error());
+            if(original->descriptor.domain!=attributes::AttributeDomain::corner||original->descriptor.type!=attributes::AttributeType::vec2||original->values.size()!=topology.value().corners.size())return core::Result<RenderMeshArtifact>::failure(validation("authored tangent UV correspondence is malformed"));
+            for(std::size_t i=0;i<original->values.size();++i){const auto* uv=std::get_if<core::Vec2d>(&original->values[i]);const auto& corner=topology.value().corners[i];const auto current=uv_by_corner.find(CornerKey{corner.face,corner.vertex});if(!uv||current==uv_by_corner.end())return core::Result<RenderMeshArtifact>::failure(validation("authored tangent UV correspondence is missing"));if(uv->x!=current->second.x||uv->y!=current->second.y){layer=nullptr;break;}}
+        }
+        if(layer) {
+            const auto topology=mesh.topology();
+            if(!topology)return core::Result<RenderMeshArtifact>::failure(topology.error());
+            if(layer->descriptor.domain!=attributes::AttributeDomain::corner||layer->descriptor.type!=attributes::AttributeType::vec4||layer->values.size()!=topology.value().corners.size())return core::Result<RenderMeshArtifact>::failure(validation("authored tangent layer must match source corners as vec4"));
+            for(std::size_t i=0;i<layer->values.size();++i) {
+                const auto* t=std::get_if<core::Vec4d>(&layer->values[i]);
+                if(!t||!t->finite()||std::abs(core::Vec3d{t->x,t->y,t->z}.length_squared()-1)>1e-5||std::abs(t->w)!=1)return core::Result<RenderMeshArtifact>::failure(validation("invalid authored tangent direction or handedness"));
+                const auto& c=topology.value().corners[i];tangent_by_corner.emplace(CornerKey{c.face,c.vertex},*t);
+            }
+        }
+    }
     std::map<CornerKey, core::Vec4d> color_by_corner;
     if (options.vertex_color_layer.has_value()) {
         const auto* layer = mesh.attributes().find(options.vertex_color_layer.value());
@@ -1285,6 +1313,9 @@ core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
                 const core::Vec4d color = color_iterator == color_by_corner.end()
                     ? core::Vec4d{}
                     : color_iterator->second;
+                const auto tangent_iterator=tangent_by_corner.find(corner_key);
+                const auto tangent=tangent_iterator==tangent_by_corner.end()?std::optional<core::Vec4d>{}:std::optional<core::Vec4d>{tangent_iterator->second};
+                if(tangent&&std::abs(core::dot(normal,core::Vec3d{tangent->x,tangent->y,tangent->z}))>1e-5)return core::Result<RenderMeshArtifact>::failure(validation("authored tangent is not orthogonal to the current normal; regenerate the tangent layer after edits"));
                 const RenderVertexKey vertex_key{
                     source_vertex.value,
                     canonical_f64_bits(normal.x),
@@ -1303,6 +1334,10 @@ core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
                     options.vertex_color_layer.has_value()
                         ? canonical_f64_bits(color.w) : 0U,
                     std::move(additional_uv_bits),
+                    tangent?canonical_f64_bits(tangent->x):0U,
+                    tangent?canonical_f64_bits(tangent->y):0U,
+                    tangent?canonical_f64_bits(tangent->z):0U,
+                    tangent?canonical_f64_bits(tangent->w):0U,
                 };
                 auto found = vertex_indices.find(vertex_key);
                 if (found == vertex_indices.end()) {
@@ -1328,7 +1363,8 @@ core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
                         options.vertex_color_layer.has_value()
                             ? std::optional<core::Vec4d>{color}
                             : std::nullopt,
-                        std::nullopt,
+                        tangent,
+                        {},
                     };
                     vertex.additional_uvs = std::move(additional_uv_values);
                     artifact.vertices.push_back(std::move(vertex));
@@ -1343,7 +1379,7 @@ core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
         artifact.submeshes.push_back({slot, first_index, index_count});
     }
 
-    if (options.generate_tangents) {
+    if (options.generate_tangents&&tangent_by_corner.empty()) {
         std::map<RenderTangentKey, std::uint32_t> tangent_vertex_indices;
         std::vector<render::TangentVertex> tangent_vertices;
         tangent_vertices.reserve(std::min(

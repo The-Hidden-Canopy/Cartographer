@@ -25,6 +25,14 @@ void require(bool condition, std::string_view message) {
 
 #define REQUIRE(condition) require(static_cast<bool>(condition), #condition)
 
+void remove_v40_tables(std::string& serialized) {
+    for (const std::string table : {"RIG_TEMPLATE_BINDINGS 0\n", "AGING_LAYERS 0\n"}) {
+        const auto at = serialized.find(table);
+        require(at != std::string::npos, "fixture contains the integrated schema table");
+        serialized.erase(at, table.size());
+    }
+}
+
 class TempDirectory final {
 public:
     TempDirectory() {
@@ -100,7 +108,7 @@ void erase_v33_character_record_tables(std::string& serialized) {
 void schema_35_preserves_kinematic_graph_table_and_migrates_schema_34() {
     using namespace carto::project;
     ProjectDocument document;
-    REQUIRE(document.schema_version() == 39U);
+    REQUIRE(document.schema_version() == ProjectDocument::kSchemaVersion);
     auto schema35 = document.serialize();
     const auto schema35_drafts = schema35.find("UNADMITTED_MODE_KEY_DRAFTS 0\n");
     REQUIRE(schema35_drafts != std::string::npos);
@@ -111,10 +119,11 @@ void schema_35_preserves_kinematic_graph_table_and_migrates_schema_34() {
     schema35.erase(accepted_pos, accepted_table.size());
     if (const auto control_workspace = schema35.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
         schema35.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
-    schema35.replace(0U, std::string("CARTOGRAPHER_PROJECT 39\n").size(),
+    remove_v40_tables(schema35);
+    schema35.replace(0U, ("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n").size(),
         "CARTOGRAPHER_PROJECT 35\n");
     const auto migrated_schema35 = ProjectDocument::deserialize(schema35);
-    REQUIRE(migrated_schema35 && migrated_schema35.value().serialize().starts_with("CARTOGRAPHER_PROJECT 39\n"));
+    REQUIRE(migrated_schema35 && migrated_schema35.value().serialize().starts_with(("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n")));
     std::ostringstream graph_record_bytes;
     graph_record_bytes << "CONNECTION_PORT_GRAPH "
                        << std::quoted(document.connection_port_graph().serialize()) << '\n';
@@ -140,7 +149,7 @@ void schema_35_preserves_kinematic_graph_table_and_migrates_schema_34() {
         "CARTOGRAPHER_PROJECT 34\n");
     const auto migrated_schema34 = ProjectDocument::deserialize(schema34);
     REQUIRE(migrated_schema34 && migrated_schema34.value().kinematic_graphs().empty());
-    REQUIRE(migrated_schema34.value().serialize().starts_with("CARTOGRAPHER_PROJECT 39\n"));
+    REQUIRE(migrated_schema34.value().serialize().starts_with(("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n")));
 
     auto missing_connection_graph = schema35;
     const auto graph_record = missing_connection_graph.find(empty_graph_record);

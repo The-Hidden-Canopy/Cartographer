@@ -75,6 +75,8 @@ void builtin_obj_providers_use_the_registry_lifecycle() {
 void builtin_gltf_export_provider_is_lifecycle_gated() {
     carto::providers::Registry registry;
     REQUIRE(carto::io::register_builtin_gltf_providers(registry));
+    REQUIRE(registry.resolve("geometry.import.gltf"));
+    REQUIRE(registry.resolve("geometry.import.glb"));
     const auto exporter = registry.resolve("geometry.export.gltf");
     REQUIRE(exporter);
     REQUIRE(exporter.value().id == "cartographer.gltf.export");

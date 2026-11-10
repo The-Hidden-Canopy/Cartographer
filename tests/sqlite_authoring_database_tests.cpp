@@ -1,4 +1,5 @@
 #include <carto/project/sqlite_authoring_database.hpp>
+#include <carto/core/filesystem.hpp>
 #include <carto/project/package.hpp>
 #include <carto/project/project.hpp>
 #include <carto/project/transaction.hpp>
@@ -6,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -14,6 +16,7 @@
 #include <iterator>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -402,6 +405,10 @@ void flat_project_migration_preserves_exact_export_and_rejects_overwrite() {
     }
 
     auto migrated = project::ProjectPackage::migrate_flat_project(source, destination);
+    if (!migrated) {
+        std::cerr << "flat migration diagnostic: " << migrated.error().message << '\n';
+        for (const auto& context : migrated.error().context) std::cerr << "  " << context << '\n';
+    }
     require(static_cast<bool>(migrated), "valid flat project migrates to a package");
     const auto has_database = migrated.value().has_document_database();
     require(has_database && has_database.value(),
@@ -471,8 +478,10 @@ void flat_project_migration_preserves_verified_graph_binding() {
     }
 
     auto migrated = project::ProjectPackage::migrate_flat_project(source, destination);
-    if (!migrated) std::cerr << "graph migration diagnostic: "
-        << migrated.error().message << '\n';
+    if (!migrated) {
+        std::cerr << "graph migration diagnostic: " << migrated.error().message << '\n';
+        for (const auto& context : migrated.error().context) std::cerr << "  " << context << '\n';
+    }
     require(static_cast<bool>(migrated), "graph-bound project migrates");
     require(migrated.value().manifest().evaluation_graph_blob ==
             std::optional<assets::Sha256Digest>{stored_graph.value().digest},
@@ -503,6 +512,148 @@ void invalid_flat_project_migration_leaves_no_destination() {
         "malformed source is rejected before package publication");
 }
 
+void flat_project_migration_preserves_captured_texture() {
+    TempDirectory directory;
+    const auto source_root = directory.path() / "source";
+    std::filesystem::create_directories(source_root);
+    assets::BlobStore source_blobs(source_root / ".carto-assets" / "source-blobs");
+    const std::string bytes = "captured texture fixture";
+    const auto stored = source_blobs.put(bytes, "image/png");
+    require(bool(stored), "texture fixture blob is stored");
+    project::TextureSourceRecord texture;
+    texture.id = 1U;
+    texture.name = "captured";
+    texture.relative_locator = source_blobs.path_for(stored.value().digest)
+        .lexically_relative(source_root).generic_string();
+    texture.content_digest = stored.value().digest;
+    texture.provenance = "fixture";
+    project::MaterialCatalog catalog;
+    require(bool(catalog.insert_texture(texture)), "captured texture enters material catalog");
+    project::ProjectDocument document;
+    journal::Journal journal_file(directory.path() / "texture-journal" / "journal.log");
+    auto transaction = project::ProjectTransaction::begin(document, journal_file, "migration-test");
+    require(transaction && transaction.value().set_material_catalog(catalog) &&
+            transaction.value().commit("material.bind"), "captured material catalog is admitted");
+    const auto source_path = source_root / "source.carto";
+    {
+        std::ofstream output(source_path, std::ios::binary);
+        output << document.serialize();
+        require(bool(output), "texture project is written");
+    }
+    const auto migrated = project::ProjectPackage::migrate_flat_project(source_path, directory.path() / "package");
+    require(bool(migrated), "captured texture project migrates");
+    assets::BlobStore target_blobs(migrated.value().root() / ".carto-assets" / "source-blobs");
+    const auto target = target_blobs.read(stored.value().digest);
+    require(target && std::string(target.value().begin(), target.value().end()) == bytes,
+            "captured texture bytes survive package migration");
+    const auto missing_root = directory.path() / "missing";
+    std::filesystem::create_directory(missing_root);
+    std::filesystem::copy_file(source_path, missing_root / "source.carto");
+    require(!project::ProjectPackage::migrate_flat_project(missing_root / "source.carto", missing_root / "package") &&
+            !std::filesystem::exists(missing_root / "package"),
+            "migration refuses to publish when a captured texture is missing");
+}
+
+void long_path_migration_reopens_and_preserves_collisions() {
+    TempDirectory directory;
+    auto deep = directory.path() / std::string(88U, 'a') / std::string(88U, 'b');
+#ifdef _WIN32
+    deep /= L"\u5de5\u7a0b";
+#endif
+    const auto source_root = deep / "source";
+    const auto source_path = source_root / "project.carto";
+    const auto destination = deep / "migrated-package";
+    require(destination.native().size() > 260U, "long migration fixture exceeds Windows MAX_PATH");
+    std::error_code error;
+    const auto native_deep = core::native_io_path(deep, error);
+    require(!error, "long fixture path resolves");
+    core::create_directories(native_deep, error);
+    require(!error, "long fixture directory is created");
+
+    auto source_package = project::ProjectPackage::create(source_root,
+        {"long-source", "Long path", "meters", "y"});
+    require(bool(source_package), "long source package is created");
+    eval::EvaluationGraph graph;
+    const auto graph_blob = source_package.value().store_evaluation_graph(graph);
+    require(bool(graph_blob), "long source graph is stored");
+    const auto inventory = source_package.value().blob_store().list();
+    require(inventory && inventory.value().size() == 1U &&
+            inventory.value().front().digest == graph_blob.value().digest,
+            "long-path blob inventory retains its verified graph entry");
+    project::ProjectDocument document;
+    journal::Journal journal_file(directory.path() / "long-journal" / "journal.log");
+    auto transaction = project::ProjectTransaction::begin(document, journal_file, "migration-test");
+    require(transaction && transaction.value().set_evaluation_graph_digest(graph_blob.value().digest) &&
+            transaction.value().commit("graph.bind"), "long source binds graph");
+    const auto serialized = document.serialize();
+    const auto native_source = core::native_io_path(source_path, error);
+    require(!error, "long source document path resolves");
+    {
+        std::ofstream output(native_source, std::ios::binary);
+        output << serialized;
+        require(bool(output), "long source document is written");
+    }
+    const auto migrated = project::ProjectPackage::migrate_flat_project(source_path, destination);
+    if (!migrated) {
+        std::cerr << "long migration diagnostic: " << migrated.error().message << '\n';
+        for (const auto& context : migrated.error().context) std::cerr << "  " << context << '\n';
+    }
+    require(bool(migrated), "long migration publishes successfully");
+    const auto reopened = project::ProjectPackage::open(destination);
+    require(reopened && reopened.value().load_evaluation_graph() &&
+            reopened.value().export_project_document() &&
+            reopened.value().export_project_document().value() == serialized,
+            "long published package independently reopens with its graph and exact project");
+
+    const auto collision = deep / "existing-package";
+    const auto native_collision = core::native_io_path(collision, error);
+    core::create_directories(native_collision, error);
+    require(!error, "collision directory is created");
+    {
+        std::ofstream marker(native_collision / "keep.txt", std::ios::binary);
+        marker << "preserve";
+        require(bool(marker), "collision marker is written");
+    }
+    require(!project::ProjectPackage::migrate_flat_project(source_path, collision),
+            "existing destination rejects migration");
+    std::ifstream marker(native_collision / "keep.txt", std::ios::binary);
+    const std::string marker_bytes((std::istreambuf_iterator<char>(marker)), {});
+    require(marker_bytes == "preserve", "collision leaves existing destination untouched");
+
+    const auto race_destination = deep / "race-package";
+    std::atomic<unsigned> winners{0U};
+    const auto race = [&] {
+        if (project::ProjectPackage::migrate_flat_project(source_path, race_destination)) ++winners;
+    };
+    std::thread first(race);
+    std::thread second(race);
+    first.join();
+    second.join();
+    require(winners == 1U, "concurrent migrations publish exactly one winner");
+    const auto race_result = project::ProjectPackage::open(race_destination);
+    require(race_result && race_result.value().export_project_document() &&
+            race_result.value().export_project_document().value() == serialized,
+            "collision winner remains complete and readable");
+
+    const auto missing_root = deep / "missing";
+    const auto native_missing = core::native_io_path(missing_root, error);
+    core::create_directories(native_missing, error);
+    require(!error, "missing graph fixture directory is created");
+    {
+        std::ofstream output(native_missing / "project.carto", std::ios::binary);
+        output << serialized;
+        require(bool(output), "missing graph fixture project is written");
+    }
+    const auto failed_destination = deep / "missing-package";
+    const auto native_failed = core::native_io_path(failed_destination, error);
+    require(!project::ProjectPackage::migrate_flat_project(missing_root / "project.carto", failed_destination) &&
+            !std::filesystem::exists(native_failed), "missing graph fails without publishing a destination");
+    for (const auto& entry : std::filesystem::directory_iterator(native_deep)) {
+        require(!entry.path().filename().string().starts_with(".cm-"),
+                "failed migration removes its staging directory");
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -527,6 +678,8 @@ int main(int argc, char** argv) {
             argc > 1 ? argv[1] : argv[0])));
     flat_project_migration_preserves_exact_export_and_rejects_overwrite();
     flat_project_migration_preserves_verified_graph_binding();
+    flat_project_migration_preserves_captured_texture();
+    long_path_migration_reopens_and_preserves_collisions();
     invalid_flat_project_migration_leaves_no_destination();
     std::cout << "SQLite authoring database checks passed\n";
 }

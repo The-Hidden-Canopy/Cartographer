@@ -1,4 +1,12 @@
 add_library(carto_production STATIC
+    src/authoring_material.cpp
+    src/authoring_material_bake.cpp
+    src/authoring_aging.cpp
+    src/authoring_material_surface.cpp
+    src/authoring_viewport.cpp
+    src/authoring_shadow.cpp
+    src/authoring_environment.cpp
+    src/authoring_temporal.cpp
     src/artifact_store.cpp
     src/bake_graph.cpp
     src/bake_job.cpp

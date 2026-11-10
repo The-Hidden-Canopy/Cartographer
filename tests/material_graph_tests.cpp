@@ -1,8 +1,10 @@
 #include <carto/project/material_graph.hpp>
+#include "../apps/desktop/studio_material_graph_draft.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <initializer_list>
 #include <iostream>
 #include <span>
 #include <string>
@@ -419,6 +421,50 @@ void cpu_evaluation_is_typed_deterministic_and_fail_closed() {
 } // namespace
 
 int main() {
+    {
+        using namespace carto;
+        using studio::MaterialGraphDraftIdentity;
+        using studio::MaterialGraphDraftState;
+        const MaterialGraphDraftIdentity original{1U, core::Revision{5U}, "graph.a", core::Revision{2U}};
+        const MaterialGraphDraftIdentity other_graph{1U, core::Revision{5U}, "graph.b", core::Revision{2U}};
+        const MaterialGraphDraftIdentity other_project{2U, core::Revision{5U}, "graph.a", core::Revision{2U}};
+        const MaterialGraphDraftIdentity project_edit{1U, core::Revision{6U}, "graph.a", core::Revision{2U}};
+        const MaterialGraphDraftIdentity graph_edit{1U, core::Revision{5U}, "graph.a", core::Revision{3U}};
+        require(studio::material_graph_draft_state(true,true,original,original) ==
+                    MaterialGraphDraftState::current,
+                "matching dirty graph draft remains applicable");
+        for (const auto& source : {other_graph, other_project, project_edit, graph_edit}) {
+            require(studio::material_graph_draft_state(true,true,original,source) ==
+                        MaterialGraphDraftState::stale,
+                    "dirty graph draft stays stale on any source identity change");
+            require(studio::material_graph_draft_state(true,false,original,source) ==
+                        MaterialGraphDraftState::reload,
+                    "clean graph draft reloads on any source identity change");
+        }
+        require(studio::material_graph_draft_state(false,true,original,original) ==
+                    MaterialGraphDraftState::stale &&
+                studio::material_graph_draft_state(false,false,original,original) ==
+                    MaterialGraphDraftState::reload,
+                "missing loaded identity never silently discards a dirty graph draft");
+        const studio::PendingMaterialGraphSelection pending{
+            1U, core::Revision{5U}, "graph.new", core::Revision{1U}};
+        using studio::PendingMaterialGraphState;
+        require(studio::pending_material_graph_state(pending,1U,core::Revision{5U},std::nullopt) ==
+                    PendingMaterialGraphState::waiting,
+                "new selection waits while the pre-creation snapshot is shown");
+        require(studio::pending_material_graph_state(pending,1U,core::Revision{6U},core::Revision{1U}) ==
+                    PendingMaterialGraphState::confirmed,
+                "new selection confirms the expected source revision in the same project");
+        require(studio::pending_material_graph_state(pending,2U,core::Revision{6U},core::Revision{1U}) ==
+                    PendingMaterialGraphState::unavailable &&
+                studio::pending_material_graph_state(pending,1U,core::Revision{6U},std::nullopt) ==
+                    PendingMaterialGraphState::unavailable &&
+                studio::pending_material_graph_state(pending,1U,core::Revision{5U},core::Revision{1U}) ==
+                    PendingMaterialGraphState::unavailable &&
+                studio::pending_material_graph_state(pending,1U,core::Revision{6U},core::Revision{2U}) ==
+                    PendingMaterialGraphState::unavailable,
+                "project switches, missing sources and changed source revisions require a new choice");
+    }
     deterministic_round_trip_and_compilation_report();
     hostile_graph_boundaries_fail_closed();
     cpu_evaluation_is_typed_deterministic_and_fail_closed();

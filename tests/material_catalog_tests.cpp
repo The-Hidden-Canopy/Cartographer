@@ -418,6 +418,10 @@ void texture_source_replacement_advances_revision_and_rejects_stale_edits() {
                 replacement.content_digest &&
             reopened.value().materials().at(71U).definition.base_color.asset == 501U,
         "replacement texture source and stable references survive catalog reopen");
+    auto later = replacement;
+    later.revision = replacement.revision.next().next();
+    require(static_cast<bool>(catalog.replace_texture(later)),
+        "existing catalog contract permits any advancing texture revision");
 }
 
 void hostile_catalog_inputs_fail_closed() {

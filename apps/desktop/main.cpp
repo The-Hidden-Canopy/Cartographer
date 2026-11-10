@@ -3,13 +3,21 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 #define IMGUI_DEFINE_MATH_OPERATORS
 
+#if defined(CARTO_DESKTOP_D3D12_UI) && !defined(CARTO_DESKTOP_D3D12_COMPILE_CHECK)
+#error "D3D12 desktop UI is disabled pending native lifecycle and visual validation"
+#endif
+#if defined(CARTO_DESKTOP_D3D12_VIEWPORT)
+#error "D3D12 authoring viewport is disabled pending verified asynchronous production and shutdown"
+#endif
+
 #include <windows.h>
 #include <commdlg.h>
 #include <dwmapi.h>
 #include <mmsystem.h>
+#ifndef CARTO_DESKTOP_D3D12_UI
 #include <vulkan/vulkan.h>
-
 #include <backends/imgui_impl_vulkan.h>
+#endif
 #include <backends/imgui_impl_win32.h>
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -27,6 +35,9 @@
 #include "studio_scene_camera.hpp"
 #include "studio_style.hpp"
 #include "studio_draft.hpp"
+#include "studio_environment_import.hpp"
+#include "studio_material_draft.hpp"
+#include "studio_material_graph_draft.hpp"
 #include "studio_sweep_source.hpp"
 #include "studio_viewshed.hpp"
 #include "studio_view_settings.hpp"
@@ -51,8 +62,14 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 #include <carto/d3d12/scene_renderer.hpp>
 #include <carto/d3d12/temporal_sampling.hpp>
 #endif
+#include <carto/production/authoring_aging.hpp>
+#if defined(CARTO_DESKTOP_D3D12_VIEWPORT) || defined(CARTO_DESKTOP_ASYNC_READBACK) || defined(CARTO_DESKTOP_RESIDENT_WORKER)
+#include <carto/d3d12/authoring_viewport.hpp>
+#endif
 #include <carto/assets/blob_store.hpp>
 #include <carto/assets/texture_source.hpp>
+#include <carto/assets/hdr_environment.hpp>
+#include <carto/character/rig_module.hpp>
 #include <carto/biological/proxy_mesh.hpp>
 #include <carto/botanical/source.hpp>
 #include <carto/condition/wave_import.hpp>
@@ -73,6 +90,9 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 #include <carto/runtime_api/client.hpp>
 #include <carto/terrain/terrain_tile.hpp>
 #include <carto/ui/ui.hpp>
+#ifndef CARTO_DESKTOP_D3D12_UI
+#include <carto/vulkan/runtime.hpp>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -93,6 +113,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 #include <limits>
 #include <map>
 #include <memory>
+#include <new>
 #include <optional>
 #include <set>
 #include <span>
@@ -105,6 +126,10 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#ifdef CARTO_DESKTOP_D3D12_UI
+#include "carto_d3d12_shell.hpp"
+#endif
 
 namespace {
 
@@ -315,6 +340,18 @@ material_graph_input_type(
     return std::nullopt;
 }
 
+#ifndef CARTO_DESKTOP_D3D12_UI
+// Backend callbacks run on the calling UI thread. Preserve the actual result
+// even if constructing the exception message itself runs out of memory.
+thread_local VkResult imgui_backend_last_result = VK_SUCCESS;
+[[nodiscard]] constexpr bool upload_submission_was_rejected(VkResult result) noexcept {
+    return result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY;
+}
+static_assert(upload_submission_was_rejected(VK_ERROR_OUT_OF_HOST_MEMORY));
+static_assert(upload_submission_was_rejected(VK_ERROR_OUT_OF_DEVICE_MEMORY));
+static_assert(!upload_submission_was_rejected(VK_ERROR_DEVICE_LOST));
+static_assert(!upload_submission_was_rejected(VK_ERROR_UNKNOWN));
+static_assert(!upload_submission_was_rejected(VK_SUCCESS));
 void check_vk(VkResult result, const char* operation) {
     if (result != VK_SUCCESS) {
         throw std::runtime_error(std::string(operation) + " failed with Vulkan result " +
@@ -350,6 +387,29 @@ int create_imgui_vulkan_surface(
     return static_cast<int>(result);
 }
 
+void trace_desktop_startup(const char* phase);
+
+// Both authoring producers promise binary coverage and transparent black.
+// Composite onto black before linear texture filtering, or straight-alpha
+// blending would darken silhouette edges. Reject unexpected output rather
+// than conceal a renderer fault or assume an intermediate-alpha contract.
+[[nodiscard]] constexpr bool authoring_pixel_on_black(std::uint8_t* pixel) noexcept {
+    if (pixel[3] == 255U) return true;
+    if (pixel[3] != 0U || pixel[0] != 0U || pixel[1] != 0U || pixel[2] != 0U)
+        return false;
+    pixel[3] = 255U;
+    return true;
+}
+static_assert([] {
+    std::array<std::uint8_t, 4> clear{0, 0, 0, 0};
+    std::array<std::uint8_t, 4> fault{255, 0, 255, 255};
+    std::array<std::uint8_t, 4> partial{255, 0, 0, 128};
+    std::array<std::uint8_t, 4> invalid_clear{1, 0, 0, 0};
+    return authoring_pixel_on_black(clear.data()) && clear[3] == 255U &&
+        authoring_pixel_on_black(fault.data()) && fault[0] == 255U && fault[2] == 255U &&
+        !authoring_pixel_on_black(partial.data()) && !authoring_pixel_on_black(invalid_clear.data());
+}());
+
 class VulkanShell final {
 public:
     enum class TextureUploadResult { ready, pending, failed };
@@ -361,6 +421,7 @@ public:
             std::clog << "cartographer: GPU cleanup retained: " << error.what() << '\n';
         }
     }
+    void new_frame() { ImGui_ImplVulkan_NewFrame(); }
 
     void initialize(HWND window) {
         window_ = window;
@@ -382,6 +443,7 @@ public:
         init_info.QueueFamily = queue_family_;
         init_info.Queue = queue_;
         init_info.CheckVkResultFn = [](VkResult result) {
+            imgui_backend_last_result = result;
             check_vk(result, "ImGui Vulkan backend");
         };
         init_info.DescriptorPool = descriptor_pool_;
@@ -389,7 +451,6 @@ public:
         // Detached surfaces query/clamp their own image count independently.
         init_info.MinImageCount = static_cast<std::uint32_t>(kFrameContextCount);
         init_info.ImageCount = static_cast<std::uint32_t>(kFrameContextCount);
-        init_info.CheckVkResultFn = [](VkResult result) { check_vk(result, "ImGui Vulkan backend"); };
         init_info.UseSwapchainMaintenance1 = present_retirement_enabled_;
         init_info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
         init_info.PipelineInfoMain.RenderPass = render_pass_;
@@ -403,7 +464,8 @@ public:
 
     [[nodiscard]] TextureUploadResult set_reference_image_texture(
         const carto::assets::DecodedRgba8Texture& decoded,
-        std::string& diagnostic) {
+        std::string& diagnostic) try {
+        diagnostic = "Reference texture upload ran out of memory.";
         carto::assets::TextureSourceLimits texture_limits;
         texture_limits.max_pixels = 16'777'216ULL;
         const auto valid = decoded.validate(texture_limits);
@@ -440,13 +502,19 @@ public:
             return TextureUploadResult::failed;
         }
         return TextureUploadResult::ready;
+    } catch (const std::bad_alloc&) {
+        if (device_lost_) throw;
+        cancel_upload("reference image");
+        try { diagnostic = "Out of memory"; } catch (const std::bad_alloc&) {}
+        return TextureUploadResult::failed;
     }
 
     [[nodiscard]] TextureUploadResult set_scene_capture_texture(
         std::uint32_t width, std::uint32_t height,
         std::span<const std::uint8_t> pixels,
         const carto::assets::Sha256Digest& pixel_digest,
-        std::string& diagnostic) {
+        std::string& diagnostic) try {
+        diagnostic = "Scene texture upload ran out of memory.";
         const std::uint64_t pixel_count = static_cast<std::uint64_t>(width) * height;
         if (width == 0U || height == 0U || pixel_count > 16'777'216ULL ||
             pixel_count * 4ULL != pixels.size() || pixel_digest.is_zero()) {
@@ -478,6 +546,114 @@ public:
             return TextureUploadResult::failed;
         }
         return TextureUploadResult::ready;
+    } catch (const std::bad_alloc&) {
+        if (device_lost_) throw;
+        cancel_upload("scene capture");
+        try { diagnostic = "Out of memory"; } catch (const std::bad_alloc&) {}
+        return TextureUploadResult::failed;
+    }
+
+    // The image is already display-encoded. A role and format-qualified
+    // digest keep uploads distinct across swapchain format changes.
+    [[nodiscard]] TextureUploadResult set_authoring_viewport_texture(
+        const carto::production::AuthoringViewportImage& image,
+        const std::string& pixel_digest, std::string& diagnostic) try {
+        const std::uint64_t pixels = static_cast<std::uint64_t>(image.width) * image.height;
+        if (!imgui_initialized_ || device_ == VK_NULL_HANDLE || command_pool_ == VK_NULL_HANDLE ||
+            queue_ == VK_NULL_HANDLE || image.width == 0U || image.height == 0U ||
+            pixels > 16'777'216ULL || image.display_rgba8.size() != pixels * 4ULL ||
+            pixel_digest.empty()) {
+            cancel_authoring_viewport_upload();
+            diagnostic = "authoring viewport texture is unavailable or invalid";
+            return TextureUploadResult::failed;
+        }
+        const bool srgb_target = swapchain_format_ == VK_FORMAT_B8G8R8A8_SRGB ||
+            swapchain_format_ == VK_FORMAT_R8G8B8A8_SRGB;
+        std::string digest;
+        bool staging_failure_diagnostic_ready = false;
+        try {
+            // Set the error before the large allocation, so reporting its
+            // failure does not itself require allocating memory.
+            diagnostic = "Rendered viewport staging ran out of memory.";
+            staging_failure_diagnostic_ready = true;
+            digest = pixel_digest + (srgb_target ? ":black-v1:srgb" : ":black-v1:unorm");
+            if (authoring_viewport_texture_.has_value() &&
+                authoring_viewport_texture_->digest == digest &&
+                authoring_viewport_texture_->width == image.width &&
+                authoring_viewport_texture_->height == image.height) {
+                cancel_authoring_viewport_upload();
+                diagnostic.clear();
+                return TextureUploadResult::ready;
+            }
+            const carto::studio::TextureUploadIdentity staging_key{
+                "authoring viewport", digest, image.width, image.height};
+            if (!authoring_staging_key_ || !(*authoring_staging_key_ == staging_key)) {
+                auto opaque_pixels = image.display_rgba8;
+                for (std::size_t i = 0; i < opaque_pixels.size(); i += 4U) {
+                    if (!authoring_pixel_on_black(opaque_pixels.data() + i)) {
+                        cancel_authoring_viewport_upload();
+                        diagnostic = "Rendered viewport returned invalid coverage or a nonblack transparent pixel.";
+                        return TextureUploadResult::failed;
+                    }
+                }
+                authoring_staging_pixels_ = std::move(opaque_pixels);
+                authoring_staging_key_ = staging_key;
+            }
+        } catch (const std::bad_alloc&) {
+            if (device_lost_) throw;
+            // Withdraw publication without retiring the previously displayed
+            // texture. Its in-flight GPU resources still follow normal fences.
+            cancel_authoring_viewport_upload();
+            // The first diagnostic assignment itself could fail under total
+            // exhaustion; use a short best-effort fallback in that case.
+            if (!staging_failure_diagnostic_ready) {
+                try { diagnostic = "Out of memory"; } catch (const std::bad_alloc&) {}
+            }
+            return TextureUploadResult::failed;
+        }
+        std::optional<Rgba8Texture> candidate;
+        const auto result = create_rgba8_texture(image.width, image.height, authoring_staging_pixels_,
+            digest, candidate, "authoring viewport", diagnostic, true);
+        if (result != TextureUploadResult::pending) {
+            authoring_staging_key_.reset();
+            authoring_staging_pixels_.clear();
+        }
+        if (result != TextureUploadResult::ready) return result;
+        if (!publish_rgba8_texture(authoring_viewport_texture_, retired_rgba8_textures_, candidate)) {
+            if (candidate.has_value()) destroy_rgba8_texture(*candidate);
+            diagnostic = "Unable to retain the prior authoring texture through frame presentation";
+            return TextureUploadResult::failed;
+        }
+        return TextureUploadResult::ready;
+    } catch (const std::bad_alloc&) {
+        if (device_lost_) throw;
+        cancel_authoring_viewport_upload();
+        try { diagnostic = "Out of memory"; } catch (const std::bad_alloc&) {}
+        return TextureUploadResult::failed;
+    }
+
+    [[nodiscard]] bool authoring_viewport_format_matches() const noexcept {
+        if (!authoring_viewport_texture_.has_value()) return false;
+        const bool srgb_target = swapchain_format_ == VK_FORMAT_B8G8R8A8_SRGB ||
+            swapchain_format_ == VK_FORMAT_R8G8B8A8_SRGB;
+        return authoring_viewport_texture_->digest.ends_with(
+            srgb_target ? ":black-v1:srgb" : ":black-v1:unorm");
+    }
+
+    [[nodiscard]] ImTextureID authoring_viewport_texture_id() const noexcept {
+        if (!authoring_viewport_texture_.has_value() ||
+            authoring_viewport_texture_->descriptor == VK_NULL_HANDLE) return ImTextureID_Invalid;
+        return to_imgui_texture_id(authoring_viewport_texture_->descriptor);
+    }
+
+    void cancel_authoring_viewport_upload() noexcept {
+        cancel_upload("authoring viewport");
+        authoring_staging_key_.reset();
+        authoring_staging_pixels_.clear();
+    }
+    void clear_authoring_viewport_texture() noexcept {
+        cancel_authoring_viewport_upload();
+        static_cast<void>(retire_rgba8_texture(authoring_viewport_texture_, retired_rgba8_textures_));
     }
 
     [[nodiscard]] ImTextureID reference_image_texture_id() const noexcept {
@@ -498,7 +674,8 @@ public:
 
     [[nodiscard]] TextureUploadResult set_source_reimport_thumbnail_texture(
         std::size_t slot, const carto::studio::MeshThumbnailRaster& raster,
-        std::string& diagnostic) {
+        std::string& diagnostic) try {
+        diagnostic = "Thumbnail upload ran out of memory.";
         const std::uint64_t pixel_count =
             static_cast<std::uint64_t>(raster.width) * raster.height;
         if (slot >= source_reimport_thumbnail_textures_.size() ||
@@ -531,6 +708,12 @@ public:
             return TextureUploadResult::failed;
         }
         return TextureUploadResult::ready;
+    } catch (const std::bad_alloc&) {
+        if (device_lost_) throw;
+        if (slot < source_reimport_thumbnail_textures_.size())
+            cancel_upload(slot == 0U ? "source reimport thumbnail 0" : "source reimport thumbnail 1");
+        try { diagnostic = "Out of memory"; } catch (const std::bad_alloc&) {}
+        return TextureUploadResult::failed;
     }
 
     [[nodiscard]] ImTextureID source_reimport_thumbnail_texture_id(
@@ -767,6 +950,10 @@ private:
         carto::studio::TextureUploadTicket ticket;
         explicit PendingUpload(carto::studio::TextureUploadIdentity key) : ticket(std::move(key)) {}
     };
+    // Once a descriptor is acquired, publication and removal of the pending
+    // owner must not throw between transferring and erasing its Vulkan handles.
+    static_assert(std::is_nothrow_move_constructible_v<Rgba8Texture>);
+    static_assert(std::is_nothrow_move_assignable_v<PendingUpload>);
 
     bool release_upload_submission(PendingUpload& upload, bool retirement_confirmed = false) noexcept {
         if (!retirement_confirmed && !upload.ticket.may_release_submission()) return false;
@@ -782,11 +969,20 @@ private:
         return true;
     }
 
-    void poll_uploads() noexcept {
+    void poll_uploads() {
+        if (device_lost_) check_vk(VK_ERROR_DEVICE_LOST, "poll texture uploads");
         for (auto& upload : pending_uploads_) {
-            if (upload.fence != VK_NULL_HANDLE && vkGetFenceStatus(device_, upload.fence) == VK_SUCCESS) {
+            if (upload.fence == VK_NULL_HANDLE) continue;
+            const auto status = vkGetFenceStatus(device_, upload.fence);
+            if (status == VK_ERROR_DEVICE_LOST) {
+                device_lost_ = true;
+                check_vk(status, "poll texture upload fence");
+            }
+            if (status == VK_SUCCESS) {
                 upload.ticket.observe_completion();
                 release_upload_submission(upload);
+            } else if (status != VK_NOT_READY) {
+                check_vk(status, "poll texture upload fence");
             }
         }
         std::erase_if(pending_uploads_, [&](PendingUpload& upload) {
@@ -808,8 +1004,23 @@ private:
             diagnostic = "The requested texture upload is pending.";
             return TextureUploadResult::pending;
         }
-        upload.texture.descriptor = ImGui_ImplVulkan_AddTexture(
-            upload.texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        imgui_backend_last_result = VK_SUCCESS;
+        try {
+            upload.texture.descriptor = ImGui_ImplVulkan_AddTexture(
+                upload.texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        } catch (const std::bad_alloc&) {
+            upload.ticket.cancel();
+            if (imgui_backend_last_result == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+            throw;
+        } catch (const std::runtime_error& error) {
+            upload.ticket.cancel();
+            if (imgui_backend_last_result == VK_ERROR_DEVICE_LOST) {
+                device_lost_ = true;
+                throw; // Preserve the existing fatal device-loss path.
+            }
+            diagnostic = "Texture descriptor allocation failed: " + std::string(error.what());
+            return TextureUploadResult::failed;
+        }
         if (upload.texture.descriptor == VK_NULL_HANDLE) {
             destroy_rgba8_texture(upload.texture);
             pending_uploads_.erase(pending_uploads_.begin() + static_cast<std::ptrdiff_t>(index));
@@ -924,7 +1135,14 @@ private:
         const std::string& digest,
         std::optional<Rgba8Texture>& destination,
         std::string_view label,
-        std::string& diagnostic) {
+        std::string& diagnostic,
+        bool encoded_display = false) try {
+        // Reserve a useful message before allocations or Vulkan handles.
+        diagnostic = "Texture upload ran out of memory.";
+        const bool srgb_target = swapchain_format_ == VK_FORMAT_B8G8R8A8_SRGB ||
+            swapchain_format_ == VK_FORMAT_R8G8B8A8_SRGB;
+        const VkFormat pixel_format = encoded_display && srgb_target
+            ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
         if (destination.has_value()) {
             diagnostic = "RGBA8 " + std::string(label) +
                 " upload destination must be empty until publication";
@@ -940,13 +1158,14 @@ private:
         }
         VkFormatProperties format_properties{};
         vkGetPhysicalDeviceFormatProperties(
-            physical_device_, VK_FORMAT_R8G8B8A8_UNORM, &format_properties);
+            physical_device_, pixel_format, &format_properties);
         constexpr VkFormatFeatureFlags required_format_features =
-            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
         if ((format_properties.optimalTilingFeatures & required_format_features) !=
             required_format_features) {
-            diagnostic = "Vulkan device cannot sample an RGBA8 " + std::string(label) +
-                " texture";
+            diagnostic = "Vulkan device cannot linearly sample and upload an RGBA8 " +
+                std::string(label) + " texture";
             return TextureUploadResult::failed;
         }
         const carto::studio::TextureUploadIdentity key{std::string(label), digest, width, height};
@@ -997,9 +1216,16 @@ private:
                 staging_memory = VK_NULL_HANDLE;
             }
         };
-        const auto fail = [&](std::string reason) {
+        const auto cleanup_before_submit = [&]() noexcept {
             cleanup_staging();
             destroy_rgba8_texture(candidate);
+        };
+        struct PreSubmitGuard {
+            decltype(cleanup_before_submit)& cleanup;
+            bool active = true;
+            ~PreSubmitGuard() noexcept { if (active) cleanup(); }
+        } guard{cleanup_before_submit};
+        const auto fail = [&](std::string reason) {
             diagnostic = std::move(reason);
             return TextureUploadResult::failed;
         };
@@ -1064,7 +1290,7 @@ private:
         VkImageCreateInfo image_info{};
         image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         image_info.imageType = VK_IMAGE_TYPE_2D;
-        image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        image_info.format = pixel_format;
         image_info.extent = {candidate.width, candidate.height, 1U};
         image_info.mipLevels = 1U;
         image_info.arrayLayers = 1U;
@@ -1098,7 +1324,7 @@ private:
         view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         view_info.image = candidate.image;
         view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        view_info.format = pixel_format;
         view_info.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
             VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
         view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1173,16 +1399,44 @@ private:
         fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         if (vkCreateFence(device_, &fence_info, nullptr, &upload_fence) != VK_SUCCESS)
             return fail("Vulkan upload fence allocation failed for " + std::string(label));
-        if (vkQueueSubmit(queue_, 1U, &upload_submit, upload_fence) != VK_SUCCESS)
-            return fail("Vulkan texture upload submission failed for " + std::string(label));
-
-        pending.texture = std::move(candidate);
-        pending.staging_buffer = staging_buffer;
-        pending.staging_memory = staging_memory;
-        pending.command = upload_command;
-        pending.fence = upload_fence;
+        // Insert the owner before submission. All transfers after insertion
+        // are non-throwing, and the guard is disarmed before the queue call,
+        // whose failure may leave submission ownership uncertain.
+        static_assert(std::is_nothrow_move_constructible_v<PendingUpload>);
+        static_assert(std::is_nothrow_move_assignable_v<PendingUpload>);
+        static_assert(std::is_nothrow_move_assignable_v<Rgba8Texture>);
         pending.ticket.mark_submitted();
         pending_uploads_.push_back(std::move(pending));
+        auto& submitted_upload = pending_uploads_.back();
+        submitted_upload.texture = std::move(candidate);
+        submitted_upload.staging_buffer = staging_buffer;
+        submitted_upload.staging_memory = staging_memory;
+        submitted_upload.command = upload_command;
+        submitted_upload.fence = upload_fence;
+        guard.active = false;
+        const VkResult submitted = vkQueueSubmit(queue_, 1U, &upload_submit, upload_fence);
+        if (submitted != VK_SUCCESS) {
+            if (upload_submission_was_rejected(submitted)) {
+                // Vulkan guarantees these failed submissions leave the
+                // referenced objects and synchronization state unchanged.
+                // This owner was installed before the call but was never
+                // accepted by the queue, so no fence wait is needed.
+                if (submitted_upload.ticket.reject_unaccepted_submission()) {
+                    release_upload_submission(submitted_upload);
+                    destroy_rgba8_texture(submitted_upload.texture);
+                    pending_uploads_.pop_back();
+                    diagnostic = "Vulkan texture submission ran out of memory; prior texture retained.";
+                    return TextureUploadResult::failed;
+                }
+            }
+            submitted_upload.ticket.cancel();
+            if (submitted == VK_ERROR_DEVICE_LOST) {
+                device_lost_ = true;
+                check_vk(submitted, "texture upload submission");
+            }
+            diagnostic = "Vulkan texture submission failed; GPU resources remain owned pending retirement.";
+            return TextureUploadResult::failed;
+        }
         // From here, even a timeout or device error cannot free in-flight
         // commands/staging. The pending owner survives until fence completion
         // or the explicit device shutdown boundary.
@@ -1193,10 +1447,23 @@ private:
             pending_uploads_[index].ticket.observe_completion();
             release_upload_submission(pending_uploads_[index]);
         } else if (waited != VK_TIMEOUT) {
+            if (waited == VK_ERROR_DEVICE_LOST) {
+                device_lost_ = true;
+                check_vk(waited, "texture upload completion");
+            }
             diagnostic = "Texture upload completion failed; pending GPU resources remain owned.";
             return TextureUploadResult::failed;
         }
         return consume_upload(index, key, destination, diagnostic);
+    } catch (const std::bad_alloc&) {
+        if (device_lost_) throw;
+        // The pre-submit guard has already cleaned local handles. Submitted
+        // uploads remain in pending_uploads_ until retirement is confirmed.
+        cancel_upload(label);
+        try {
+            diagnostic = device_lost_ ? "Vulkan device lost during texture upload." : "Out of memory";
+        } catch (const std::bad_alloc&) {}
+        return TextureUploadResult::failed;
     }
 
     // ImGui rotates its upload buffers by InitInfo.ImageCount. Surface
@@ -1640,6 +1907,8 @@ private:
         check_vk(vkGetSwapchainImagesKHR(device_, swapchain_, &actual_count, nullptr), "vkGetSwapchainImagesKHR");
         images_.resize(actual_count);
         check_vk(vkGetSwapchainImagesKHR(device_, swapchain_, &actual_count, images_.data()), "vkGetSwapchainImagesKHR");
+        trace_desktop_startup(("swapchain.images." + std::to_string(actual_count) + ".mode." +
+            std::to_string(swapchain_present_mode_)).c_str());
         std::clog << "cartographer: swapchain images=" << actual_count
                   << " frames=" << kFrameContextCount << " present_mode=" << swapchain_present_mode_
                   << " extent=" << swapchain_width_ << 'x' << swapchain_height_ << '\n';
@@ -1683,7 +1952,7 @@ private:
     }
 
     void recreate_swapchain() {
-        if (client_width() == 0 || client_height() == 0) return;
+        if (IsIconic(window_) || client_width() == 0 || client_height() == 0) return;
         // Maintenance1 callers already observed every main render/present
         // fence. Pending uploads and detached windows own separate resources.
         if (!present_retirement_enabled_) check_vk(vkDeviceWaitIdle(device_), "vkDeviceWaitIdle legacy resize");
@@ -1778,6 +2047,10 @@ public:
                         texture.reset();
                     }
                 }
+                if (authoring_viewport_texture_.has_value()) {
+                    destroy_rgba8_texture(*authoring_viewport_texture_);
+                    authoring_viewport_texture_.reset();
+                }
                 destroy_retired_rgba8_textures(true);
                 ImGui_ImplVulkan_Shutdown();
                 imgui_initialized_ = false;
@@ -1850,6 +2123,9 @@ private:
     std::vector<PresentRetirement> present_retirement_;
     std::optional<Rgba8Texture> reference_image_texture_;
     std::optional<Rgba8Texture> scene_capture_texture_;
+    std::optional<Rgba8Texture> authoring_viewport_texture_;
+    std::optional<carto::studio::TextureUploadIdentity> authoring_staging_key_;
+    std::vector<std::uint8_t> authoring_staging_pixels_;
     std::array<std::optional<Rgba8Texture>, 2U>
         source_reimport_thumbnail_textures_;
     std::vector<RetiredTexture> retired_rgba8_textures_;
@@ -1865,6 +2141,40 @@ private:
     bool present_retirement_enabled_ = false;
     bool device_lost_ = false;
 };
+using DesktopShell = VulkanShell;
+#else
+using DesktopShell = carto::desktop::D3D12Shell;
+#endif
+
+// A future process-owned viewport worker must bind this gate before starting
+// any work. Null callbacks mean no worker has been started; incomplete binding
+// or a failed retirement check never grants permission to exit.
+struct ViewportWorkerShutdownGate {
+    void* owner = nullptr;
+    void (*stop)(void*) noexcept = nullptr;
+    bool (*ready)(void*) noexcept = nullptr;
+    bool bound = false;
+    bool stopping = false;
+
+    bool bind(void* value, void (*request_stop)(void*) noexcept,
+              bool (*shutdown_ready)(void*) noexcept) noexcept {
+        if (bound || !value || !request_stop || !shutdown_ready) return false;
+        owner = value;
+        stop = request_stop;
+        ready = shutdown_ready;
+        bound = true;
+        return true;
+    }
+    void request_stop() noexcept {
+        stopping = true;
+        if (bound && stop) stop(owner);
+    }
+    [[nodiscard]] bool shutdown_ready() const noexcept {
+        if (!bound) return true; // No producer may start without binding first.
+        return stopping && owner && stop && ready && ready(owner);
+    }
+};
+ViewportWorkerShutdownGate viewport_worker_shutdown;
 
 struct DesktopState;
 DesktopState* g_state = nullptr;
@@ -2007,6 +2317,7 @@ bool same_camera_source(
         left.vertical_fov_radians == right.vertical_fov_radians &&
         left.orthographic_height == right.orthographic_height &&
         left.near_plane == right.near_plane && left.far_plane == right.far_plane &&
+        left.exposure_ev == right.exposure_ev && left.tone_mode == right.tone_mode &&
         left.active_for_review == right.active_for_review;
 }
 
@@ -2450,6 +2761,9 @@ enum class FileDialogKind {
     environment_image,
     material_surface_id_recipe,
     bake_output_directory,
+    hdr_environment,
+    rig_module,
+    material_library,
 };
 
 enum class StandardMeshExport {
@@ -2479,7 +2793,7 @@ carto::studio::FilePickerTheme file_picker_theme = carto::studio::FilePickerThem
     case FileDialogKind::mesh_import:
         dialog.lpstrFilter =
             L"Supported Assets (*.obj;*.ply;*.stl;*.gltf;*.glb)\0*.obj;*.ply;*.stl;*.gltf;*.glb\0"
-            L"Embedded glTF / GLB scene (*.gltf;*.glb)\0*.gltf;*.glb\0"
+            L"glTF / GLB scene (*.gltf;*.glb)\0*.gltf;*.glb\0"
             L"Wavefront OBJ (*.obj)\0*.obj\0"
             L"PLY (*.ply)\0*.ply\0"
             L"STL (*.stl)\0*.stl\0"
@@ -2586,6 +2900,15 @@ carto::studio::FilePickerTheme file_picker_theme = carto::studio::FilePickerThem
         break;
     case FileDialogKind::audio_clip:
         dialog.lpstrFilter = L"WAVE audio clip (*.wav;*.wave)\0*.wav;*.wave\0All Files\0*.*\0";
+        break;
+    case FileDialogKind::hdr_environment:
+        dialog.lpstrFilter = L"Radiance HDR environment (*.hdr)\0*.hdr\0";
+        break;
+    case FileDialogKind::rig_module:
+        dialog.lpstrFilter = L"Cartographer rig module (*.cartorig)\0*.cartorig\0All files\0*.*\0";
+        break;
+    case FileDialogKind::material_library:
+        dialog.lpstrFilter = L"Embedded Cartographer material library (*.gltf;*.glb)\0*.gltf;*.glb\0";
         break;
     case FileDialogKind::texture_source:
         dialog.lpstrFilter =
@@ -2819,8 +3142,106 @@ struct DesktopState {
 #endif
 
     ApplicationSession session;
+    bool material_viewport_enabled = false;
+    // Queueing a CPU frame does not prove that it replaced the preview on
+    // screen. Once preview is enabled, keep viewport editing paused for this
+    // session until displayed-frame identity can be established safely.
+    bool viewport_edit_requires_restart = false;
+    bool viewport_controls_open = false;
+    bool shared_rigs_open = false;
+    bool shared_rig_rights_confirmed = false;
+    bool material_library_rights_confirmed = false;
+    carto::project::ObjectAgingLayer aging_draft;
+    std::string aging_draft_key;
+    std::string aging_validation_key;
+    bool aging_stale = false;
+    std::array<char,97> aging_operation_name{};
+    bool shared_rig_mapping_confirmed = false;
+    std::string shared_rig_module;
+    std::string shared_rig_source_key;
+    std::string shared_rig_mapping_key;
+    std::optional<carto::project::ProjectDocument> shared_rig_source;
+    carto::scene::ObjectId shared_rig_root;
+    std::map<std::uint64_t, carto::scene::ObjectId> shared_rig_mapping;
+    double shared_rig_length_scale = 1;
+    std::array<char,129> shared_rig_capture_name{};
+    bool export_bake_graphs = false;
+    std::uint32_t export_bake_resolution = 64;
+    int viewport_snap_policy = 0;
+    std::uint32_t lightmap_uv_output = 2;
+    std::uint32_t lightmap_uv_resolution = 1024;
+    std::optional<carto::project::AuthoredEnvironment> environment_draft;
+    std::string environment_draft_key;
+#ifdef CARTO_DESKTOP_D3D12_VIEWPORT
+    bool material_viewport_cpu_reference = false;
+    std::unique_ptr<carto::d3d12::AuthoringViewport> material_gpu_viewport;
+    std::shared_ptr<const carto::project::ProjectDocument> material_gpu_source;
+    std::shared_ptr<const carto::production::AuthoringTextureLibrary> material_gpu_textures;
+    std::uint64_t material_gpu_source_generation = 0U;
+    carto::core::Revision material_gpu_source_revision;
+#ifdef CARTO_DESKTOP_D3D12_UI
+    std::optional<carto::production::AuthoringViewportRequest> material_gpu_last_request;
+    bool material_gpu_readback_comparison = [] {
+        const auto* mode = std::getenv("CARTO_DESKTOP_VIEWPORT_BRIDGE");
+        return mode && std::string_view(mode) == "1";
+    }();
+    bool material_gpu_synchronous_timing = [] {
+        const auto* mode = std::getenv("CARTO_DESKTOP_VIEWPORT_SYNC_TIMING");
+        return mode && std::string_view(mode) == "1";
+    }();
+#ifdef CARTO_DESKTOP_STARTUP_TRACE
+    // Bounded diagnostic redraws of the identical authored scene. Does not edit
+    // camera/project state or change resolution; disabled unless requested.
+    unsigned material_profile_remaining = [] {
+        const auto* count = std::getenv("CARTO_DESKTOP_VIEWPORT_PROFILE_FRAMES");
+        if (!count) return 0U;
+        char* end = nullptr;
+        const auto parsed = std::strtoul(count, &end, 10);
+        return end != count && *end == '\0' && parsed <= 256UL ? static_cast<unsigned>(parsed) : 0U;
+    }();
+    bool material_profile_auto_close = false;
+    bool material_profile_first_paint = false;
+    unsigned material_profile_tail = 0;
+#endif
+#endif
+#endif
+    std::string material_viewport_metrics;
+
+    bool material_viewport_displayed = false;
+    bool viewport_producer_seen_this_frame = false;
+    std::uint64_t material_viewport_generation = 0U;
+    bool material_viewport_authored_camera = false;
+    std::string material_display_source_key;
+    float material_viewport_exposure = 0.0F;
+    int material_viewport_tone = 0;
+    int material_viewport_scale = 0;
+    std::string material_viewport_key;
+    std::string material_viewport_diagnostic;
+    std::optional<carto::production::AuthoringViewportImage> material_viewport_image;
+#if defined(CARTO_DESKTOP_ASYNC_READBACK) || defined(CARTO_DESKTOP_RESIDENT_WORKER)
+    std::string material_requested_key;
+    std::string material_pending_upload_key;
+    std::string material_pending_pixel_digest;
+    std::string material_display_pixel_digest;
+    std::uint64_t material_next_request_id = 0U;
+    std::optional<carto::d3d12::ReadbackViewportIdentity> material_requested_identity;
+    bool material_requested_started = false;
+    std::optional<carto::production::AuthoringViewportImage> material_pending_upload;
+#endif
+#ifdef CARTO_DESKTOP_RESIDENT_WORKER
+    struct PendingResidentJob {
+        carto::d3d12::ReadbackViewportIdentity identity;
+        carto::project::ProjectDocument source;
+        std::optional<std::filesystem::path> path;
+        carto::production::AuthoringViewportRequest request;
+        std::shared_ptr<carto::d3d12::D3D12Device> device;
+    };
+    std::optional<PendingResidentJob> pending_resident_job;
+    std::optional<carto::d3d12::ReadbackViewportPoll> completed_resident_job;
+#endif
+
     carto::ui::UiController ui;
-    VulkanShell renderer;
+    DesktopShell renderer;
     ~DesktopState() {
         static_cast<void>(uv_tile_bake_stop_source.request_stop());
         stop_condition_audio_audition();
@@ -2832,6 +3253,7 @@ struct DesktopState {
     std::string static_scene_source_namespace;
     std::array<char, 1025U> static_scene_import_reason{};
     bool static_scene_rights_confirmed = false;
+    bool static_scene_allow_default_material_projection = false;
     bool static_scene_popup_requested = false;
     ShellSurface surface = ShellSurface::workspace;
     WorkbenchFlow workbench_flow = WorkbenchFlow::focus;
@@ -2840,6 +3262,7 @@ struct DesktopState {
     std::optional<carto::ui::WorkbenchInstrument> pending_instrument_snap;
     std::optional<carto::core::Vec2d> workbench_native_release_position;
     bool renderer_ready = false;
+    bool close_accepted = false;
     std::optional<carto::ui::Theme> applied_window_theme;
     std::optional<bool> applied_system_high_contrast;
     ImFont* body_font = nullptr;
@@ -3001,14 +3424,16 @@ struct DesktopState {
     std::array<char, 257U> asset_browser_search{};
     std::map<std::uint64_t, carto::studio::MeshThumbnailCacheEntry> asset_thumbnail_cache;
     int scene_browser_filter = 0;
-    carto::core::Revision material_draft_revision{};
+    carto::studio::MaterialDraftIdentity material_draft_identity{};
     carto::render::StandardMaterial material_draft;
     bool material_draft_loaded = false;
     bool material_draft_dirty = false;
     std::array<char, 257> material_graph_identity_buffer{};
     std::string selected_material_graph_identity;
+    std::optional<carto::studio::PendingMaterialGraphSelection> pending_material_graph_selection;
+    bool material_graph_selection_needs_choice = false;
     carto::project::MaterialGraph material_graph_draft;
-    carto::core::Revision material_graph_draft_project_revision{};
+    carto::studio::MaterialGraphDraftIdentity material_graph_draft_identity{};
     std::optional<carto::assets::Sha256Digest> material_graph_draft_digest;
     std::optional<carto::project::MaterialGraphCompileReport> material_graph_compile_report;
     std::optional<carto::project::MaterialGraphEvaluation> material_graph_cpu_preview;
@@ -4096,6 +4521,10 @@ struct DesktopState {
         }
         action_feedback = result.value().action + " accepted at revision " +
             std::to_string(result.value().revision_after.value());
+        for(const auto& warning:result.value().warnings) {
+            if(action_feedback.size()>6000)break;
+            action_feedback+="\nWarning: "+warning.message;
+        }
         action_feedback_error = false;
         return true;
     }
@@ -5929,6 +6358,7 @@ struct DesktopState {
             static_scene_source_namespace = context.source_namespace;
             static_scene_import_reason.fill('\0');
             static_scene_rights_confirmed = false;
+            static_scene_allow_default_material_projection = false;
             static_scene_popup_requested = true;
             return;
         }
@@ -5937,7 +6367,7 @@ struct DesktopState {
         else if (extension == ".ply") format = carto::ui::MeshImportFormat::ply;
         else if (extension == ".stl") format = carto::ui::MeshImportFormat::stl;
         if (!format.has_value()) {
-            action_feedback = "Choose an OBJ, PLY, STL, or embedded glTF/GLB scene.";
+            action_feedback = "Choose OBJ, PLY, STL, or a glTF/GLB scene. FBX, USD and Blend require a compatible external adapter.";
             action_feedback_error = true;
             MessageBoxW(window, wide(action_feedback).c_str(),
                         L"Cartographer mesh import", MB_OK | MB_ICONWARNING);
@@ -5985,10 +6415,15 @@ struct DesktopState {
         if (ImGui::BeginPopupModal(title, &open, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::TextWrapped("Source: %s", pending_static_scene_path->filename().string().c_str());
             ImGui::TextWrapped("Project: %s", snapshot.project_name.c_str());
-            ImGui::TextWrapped("Import embedded static geometry, hierarchy and materials. "
-                "Skins, animation and external resources are refused.");
+            ImGui::TextWrapped("Import static geometry, hierarchy and materials. Plain sibling "
+                "buffer filenames are captured with the source; external images, skins and animation are refused.");
             ImGui::Checkbox("I own this source or have permission to reuse it",
                 &static_scene_rights_confirmed);
+            ImGui::Checkbox("Allow two-sided projection of missing glTF materials",
+                &static_scene_allow_default_material_projection);
+            ImGui::TextWrapped("glTF's implicit material is single-sided; this option "
+                "uses its default PBR values but changes back-face appearance. "
+                "If used, the saved project requires an updated Cartographer reader.");
             ImGui::InputText("Import reason", static_scene_import_reason.data(),
                 static_scene_import_reason.size());
             const bool stale_context = !snapshot.project_path ||
@@ -6014,7 +6449,7 @@ struct DesktopState {
                 auto imported = ui.import_static_gltf_scene(*pending_static_scene_path,
                     static_scene_project_generation, static_scene_project_revision,
                     static_scene_source_namespace, static_scene_rights_confirmed,
-                    std::string(reason));
+                    std::string(reason), static_scene_allow_default_material_projection);
                 action_feedback_error = !imported;
                 if (!imported) {
                     action_feedback = imported.error().message;
@@ -6953,10 +7388,10 @@ struct DesktopState {
             cancel_native_transform_drag(preview.error().message);
             return true;
         }
-        const bool grid_snap =
-            (event.modifiers & carto::ui::kNativeModifierControl) != 0U;
-        const bool geometry_snap = !grid_snap &&
-            (event.modifiers & carto::ui::kNativeModifierShift) != 0U;
+        const bool control_snap = (event.modifiers & carto::ui::kNativeModifierControl) != 0U;
+        const bool shift_snap = (event.modifiers & carto::ui::kNativeModifierShift) != 0U;
+        const bool grid_snap = control_snap || (!shift_snap && viewport_snap_policy == 1);
+        const bool geometry_snap = !grid_snap && (shift_snap || viewport_snap_policy == 2);
         const auto snapped_preview = carto::editor::snap_viewport_transform_preview(
             preview.value(), native_transform_drag->axis, snapshot.viewport.scene,
             snapshot.project_revision, grid_snap, geometry_snap,
@@ -8132,6 +8567,7 @@ struct DesktopState {
     }
 
     bool route_native_pointer(const carto::ui::NativePointerEvent& event) {
+        if (material_viewport_enabled || viewport_edit_requires_restart) return false;
         if (mesh_loop_cut_seed_pick_active) {
             return route_native_loop_cut_seed_pick(event);
         }
@@ -8157,8 +8593,31 @@ struct DesktopState {
             native_viewport_hits.screen_origin + native_viewport_hits.extent);
         if (!viewport.Contains(point)) return false;
 
-        if (begin_native_condition_gizmo_drag(event, snapshot, point)) return true;
-        if (begin_native_transform_drag(event, snapshot, point)) return true;
+        if (!(material_viewport_displayed && material_viewport_authored_camera)) {
+            if (begin_native_condition_gizmo_drag(event, snapshot, point)) return true;
+            if (begin_native_transform_drag(event, snapshot, point)) return true;
+        }
+        if (material_viewport_displayed && material_viewport_generation != snapshot.project_generation) return false;
+        if (material_viewport_displayed && material_viewport_image &&
+            material_viewport_image->source_revision == snapshot.project_revision &&
+            (snapshot.selection.mode == carto::editor::SelectionMode::object ||
+             snapshot.selection.mode == carto::editor::SelectionMode::face)) {
+            const auto& image = *material_viewport_image;
+            if (image.objects.size() != std::uint64_t(image.width)*image.height ||
+                image.faces.size() != image.objects.size()) return false;
+            const auto x = static_cast<std::uint32_t>(std::clamp(
+                (point.x - viewport.Min.x) / native_viewport_hits.extent.x * static_cast<float>(image.width),
+                0.0F, static_cast<float>(image.width - 1U)));
+            const auto y = static_cast<std::uint32_t>(std::clamp(
+                (point.y - viewport.Min.y) / native_viewport_hits.extent.y * static_cast<float>(image.height),
+                0.0F, static_cast<float>(image.height - 1U)));
+            const auto pixel = static_cast<std::size_t>(y) * image.width + x;
+            if (!image.objects[pixel]) return false;
+            if (snapshot.selection.mode == carto::editor::SelectionMode::face)
+                static_cast<void>(dispatch(SelectFaceAction{image.objects[pixel], image.faces[pixel], *selection_operation}));
+            else static_cast<void>(dispatch(SelectObjectAction{image.objects[pixel], *selection_operation}));
+            return true;
+        }
 
         std::optional<carto::ui::ProjectedSurfaceHitResolution> perspective_surface_hit;
         if (perspective_camera_active) {
@@ -8430,8 +8889,8 @@ struct DesktopState {
             return;
         }
         const auto report = binary_container
-            ? carto::io::export_glb(document.value(), *path)
-            : carto::io::export_gltf(document.value(), *path);
+            ? carto::io::export_glb(document.value(), *path, carto::io::GltfExportOptions{*snapshot.project_path,{},export_bake_graphs?export_bake_resolution:0U})
+            : carto::io::export_gltf(document.value(), *path, carto::io::GltfExportOptions{*snapshot.project_path,{},export_bake_graphs?export_bake_resolution:0U});
         if (!report) {
             MessageBoxW(window, wide(report.error().message).c_str(),
                         L"Cartographer export failed", MB_OK | MB_ICONERROR);
@@ -8721,10 +9180,35 @@ struct DesktopState {
         discard_prompt_pending = true;
     }
 
+    // A hidden, collapsed, or otherwise undrawn viewport must not admit an
+    // old worker result. Retain published texture ownership until normal
+    // replacement or renderer shutdown; cancellation only revokes intent.
+    void invalidate_unseen_viewport() noexcept {
+#if defined(CARTO_DESKTOP_ASYNC_READBACK) || defined(CARTO_DESKTOP_RESIDENT_WORKER)
+        if (viewport_worker_shutdown.bound && viewport_worker_shutdown.owner &&
+            !viewport_worker_shutdown.stopping)
+            static_cast<carto::d3d12::ReadbackViewportWorker*>(viewport_worker_shutdown.owner)->invalidate();
+        renderer.cancel_authoring_viewport_upload();
+        material_pending_upload.reset();
+        material_pending_upload_key.clear();
+        material_pending_pixel_digest.clear();
+        material_requested_key.clear();
+        material_requested_identity.reset();
+        material_requested_started = false;
+#ifdef CARTO_DESKTOP_RESIDENT_WORKER
+        pending_resident_job.reset();
+        completed_resident_job.reset();
+#endif
+#endif
+        material_viewport_key.clear();
+        material_viewport_displayed = false;
+    }
+
     void request_close() noexcept { close_requested = true; }
 
     void approve_close() noexcept {
-        PostQuitMessage(0);
+        close_accepted = true;
+        viewport_worker_shutdown.request_stop();
     }
 
     void process_close_request() {
@@ -9946,6 +10430,7 @@ struct DesktopState {
             if (ImGui::MenuItem("Import Mesh...", "Ctrl+I")) {
                 import_mesh();
             }
+            if (ImGui::MenuItem("Shared structures and rigs...")) shared_rigs_open = true;
             ImGui::Separator();
             if (ImGui::MenuItem("Save", "Ctrl+S")) {
                 static_cast<void>(save_project(snapshot));
@@ -9995,6 +10480,11 @@ struct DesktopState {
             }
             if (ImGui::MenuItem("Export GLB", nullptr, false, can_export)) {
                 export_interchange(snapshot, true);
+            }
+            ImGui::Checkbox("Bake UV material graphs on export", &export_bake_graphs);
+            if(export_bake_graphs) {
+                ImGui::InputScalar("Graph bake resolution", ImGuiDataType_U32, &export_bake_resolution);
+                ImGui::TextDisabled("Explicit RGBA8 approximation, unit UV tile, powers of two 4..256.");
             }
             if (ImGui::MenuItem("Export OBJ", "Ctrl+Alt+O", false, can_export)) {
                 export_standard_mesh(snapshot, StandardMeshExport::obj);
@@ -10100,6 +10590,7 @@ struct DesktopState {
                 }
             }
             ImGui::TextDisabled("Panels move and resize independently. Close to hide; reopen here.");
+            ImGui::TextDisabled("Detached windows snap at nearby window/monitor edges. Hold Alt for free placement.");
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Window")) {
@@ -10131,7 +10622,317 @@ struct DesktopState {
         ImGui::EndMainMenuBar();
     }
 
+    const carto::project::AuthoredCamera* material_camera(const UiSnapshot& snapshot) const {
+        const auto& cameras = snapshot.presentation_catalog.cameras();
+        for (const auto& [id, camera] : cameras) {
+            static_cast<void>(id);
+            if (camera.active_for_review) return &camera;
+        }
+        return cameras.empty() ? nullptr : &cameras.begin()->second;
+    }
+
+    void draw_environment_controls(const UiSnapshot& snapshot) {
+        if (!ImGui::BeginPopup("Environment lighting")) return;
+        ImGui::TextUnformatted("Scene-linear environment lighting");
+        ImGui::TextDisabled("HDR imports are filtered to a lighting grid of at most 128 x 64.");
+        if (ImGui::Button("Import Radiance HDR...")) {
+            const auto path = choose_file(false, FileDialogKind::hdr_environment);
+            if (path) {
+                std::ifstream input(*path, std::ios::binary | std::ios::ate);
+                const auto length = input ? input.tellg() : std::streampos(-1);
+                if (length <= 0 || length > std::streamoff(32U * 1024U * 1024U)) {
+                    action_feedback = "HDR source must be readable and at most 32 MiB; existing lighting retained.";
+                    action_feedback_error = true;
+                } else {
+                    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(length));
+                    input.seekg(0);
+                    input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+                    auto decoded = carto::assets::decode_hdr_environment(bytes);
+                    if (!input || !decoded) {
+                        action_feedback = !input ? "HDR read failed; existing lighting retained." : decoded.error().message;
+                        action_feedback_error = true;
+                    } else {
+                        carto::project::AuthoredEnvironment source;
+                        source.identity = "hdr." + decoded.value().source_digest.hex();
+                        source.width = decoded.value().width;
+                        source.height = decoded.value().height;
+                        source.linear_radiance = std::move(decoded.value().linear_radiance);
+                        auto admitted = carto::studio::prepare_environment_import(
+                            snapshot.presentation_catalog, std::move(source));
+                        if (!admitted) { action_feedback = admitted.error().message; action_feedback_error = true; }
+                        else if (admitted.value().serialize() == snapshot.presentation_catalog.serialize()) {
+                            action_feedback = "This environment is already imported."; action_feedback_error = false;
+                        } else if (dispatch(carto::application::SetPresentationCatalogAction{
+                                snapshot.project_generation, snapshot.project_revision, std::move(admitted.value())})) {
+                            action_feedback = "HDR lighting imported: " + std::to_string(decoded.value().source_width) + " x " +
+                                std::to_string(decoded.value().source_height) + " source, " +
+                                std::to_string(decoded.value().width) + " x " + std::to_string(decoded.value().height) +
+                                " embedded lighting grid. Camera owns display exposure.";
+                        }
+                    }
+                }
+            }
+        }
+        const auto& source = snapshot.presentation_catalog.environment();
+        if (source) {
+            const auto key = std::to_string(snapshot.project_generation) + ":" +
+                std::to_string(snapshot.project_revision.value()) + ":" + source->identity + ":" +
+                std::to_string(source->revision.value());
+            if (environment_draft_key != key) { environment_draft = source; environment_draft_key = key; }
+            ImGui::Text("Embedded lighting: %u x %u", source->width, source->height);
+            bool commit = ImGui::Checkbox("Environment enabled", &environment_draft->enabled);
+            ImGui::InputDouble("Rotation (radians)", &environment_draft->rotation_radians, .05, .25, "%.3f");
+            commit = ImGui::IsItemDeactivatedAfterEdit() || commit;
+            ImGui::InputDouble("Radiance multiplier", &environment_draft->intensity, .1, 1, "%.3f");
+            commit = ImGui::IsItemDeactivatedAfterEdit() || commit;
+            const bool remove = ImGui::Button("Remove environment");
+            if (commit || remove) {
+                auto catalog = snapshot.presentation_catalog;
+                auto candidate = environment_draft;
+                if (remove) candidate.reset(); else candidate->revision = source->revision.next();
+                const auto changed = catalog.set_environment(std::move(candidate));
+                if (changed) dispatch(carto::application::SetPresentationCatalogAction{
+                    snapshot.project_generation, snapshot.project_revision, std::move(catalog)});
+                else { action_feedback = changed.error().message; action_feedback_error = true; environment_draft_key.clear(); }
+            }
+        } else ImGui::TextDisabled("No authored environment. Import a 2:1 HDR lat-long image.");
+        ImGui::EndPopup();
+    }
+
+    void draw_object_aging(const UiSnapshot& snapshot,carto::scene::ObjectId object) {
+        if(!ImGui::CollapsingHeader("Per-object variation and aging"))return;
+        const auto key=std::to_string(snapshot.project_generation)+":"+std::to_string(snapshot.project_revision.value());
+        // Share the existing read-only authoring snapshot; drafts are not a
+        // second source of durable project truth.
+        if(key!=shared_rig_source_key){auto source=session.authoring_viewport_source(snapshot.project_revision);if(!source){ImGui::TextWrapped("%s",source.error().message.c_str());return;}shared_rig_source.emplace(std::move(source.value()));shared_rig_source_key=key;}
+        const auto& source=*shared_rig_source;const auto* node=source.scene().find(object);if(!node||!node->mesh_asset)return;
+        const auto found=source.aging_layers().find(object);const bool exists=found!=source.aging_layers().end();
+        const auto draft_key=std::to_string(snapshot.project_generation)+":"+std::to_string(object.value)+":"+(exists?found->second.serialize():"new");
+        if(draft_key!=aging_draft_key){aging_draft=exists?found->second:carto::project::ObjectAgingLayer{};aging_draft.object=object;if(!exists){aging_draft.source_material=selected_material_id;const auto& mesh=source.meshes().at(*node->mesh_asset);if(auto uv=mesh.uv_sets().active_for_render())aging_draft.uv_set=uv->id;aging_draft.controls.seed=42;}std::snprintf(aging_operation_name.data(),aging_operation_name.size(),"%s",aging_draft.operation_identity.c_str());aging_draft_key=draft_key;}
+        if(!exists)aging_draft.source_material=selected_material_id;
+        ImGui::TextWrapped("Explicit local UV bake. One source material across regions; shared instances are isolated. Heuristic wear, not physical erosion or GI.");
+        ImGui::Text("Source material %llu",static_cast<unsigned long long>(aging_draft.source_material));
+        if (!exists) {
+            const auto& variants = source.material_catalog().variants();
+            auto current = aging_draft.source_variant ? variants.find(*aging_draft.source_variant) : variants.end();
+            if (aging_draft.source_variant && (current == variants.end() || current->second.base_material != aging_draft.source_material)) {
+                aging_draft.source_variant.reset();
+                current = variants.end();
+            }
+            if (ImGui::BeginCombo("Aging source variant", current == variants.end() ? "Base material" : current->second.name.c_str())) {
+                if (ImGui::Selectable("Base material", !aging_draft.source_variant)) aging_draft.source_variant.reset();
+                for (const auto& [id, variant] : variants) {
+                    if (variant.base_material != aging_draft.source_material) continue;
+                    const bool permitted = variant.permitted_mesh_assets.empty() || std::binary_search(
+                        variant.permitted_mesh_assets.begin(), variant.permitted_mesh_assets.end(), *node->mesh_asset);
+                    ImGui::BeginDisabled(!permitted);
+                    const auto variant_key = std::to_string(id);
+                    ImGui::PushID(variant_key.c_str());
+                    if (ImGui::Selectable(variant.name.c_str(), aging_draft.source_variant == id)) aging_draft.source_variant = id;
+                    ImGui::PopID();
+                    ImGui::EndDisabled();
+                }
+                ImGui::EndCombo();
+            }
+        } else if (aging_draft.source_variant) {
+            ImGui::Text("Source variant %llu", static_cast<unsigned long long>(*aging_draft.source_variant));
+        }
+        ImGui::InputText("Stable operation ID",aging_operation_name.data(),aging_operation_name.size(),exists?ImGuiInputTextFlags_ReadOnly:0);
+        ImGui::InputScalar("Stable variation seed",ImGuiDataType_U64,&aging_draft.controls.seed);
+        const double zero=0,one=1,years=100,half=.5;
+        ImGui::SliderScalar("Age",ImGuiDataType_Double,&aging_draft.controls.age,&zero,&years,"%.1f");
+        ImGui::SliderScalar("Rain exposure",ImGuiDataType_Double,&aging_draft.controls.rain_exposure,&zero,&one,"%.2f");
+        ImGui::SliderScalar("Sun exposure",ImGuiDataType_Double,&aging_draft.controls.solar_exposure,&zero,&one,"%.2f");
+        ImGui::SliderScalar("Moisture",ImGuiDataType_Double,&aging_draft.controls.moisture,&zero,&one,"%.2f");
+        ImGui::SliderScalar("Traffic/contact",ImGuiDataType_Double,&aging_draft.controls.traffic,&zero,&one,"%.2f");
+        ImGui::SliderScalar("Maintenance",ImGuiDataType_Double,&aging_draft.controls.maintenance,&zero,&one,"%.2f");
+        ImGui::SliderScalar("Object variation",ImGuiDataType_Double,&aging_draft.variation,&zero,&half,"%.2f");
+        ImGui::InputDouble("Feature scale (meters)",&aging_draft.feature_scale_meters,.01,.1,"%.3f");
+        ImGui::InputScalar("Aging UV set",ImGuiDataType_U64,&aging_draft.uv_set);
+        ImGui::InputScalar("Aging bake extent",ImGuiDataType_U32,&aging_draft.resolution);
+        if(exists){ImGui::Text("Mask texture %llu",static_cast<unsigned long long>(found->second.output_textures[5]));ImGui::TextWrapped("Mask RGB: oxidation, contact wear, solar fade; alpha is coverage. Source albedo/alpha, normal, AO and HDR emission remain separately bound.");const auto validation_key=key+":"+std::to_string(object.value);if(validation_key!=aging_validation_key){aging_stale=carto::production::aging_needs_rebake(source,found->second);aging_validation_key=validation_key;}if(aging_stale)ImGui::TextWrapped("Source/geometry/UV/transform changed. Re-bake to refresh cause masks; the previous good appearance remains active.");}
+        ImGui::BeginDisabled(!snapshot.project_path||!aging_draft.source_material);
+        if(ImGui::Button(exists?"Re-bake editable aging":"Bake per-object aging",ImVec2(-1,26))){aging_draft.operation_identity=aging_operation_name.data();if(dispatch(carto::application::ApplyObjectAgingAction{snapshot.project_generation,snapshot.project_revision,aging_draft}))aging_draft_key.clear();}
+        ImGui::EndDisabled();
+        if(exists&&ImGui::Button("Unlink aging (restore source appearance)",ImVec2(-1,26)))if(dispatch(carto::application::RemoveObjectAgingAction{snapshot.project_generation,snapshot.project_revision,object}))aging_draft_key.clear();
+    }
+
+    void draw_shared_rigs(const UiSnapshot& snapshot) {
+        if(!shared_rigs_open)return;
+        if(!ImGui::Begin("Shared structures and rigs",&shared_rigs_open)){ImGui::End();return;}
+        ImGui::TextWrapped("Reuse a common joint/rest structure on existing rigid parts. Target meshes and their visual identity remain yours; skin weights are not inferred.");
+        ImGui::Checkbox("I own these local modules or have a license permitting reuse",&shared_rig_rights_confirmed);
+        ImGui::BeginDisabled(!shared_rig_rights_confirmed||!snapshot.project_path);
+        if(ImGui::Button("Import local rig module...")) {
+            if(auto path=choose_file(false,FileDialogKind::rig_module)) {
+                std::ifstream in(*path,std::ios::binary|std::ios::ate);const auto size=in?in.tellg():std::streampos(-1);
+                if(size<=0||size>std::streamoff(carto::character::RigModuleTemplate::kMaxSerializedBytes)) {
+                    action_feedback="Rig module must be readable and within the 16 MiB bound.";action_feedback_error=true;
+                } else {
+                    std::string bytes(static_cast<std::size_t>(size),'\0');in.seekg(0);in.read(bytes.data(),static_cast<std::streamsize>(bytes.size()));
+                    if(in)dispatch(carto::application::ImportRigModuleAction{snapshot.project_generation,snapshot.project_revision,std::move(bytes),true});
+                    else {action_feedback="Rig source read failed; library unchanged.";action_feedback_error=true;}
+                }
+            }
+        }
+        ImGui::EndDisabled();
+        const auto key=std::to_string(snapshot.project_generation)+":"+std::to_string(snapshot.project_revision.value());
+        if(key!=shared_rig_source_key) {
+            auto source=session.authoring_viewport_source(snapshot.project_revision);
+            if(source){shared_rig_source.emplace(std::move(source.value()));shared_rig_source_key=key;}
+            else {action_feedback=source.error().message;action_feedback_error=true;}
+        }
+        if(shared_rig_source) {
+            const auto& library=shared_rig_source->rig_module_templates();
+            if(ImGui::BeginCombo("Project rig library",shared_rig_module.empty()?"Choose a module":shared_rig_module.c_str())) {
+                for(const auto& [name,entry]:library){static_cast<void>(entry);if(ImGui::Selectable(name.c_str(),name==shared_rig_module))shared_rig_module=name;}
+                ImGui::EndCombo();
+            }
+            if(!shared_rig_root&&snapshot.selection.objects.size()==1)shared_rig_root=snapshot.selection.objects.front();
+            const auto* root=shared_rig_source->scene().find(shared_rig_root);
+            if(ImGui::BeginCombo("Target asset root",root?root->name.c_str():"Choose an asset root")) {
+                for(const auto& o:snapshot.objects)if(ImGui::Selectable((o.object.name+"##rig-root-"+std::to_string(o.object.id.value)).c_str(),o.object.id==shared_rig_root))shared_rig_root=o.object.id;
+                ImGui::EndCombo();
+            }
+            const auto entry=library.find(shared_rig_module);
+            ImGui::InputText("Reusable structure identity",shared_rig_capture_name.data(),shared_rig_capture_name.size());
+            ImGui::BeginDisabled(!shared_rig_root||!shared_rig_rights_confirmed);
+            if(ImGui::Button("Capture this hierarchy/rig for reuse")) {
+                if(dispatch(carto::application::CaptureSharedRigModuleAction{snapshot.project_generation,snapshot.project_revision,shared_rig_root,std::string(shared_rig_capture_name.data()),true}))shared_rig_module=shared_rig_capture_name.data();
+            }
+            ImGui::EndDisabled();
+            ImGui::TextWrapped("Capture preserves an existing bound rig's joint/control definitions. Unrigged hierarchies become fixed rest-frame templates; no meshes or visual assets are copied.");
+            if(shared_rig_source->rig_template_bindings().contains(shared_rig_root)&&ImGui::Button("Unlink rig source (keep current structure)"))
+                dispatch(carto::application::UnlinkSharedRigAction{snapshot.project_generation,snapshot.project_revision,shared_rig_root});
+            if(entry!=library.end()&&shared_rig_root) {
+                const auto module=carto::character::RigModuleTemplate::deserialize(entry->second.bytes);
+                const auto mapping_key=std::to_string(snapshot.project_generation)+":"+shared_rig_module+":"+entry->second.digest.hex()+":"+std::to_string(shared_rig_root.value);
+                if(mapping_key!=shared_rig_mapping_key){shared_rig_mapping.clear();shared_rig_mapping_confirmed=false;shared_rig_mapping_key=mapping_key;}
+                if(module) {
+                    ImGui::TextWrapped("Source identity: %s; revision %llu",shared_rig_module.c_str(),static_cast<unsigned long long>(entry->second.revision.value()));
+                    for(const auto& joint:module.value().joints) {
+                        ImGui::PushID(std::to_string(joint.id.value).c_str());
+                        auto& target=shared_rig_mapping[joint.id.value];
+                        if(!joint.parent)target=shared_rig_root;
+                        const auto* object=shared_rig_source->scene().find(target);
+                        const auto label=joint.semantic_type.empty()?"Joint "+std::to_string(joint.id.value):joint.semantic_type;
+                        ImGui::BeginDisabled(!joint.parent);
+                        if(ImGui::BeginCombo(label.c_str(),object?object->name.c_str():"Explicit correspondence required")) {
+                            for(const auto& o:snapshot.objects)if(ImGui::Selectable((o.object.name+"##rig-part-"+std::to_string(o.object.id.value)).c_str(),o.object.id==target)){target=o.object.id;shared_rig_mapping_confirmed=false;}
+                            ImGui::EndCombo();
+                        }
+                        ImGui::EndDisabled();ImGui::PopID();
+                    }
+                    if(ImGui::InputDouble("Explicit length scale",&shared_rig_length_scale,.1,1,"%.3f"))shared_rig_mapping_confirmed=false;
+                    ImGui::Checkbox("I confirm these correspondences, reparenting and shared rest frames",&shared_rig_mapping_confirmed);
+                    ImGui::BeginDisabled(!shared_rig_mapping_confirmed||!shared_rig_rights_confirmed);
+                    if(ImGui::Button("Apply shared rigid structure (undoable)")) {
+                        carto::project::RigTemplateBinding binding{shared_rig_root,shared_rig_module,entry->second.revision,entry->second.digest,
+                            "Human-confirmed local ownership/reuse license; project module source digest retained",shared_rig_length_scale,shared_rig_mapping};
+                        dispatch(carto::application::ApplySharedRigAction{snapshot.project_generation,snapshot.project_revision,std::move(binding),true,true});
+                    }
+                    ImGui::EndDisabled();
+                    ImGui::TextDisabled("Rigid parts are explicitly retargeted. Cycles, locked or skinned targets fail without changes.");
+                }
+            }
+        }
+        draw_action_feedback(snapshot,false);ImGui::End();
+    }
+
     void draw_toolbar(const UiSnapshot& snapshot) {
+        heading_text("Work surface");
+        ImGui::SameLine();
+#if defined(CARTO_DESKTOP_ASYNC_READBACK) || defined(CARTO_DESKTOP_RESIDENT_WORKER)
+        const bool gesture_active = native_transform_drag.has_value() || native_sculpt_stroke.has_value() ||
+            native_knife_stroke.has_value() || native_condition_gizmo_drag.has_value() ||
+            work_surface_camera_panning;
+        ImGui::BeginDisabled(gesture_active);
+        if (ImGui::Checkbox("Rendered viewport", &material_viewport_enabled)) {
+            // The displayed image cannot be correlated with an input event.
+            viewport_edit_requires_restart = true;
+            native_viewport_hits.interactive = false;
+        }
+        ImGui::EndDisabled();
+        if (gesture_active && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Finish the current viewport gesture before changing preview mode.");
+#else
+        ImGui::BeginDisabled();
+        ImGui::Checkbox("Rendered viewport", &material_viewport_enabled);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Rendered viewport is unavailable in this build.");
+#endif
+        if (viewport_edit_requires_restart) {
+            ImGui::TextWrapped("Viewport editing is paused after rendered preview. Save your work and restart to resume viewport editing.");
+        }
+        if (material_viewport_enabled) {
+#ifdef CARTO_DESKTOP_RESIDENT_WORKER
+            ImGui::TextWrapped("Rendered preview is capped at 1,048,576 pixels and uses temporal history.");
+#else
+            ImGui::TextWrapped("Readback preview is capped at 1,048,576 pixels and has no temporal accumulation.");
+#endif
+            if (!material_viewport_diagnostic.empty() && !material_viewport_displayed)
+                ImGui::TextWrapped("Rendered preview: %s", material_viewport_diagnostic.c_str());
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Environment")) ImGui::OpenPopup("Environment lighting");
+        draw_environment_controls(snapshot);
+        ImGui::SameLine();
+        if(ImGui::Button("Shared rigs"))shared_rigs_open=true;
+        if (material_viewport_enabled) {
+#if defined(CARTO_DESKTOP_ASYNC_READBACK) || defined(CARTO_DESKTOP_RESIDENT_WORKER)
+            if (!material_viewport_diagnostic.empty()) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Retry render")) {
+                    renderer.cancel_authoring_viewport_upload();
+                    material_pending_upload.reset();
+                    material_pending_upload_key.clear();
+                    material_pending_pixel_digest.clear();
+#ifdef CARTO_DESKTOP_RESIDENT_WORKER
+                    pending_resident_job.reset();
+                    completed_resident_job.reset();
+#endif
+                    material_requested_key.clear();
+                }
+            }
+#endif
+            ImGui::SameLine();
+            ImGui::Checkbox("Authored camera", &material_viewport_authored_camera);
+            const auto* display_camera = material_viewport_authored_camera ? material_camera(snapshot) : nullptr;
+            if (display_camera) {
+                const auto source_key = std::to_string(snapshot.project_generation) + ":" +
+                    std::to_string(snapshot.project_revision.value()) + ":" + std::to_string(display_camera->object.value);
+                if (source_key != material_display_source_key) {
+                    material_display_source_key = source_key;
+                    material_viewport_exposure = static_cast<float>(display_camera->exposure_ev);
+                    material_viewport_tone = static_cast<int>(display_camera->tone_mode);
+                }
+            } else material_display_source_key.clear();
+#ifdef CARTO_DESKTOP_D3D12_VIEWPORT
+            ImGui::SameLine();
+            ImGui::Checkbox("CPU reference", &material_viewport_cpu_reference);
+#endif
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(90.0F);
+            ImGui::SliderFloat("EV", &material_viewport_exposure, -8.0F, 8.0F);
+            const bool commit_exposure = ImGui::IsItemDeactivatedAfterEdit();
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(100.0F);
+            const bool commit_tone = ImGui::Combo("Tone", &material_viewport_tone, "ACES\0Neutral\0Linear\0");
+            if (display_camera && (commit_exposure || commit_tone)) {
+                auto catalog = snapshot.presentation_catalog;
+                auto camera = *display_camera;
+                camera.revision = camera.revision.next();
+                camera.exposure_ev = material_viewport_exposure;
+                camera.tone_mode = static_cast<carto::render::ToneMapMode>(material_viewport_tone);
+                auto replaced = catalog.replace_camera(std::move(camera));
+                if (replaced) dispatch(carto::application::SetPresentationCatalogAction{
+                    snapshot.project_generation, snapshot.project_revision, std::move(catalog)});
+                else { action_feedback = replaced.error().message; action_feedback_error = true; }
+            }
+        }
+
+        ImGui::SameLine();
         const auto button_width = [](const char* label) {
             return ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2.0F;
         };
@@ -10145,6 +10946,12 @@ struct DesktopState {
         ImGui::BeginDisabled(snapshot.redo_count == 0U);
         if (ImGui::Button("Redo")) dispatch(carto::application::RedoAction{});
         ImGui::EndDisabled();
+        carto::studio::studio_continue_row(150.0F);
+        ImGui::SetNextItemWidth(110.0F);
+        ImGui::BeginDisabled(native_transform_drag.has_value());
+        ImGui::Combo("Snap", &viewport_snap_policy, "Free\0Grid 0.25 m\0Geometry\0");
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Translation snap. Ctrl temporarily selects grid; Shift selects geometry.");
         const float mode_width = std::max(110.0F, ImGui::CalcTextSize("Object").x +
             ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.x * 2.0F);
         carto::studio::studio_continue_row(mode_width);
@@ -10708,10 +11515,10 @@ struct DesktopState {
                     std::string upload_diagnostic;
                     const auto upload = renderer.set_reference_image_texture(
                         *reference_image_preview, upload_diagnostic);
-                    if (upload == VulkanShell::TextureUploadResult::ready) {
+                    if (upload == DesktopShell::TextureUploadResult::ready) {
                         viewport_reference_plane = &plane->second;
                         viewport_reference_plane_corners = plane_corners.value();
-                    } else if (upload == VulkanShell::TextureUploadResult::pending) {
+                    } else if (upload == DesktopShell::TextureUploadResult::pending) {
                         // Retry this exact source-bound preview next draw.
                         action_feedback = std::move(upload_diagnostic);
                         action_feedback_error = false;
@@ -10734,11 +11541,14 @@ struct DesktopState {
                                    : "Task base · review only")
             : carto::studio::view_kind_label(viewport_view.view).data());
         ImGui::SameLine();
+        const bool authored_preview = material_viewport_enabled && material_viewport_authored_camera;
+        ImGui::BeginDisabled(authored_preview);
         const bool frame_button_pressed = ImGui::SmallButton("Frame all");
+        ImGui::EndDisabled();
         const ImGuiIO& frame_shortcut_io = ImGui::GetIO();
         const bool frame_hotkey_pressed = carto::ui::work_surface_camera_hotkey_allowed(
             ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows),
-            !workbench_placement_click_consumed && !showing_agent_preview &&
+            !authored_preview && !workbench_placement_click_consumed && !showing_agent_preview &&
                 !workbench.native_drag.has_value() &&
                 !workbench.placement_mode.has_value() &&
                 !native_transform_drag.has_value() && !native_sculpt_stroke.has_value() &&
@@ -10829,17 +11639,26 @@ struct DesktopState {
                     else work_surface_camera_framed = true;
                 }
             };
+            const auto nudge_tooltip = [authored_preview](const char* direction) {
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    ImGui::SetTooltip("%s", authored_preview
+                        ? "Workspace camera navigation is unavailable while viewing an authored camera."
+                        : direction);
+                }
+            };
+            ImGui::BeginDisabled(authored_preview);
             if (ImGui::SmallButton("<")) nudge_view(-1.0, 0.0);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Move the view left");
+            nudge_tooltip("Move the view left");
             ImGui::SameLine(0.0F, 2.0F);
             if (ImGui::SmallButton("^")) nudge_view(0.0, -1.0);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Move the view up");
+            nudge_tooltip("Move the view up");
             ImGui::SameLine(0.0F, 2.0F);
             if (ImGui::SmallButton("v")) nudge_view(0.0, 1.0);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Move the view down");
+            nudge_tooltip("Move the view down");
             ImGui::SameLine(0.0F, 2.0F);
             if (ImGui::SmallButton(">")) nudge_view(1.0, 0.0);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Move the view right");
+            nudge_tooltip("Move the view right");
+            ImGui::EndDisabled();
             if (carto::ui::workspace_supports_scene_object_translation(
                     snapshot.workspace_kind)) {
                 ImGui::TextDisabled(
@@ -10847,6 +11666,10 @@ struct DesktopState {
             }
         }
         if (ImGui::CollapsingHeader("Display & shading")) {
+            if (material_viewport_enabled) {
+                ImGui::SetNextItemWidth(72.0F);
+                ImGui::Combo("Render scale", &material_viewport_scale, "100%\0 50%\0 25%\0");
+            }
             const bool geometry_visible = viewport_projected_geometry_last_frame;
             int selected_spatial = static_cast<int>(viewport_view.spatial);
             if (ImGui::Combo("Spatial", &selected_spatial,
@@ -10917,6 +11740,7 @@ struct DesktopState {
             snapshot.agent_task->status != carto::agent::TaskStatus::rejected;
         const bool space_pan_active = ImGui::IsKeyDown(ImGuiKey_Space);
         native_viewport_hits.interactive =
+            !material_viewport_enabled && !viewport_edit_requires_restart &&
             (!showing_agent_preview || ghost_edit_available) && !work_surface_pan_tool_active &&
             !perspective_camera_orbit_tool_active &&
             !space_pan_active && !condition_kinematic_pose_preview_enabled &&
@@ -11143,6 +11967,7 @@ struct DesktopState {
         const bool canvas_hovered = ImGui::IsMouseHoveringRect(
             origin, origin + extent, true);
         work_surface_camera_input_allowed =
+            !(material_viewport_enabled && material_viewport_authored_camera) &&
             !workbench_placement_click_consumed && !showing_agent_preview &&
             !workbench.native_drag.has_value() &&
             !workbench.placement_mode.has_value() &&
@@ -11188,6 +12013,469 @@ struct DesktopState {
                 if (perspective_camera_active) perspective_camera_framed = true;
                 else work_surface_camera_framed = true;
             }
+        }
+        bool material_image_current = false;
+        material_viewport_displayed = false;
+        std::optional<carto::production::AuthoringView> navigation_view;
+        std::string navigation_view_error;
+        if (perspective_camera_active && !material_viewport_authored_camera &&
+            extent.x > 0.0F && extent.y > 0.0F) {
+            auto converted = carto::studio::authoring_view_from_editor_camera(
+                perspective_camera, static_cast<double>(extent.x) / extent.y);
+            if (converted) navigation_view = std::move(converted.value());
+            else navigation_view_error = converted.error().message;
+        }
+        const bool authoring_view_supported = material_viewport_authored_camera ||
+            navigation_view.has_value() ||
+            (!perspective_camera_active &&
+             viewport_view.view == carto::studio::ViewportViewKind::top_plan_xz);
+        // The upload format is selected for the main swapchain only. Platform
+        // windows choose their own surface formats, which may not match it.
+        const bool authoring_on_main_viewport =
+            ImGui::GetWindowViewport() == ImGui::GetMainViewport();
+        if (material_viewport_enabled && !showing_agent_preview && authoring_view_supported &&
+            authoring_on_main_viewport &&
+            extent.x > 0.0F && extent.y > 0.0F) {
+            viewport_producer_seen_this_frame = true;
+            carto::production::AuthoringViewportRequest request;
+#if defined(CARTO_DESKTOP_ASYNC_READBACK) || defined(CARTO_DESKTOP_RESIDENT_WORKER)
+            auto worker_project_path = snapshot.project_path;
+            std::error_code project_path_error;
+            if (worker_project_path && worker_project_path->is_relative()) {
+                const auto absolute = std::filesystem::absolute(*worker_project_path, project_path_error);
+                if (!project_path_error) worker_project_path = absolute;
+            }
+            if (worker_project_path && !project_path_error)
+                worker_project_path = worker_project_path->lexically_normal();
+#ifdef CARTO_DESKTOP_RESIDENT_WORKER
+            request.temporal.enabled = true;
+            request.temporal.session = snapshot.project_generation;
+#else
+            // The separate-device readback worker has no persistent history.
+            request.temporal.enabled = false;
+#endif
+#endif
+#ifdef CARTO_DESKTOP_D3D12_VIEWPORT
+            request.temporal.enabled = !material_viewport_cpu_reference;
+            request.temporal.session = snapshot.project_generation;
+#endif
+            const double scale = std::array{1.0, 0.5, 0.25}[static_cast<std::size_t>(material_viewport_scale)];
+            constexpr double max_readback_pixels = 1'048'576.0;
+            // Clamp both dimensions before multiplication/conversion, then
+            // scale proportionally and retain the canvas aspect in the view.
+            const double requested_width = std::clamp(static_cast<double>(extent.x) * scale,
+                1.0, max_readback_pixels);
+            const double requested_height = std::clamp(static_cast<double>(extent.y) * scale,
+                1.0, max_readback_pixels);
+            const double limit_scale = std::min(1.0,
+                std::sqrt(max_readback_pixels / (requested_width * requested_height)));
+            request.width = static_cast<std::uint32_t>(std::max(1.0, std::floor(requested_width * limit_scale)));
+            request.height = static_cast<std::uint32_t>(std::max(1.0, std::floor(requested_height * limit_scale)));
+            if (std::uint64_t(request.width) * request.height > 1'048'576ULL)
+                request.width = static_cast<std::uint32_t>(1'048'576ULL / request.height);
+            const bool render_extent_capped = limit_scale < 1.0 ||
+                static_cast<double>(extent.x) * scale > max_readback_pixels ||
+                static_cast<double>(extent.y) * scale > max_readback_pixels;
+            request.view.position = {work_surface_camera.target().x,
+                std::isfinite(minimum.y) ? minimum.y - std::max(1.0, maximum.y-minimum.y) : -1000.0,
+                work_surface_camera.target().y};
+            request.view.orthographic_height = work_surface_camera.view_height();
+            request.view.aspect_ratio = static_cast<double>(extent.x) / extent.y;
+            request.view.far_plane = std::isfinite(maximum.y)
+                ? std::max(2.0, maximum.y-request.view.position.y+1.0) : 2000.0;
+            if (navigation_view) request.view = *navigation_view;
+            request.exposure_ev = material_viewport_exposure;
+            request.tone_mode = static_cast<carto::render::ToneMapMode>(material_viewport_tone);
+            if (material_viewport_authored_camera) {
+                if (const auto* camera = material_camera(snapshot)) {
+                    request.camera = camera->object;
+                    request.exposure_ev = camera->exposure_ev;
+                    request.tone_mode = camera->tone_mode;
+                }
+                request.camera_display = true;
+            }
+            std::ostringstream key;
+            key.precision(17);
+            key << snapshot.project_generation << ':' << snapshot.project_revision.value() << ':' << request.width << ':' << request.height
+                << ':' << request.view.aspect_ratio;
+            if (!material_viewport_authored_camera) {
+                key << ':' << request.view.position.x << ':' << request.view.position.y << ':' << request.view.position.z
+                    << ':' << request.view.rotation.x << ':' << request.view.rotation.y
+                    << ':' << request.view.rotation.z << ':' << request.view.rotation.w
+                    << ':' << static_cast<int>(request.view.projection) << ':' << request.view.vertical_fov_radians
+                    << ':' << request.view.orthographic_height << ':' << request.view.near_plane << ':' << request.view.far_plane;
+            }
+            key << ':' << request.exposure_ev << ':' << static_cast<int>(request.tone_mode)
+                << ':' << request.camera.value_or(carto::scene::ObjectId{}).value
+                << ':' << material_viewport_authored_camera;
+#if defined(CARTO_DESKTOP_ASYNC_READBACK) || defined(CARTO_DESKTOP_RESIDENT_WORKER)
+            key << ":source-path:" << (worker_project_path ? "present:" : "absent:");
+            if (worker_project_path) {
+                const auto path_utf8 = worker_project_path->generic_u8string();
+                key << path_utf8.size() << ':';
+                key.write(reinterpret_cast<const char*>(path_utf8.data()),
+                    static_cast<std::streamsize>(path_utf8.size()));
+            }
+            if (project_path_error) key << ":path-error:" << project_path_error.value();
+#endif
+#ifdef CARTO_DESKTOP_D3D12_VIEWPORT
+            key << ':' << material_viewport_cpu_reference;
+#endif
+#if defined(CARTO_DESKTOP_D3D12_UI) && defined(CARTO_DESKTOP_STARTUP_TRACE)
+            if (material_viewport_authored_camera && material_profile_remaining)
+                key << ":profile:" << material_profile_remaining--;
+#endif
+            for (const auto& instance : instances) {
+                auto transform = instance.world_transform;
+                if (native_transform_drag && instance.object == native_transform_drag->session.object()) {
+                    transform.translation.x = native_transform_drag->preview_transform.translation.x;
+                    transform.translation.z = native_transform_drag->preview_transform.translation.z;
+                }
+                request.transform_overrides.emplace(instance.object, transform);
+                key << ':' << instance.object.value << ':' << transform.translation.x << ':' << transform.translation.y
+                    << ':' << transform.translation.z << ':' << transform.rotation.x << ':' << transform.rotation.y
+                    << ':' << transform.rotation.z << ':' << transform.rotation.w << ':' << transform.scale.x
+                    << ':' << transform.scale.y << ':' << transform.scale.z;
+            }
+            // Disabled until the process-owned worker supplies an independently
+            // owned snapshot and nonblocking, generation-checked result.
+#if 0
+            if (key.str() != material_viewport_key) {
+                const auto route_start = std::chrono::steady_clock::now();
+#ifdef CARTO_DESKTOP_D3D12_UI
+                std::optional<carto::d3d12::ResidentViewportImage> gpu_presentation;
+#endif
+#ifdef CARTO_DESKTOP_D3D12_VIEWPORT
+                carto::production::AuthoringViewportImage recycled;
+                if (material_viewport_image) recycled = std::move(*material_viewport_image);
+#endif
+                material_viewport_key = key.str();
+                material_viewport_image.reset();
+                material_viewport_diagnostic.clear();
+                if (material_viewport_authored_camera && !request.camera) {
+                    material_viewport_diagnostic = "Add an authored camera to use camera preview";
+                } else {
+                    auto image = [&]() -> carto::core::Result<carto::production::AuthoringViewportImage> {
+#ifdef CARTO_DESKTOP_D3D12_VIEWPORT
+                        if (!material_viewport_cpu_reference) {
+                            if (!material_gpu_viewport) {
+#ifdef CARTO_DESKTOP_D3D12_UI
+                                auto created = carto::d3d12::AuthoringViewport::create_on_device(renderer.authoring_device());
+#else
+                                auto created = carto::d3d12::AuthoringViewport::create();
+#endif
+                                if (!created) return carto::core::Result<carto::production::AuthoringViewportImage>::failure(created.error());
+                                material_gpu_viewport = std::move(created.value());
+                            }
+#ifdef CARTO_DESKTOP_D3D12_UI
+                            double asset_prepare_begin=0,asset_prepare_end=0;
+#endif
+                            if (!material_gpu_source || material_gpu_source_generation != snapshot.project_generation ||
+                                material_gpu_source_revision != snapshot.project_revision) {
+#ifdef CARTO_DESKTOP_D3D12_UI
+                                asset_prepare_begin=renderer.host_elapsed_ms();
+#endif
+                                auto source = session.authoring_viewport_source(snapshot.project_revision);
+                                if (!source) return carto::core::Result<carto::production::AuthoringViewportImage>::failure(source.error());
+                                auto prepared = session.prepare_authoring_viewport_request(request, snapshot.project_revision);
+                                if (!prepared) return carto::core::Result<carto::production::AuthoringViewportImage>::failure(prepared.error());
+                                material_gpu_textures = prepared.value().textures;
+                                material_gpu_source = std::make_shared<const carto::project::ProjectDocument>(std::move(source.value()));
+                                material_gpu_source_generation = snapshot.project_generation;
+                                material_gpu_source_revision = snapshot.project_revision;
+#ifdef CARTO_DESKTOP_D3D12_UI
+                                asset_prepare_end=renderer.host_elapsed_ms();
+#endif
+                            }
+                            request.textures = material_gpu_textures;
+#ifdef CARTO_DESKTOP_D3D12_UI
+                            const auto render_entry = renderer.host_elapsed_ms();
+                            auto frame = material_gpu_readback_comparison
+                                ? material_gpu_viewport->render(material_gpu_source, request, std::move(recycled))
+                                : material_gpu_viewport->render_resident(material_gpu_source, request, material_gpu_synchronous_timing);
+#else
+                            auto frame = material_gpu_viewport->render(material_gpu_source, request, std::move(recycled));
+#endif
+                            if (!frame) return carto::core::Result<carto::production::AuthoringViewportImage>::failure(frame.error());
+#ifdef CARTO_DESKTOP_D3D12_UI
+                            material_gpu_last_request = request;
+                            gpu_presentation = frame.value().resident_image;
+                            renderer.note_authoring(frame.value(), render_entry, asset_prepare_begin, asset_prepare_end);
+#endif
+                            std::ostringstream metrics;
+                            metrics.precision(3);
+                            if (frame.value().deferred_timing)
+                                metrics << "GPU timing deferred to UI fence | ";
+                            else metrics << "GPU raster/PBR " << frame.value().gpu_milliseconds << " ms | Image readback map/unmap "
+                                << frame.value().readback_milliseconds << " ms | GPU display " << frame.value().gpu_display_milliseconds
+                                << " ms | CPU resolve " << frame.value().display_milliseconds
+                                << " ms | GPU queue envelope " << frame.value().gpu_all_stages_milliseconds
+                                << " ms | ";
+                            metrics << "Render call " << frame.value().host_timeline.returning
+                                << " ms (prepare " << frame.value().cpu_prepare_milliseconds
+                                << ") | " << frame.value().device_name << " | " << request.width << 'x' << request.height
+                                << (frame.value().resident_image ? " | GPU resident; no image transfer" : " | explicit readback bridge");
+                            material_viewport_metrics = metrics.str();
+                            return carto::core::Result<carto::production::AuthoringViewportImage>::success(std::move(frame.value().image));
+                        }
+#endif
+                        material_viewport_metrics = "CPU material reference | UV/texture graphs, "
+                                                    "directional shadows and environment";
+                        return session.render_authoring_viewport(request, snapshot.project_revision);
+                    }();
+                    if (!image) material_viewport_diagnostic = image.error().message;
+                    else {
+                        const auto upload_start = std::chrono::steady_clock::now();
+#ifdef CARTO_DESKTOP_D3D12_UI
+                        const bool bound = gpu_presentation
+                            ? renderer.set_authoring_gpu_texture(*gpu_presentation, image.value().width, image.value().height, material_viewport_diagnostic)
+                            : renderer.set_authoring_viewport_texture(image.value(), material_viewport_diagnostic);
+#else
+                        const bool bound = renderer.set_authoring_viewport_texture(image.value(), material_viewport_diagnostic);
+#endif
+                        if (bound) {
+                            material_viewport_image = std::move(image.value());
+                            material_viewport_metrics += " | UI image bind/upload " + std::to_string(
+                                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - upload_start).count()) + " ms";
+                        }
+                    }
+                }
+                material_viewport_metrics += " | Route before UI submit " + std::to_string(
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-route_start).count()) + " ms";
+#ifdef CARTO_DESKTOP_D3D12_UI
+                renderer.note_route(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-route_start).count());
+#endif
+            }
+#endif
+#ifdef CARTO_DESKTOP_ASYNC_READBACK
+            // Only this opt-in path may start the process-owned producer. It
+            // receives an independent revision-checked project value and a
+            // copied path; project blob reads are the worker's responsibility.
+            auto& worker = carto::d3d12::ReadbackViewportWorker::process_owned();
+            if (!viewport_worker_shutdown.bound) {
+                const bool attached = viewport_worker_shutdown.bind(&worker,
+                    [](void* owner) noexcept {
+                        static_cast<carto::d3d12::ReadbackViewportWorker*>(owner)->request_stop();
+                    },
+                    [](void* owner) noexcept {
+                        return static_cast<carto::d3d12::ReadbackViewportWorker*>(owner)->shutdown_ready();
+                    });
+                if (!attached) material_viewport_diagnostic = "Viewport shutdown interlock could not be bound.";
+            }
+            const std::string desired_key = key.str();
+            if (desired_key != material_requested_key) {
+                if (viewport_worker_shutdown.bound && viewport_worker_shutdown.owner == &worker &&
+                    !viewport_worker_shutdown.stopping) worker.invalidate();
+                renderer.cancel_authoring_viewport_upload();
+                material_pending_upload.reset();
+                material_pending_upload_key.clear();
+                material_pending_pixel_digest.clear();
+                material_requested_key = desired_key;
+                material_requested_started = false;
+                if (material_next_request_id == std::numeric_limits<std::uint64_t>::max()) {
+                    material_requested_identity.reset();
+                    material_viewport_diagnostic = "Viewport request identity is exhausted.";
+                } else {
+                    material_requested_identity = carto::d3d12::ReadbackViewportIdentity{
+                        snapshot.project_generation, ++material_next_request_id};
+                    material_viewport_diagnostic = "Preparing rendered viewport.";
+                }
+            }
+            if (viewport_worker_shutdown.bound && viewport_worker_shutdown.owner == &worker &&
+                !viewport_worker_shutdown.stopping && !close_accepted) {
+                auto completed = worker.poll();
+                const bool matching = material_requested_identity &&
+                    completed.identity == *material_requested_identity;
+                using WorkerState = carto::d3d12::ReadbackViewportPoll::State;
+                if (matching && completed.state == WorkerState::ready && completed.frame &&
+                    completed.image_digest && !completed.image_digest->is_zero()) {
+                    auto& image = completed.frame->image;
+                    if (image.source_revision == snapshot.project_revision &&
+                        image.width == request.width && image.height == request.height &&
+                        image.display_rgba8.size() == std::uint64_t(request.width) * request.height * 4ULL) {
+                        material_pending_pixel_digest = completed.image_digest->hex();
+                        material_pending_upload = std::move(image);
+                        material_pending_upload_key = desired_key;
+                    } else {
+                        material_viewport_diagnostic = "Rendered viewport result no longer matches the request.";
+                    }
+                } else if (matching && completed.state == WorkerState::ready) {
+                    material_viewport_diagnostic = "Rendered viewport result is missing its verified image digest.";
+                } else if (matching && completed.state == WorkerState::failed) {
+                    material_viewport_diagnostic = completed.error.empty()
+                        ? "Rendered viewport worker failed." : completed.error;
+                } else if (matching && !completed.error.empty()) {
+                    material_viewport_diagnostic = completed.error;
+                }
+                if (material_pending_upload && material_pending_upload_key == desired_key) {
+                    const auto uploaded = renderer.set_authoring_viewport_texture(
+                        *material_pending_upload, material_pending_pixel_digest, material_viewport_diagnostic);
+                    if (uploaded == DesktopShell::TextureUploadResult::ready) {
+                        material_viewport_image = std::move(material_pending_upload);
+                        material_pending_upload.reset();
+                        material_display_pixel_digest = std::move(material_pending_pixel_digest);
+                        material_viewport_key = desired_key;
+                        material_viewport_generation = snapshot.project_generation;
+                        material_viewport_metrics = "Asynchronous GPU readback " +
+                            std::to_string(request.width) + "x" + std::to_string(request.height) +
+                            (render_extent_capped ? " (resolution capped)" : "");
+                    } else if (uploaded == DesktopShell::TextureUploadResult::failed) {
+                        material_pending_upload.reset();
+                    }
+                }
+                const bool worker_busy = completed.state == WorkerState::pending ||
+                    completed.state == WorkerState::draining;
+                if (project_path_error) {
+                    material_requested_started = true;
+                    material_viewport_diagnostic = "Unable to resolve the project path for the viewport.";
+                } else if (!worker_busy && !material_requested_started && material_requested_identity &&
+                    !(material_viewport_authored_camera && !request.camera)) {
+                    auto source = session.authoring_viewport_source(snapshot.project_revision);
+                    if (!source) {
+                        material_requested_started = true;
+                        material_viewport_diagnostic = source.error().message;
+                    } else {
+                        auto started = worker.begin(*material_requested_identity, std::move(source.value()),
+                            worker_project_path, request);
+                        if (!started) {
+                            material_requested_started = true;
+                            material_viewport_diagnostic = started.error().message;
+                        } else if (started.value()) {
+                            material_requested_started = true;
+                            material_viewport_diagnostic = "Rendering viewport.";
+                        }
+                    }
+                } else if (material_viewport_authored_camera && !request.camera) {
+                    material_viewport_diagnostic = "Add an authored camera to use camera preview.";
+                }
+            }
+            material_image_current = material_viewport_image.has_value() &&
+                material_viewport_key == desired_key &&
+                material_viewport_generation == snapshot.project_generation &&
+                material_viewport_image->source_revision == snapshot.project_revision &&
+                !native_transform_drag.has_value() && !native_sculpt_stroke.has_value() &&
+                !native_knife_stroke.has_value() && !native_condition_gizmo_drag.has_value() &&
+                !work_surface_camera_panning;
+            // A recreated swapchain can change the required interpretation of
+            // already encoded display bytes without changing the source key.
+            if (material_image_current && !renderer.authoring_viewport_format_matches()) {
+                const auto uploaded = renderer.set_authoring_viewport_texture(
+                    *material_viewport_image, material_display_pixel_digest, material_viewport_diagnostic);
+                material_image_current = uploaded == DesktopShell::TextureUploadResult::ready;
+            }
+#elif defined(CARTO_DESKTOP_RESIDENT_WORKER)
+            auto& worker = carto::d3d12::ReadbackViewportWorker::process_owned();
+            if (!viewport_worker_shutdown.bound) {
+                const bool attached = viewport_worker_shutdown.bind(&worker,
+                    [](void* owner) noexcept { static_cast<carto::d3d12::ReadbackViewportWorker*>(owner)->request_stop(); },
+                    [](void* owner) noexcept { return static_cast<carto::d3d12::ReadbackViewportWorker*>(owner)->shutdown_ready(); });
+                if (!attached) material_viewport_diagnostic = "Viewport shutdown interlock could not be bound.";
+            }
+            const auto desired_key = key.str();
+            if (desired_key != material_requested_key) {
+                worker.invalidate();
+                pending_resident_job.reset();
+                completed_resident_job.reset();
+                material_requested_key = desired_key;
+                material_requested_started = false;
+                if (material_next_request_id == std::numeric_limits<std::uint64_t>::max()) {
+                    material_requested_identity.reset();
+                    material_viewport_diagnostic = "Viewport request identity is exhausted.";
+                } else {
+                    material_requested_identity = carto::d3d12::ReadbackViewportIdentity{
+                        snapshot.project_generation, ++material_next_request_id};
+                }
+            }
+            if (completed_resident_job) {
+                auto completed = std::move(*completed_resident_job);
+                completed_resident_job.reset();
+                const bool matching = material_requested_identity && completed.identity == *material_requested_identity;
+                using WorkerState = carto::d3d12::ReadbackViewportPoll::State;
+                if (matching && completed.state == WorkerState::ready && completed.frame &&
+                    completed.frame->resident_image && completed.frame->image.source_revision == snapshot.project_revision &&
+                    completed.frame->image.width == request.width && completed.frame->image.height == request.height &&
+                    renderer.set_authoring_gpu_texture(*completed.frame->resident_image, request.width, request.height,
+                                                       material_viewport_diagnostic)) {
+                    renderer.note_authoring(*completed.frame, renderer.host_elapsed_ms());
+                    material_viewport_image = std::move(completed.frame->image);
+                    material_viewport_key = desired_key;
+                    material_viewport_generation = snapshot.project_generation;
+                    material_viewport_metrics = "Same-device GPU viewport " + std::to_string(request.width) + "x" +
+                        std::to_string(request.height) + (render_extent_capped ? " (resolution capped)" : "");
+                    material_viewport_diagnostic.clear();
+                } else if (matching && completed.state == WorkerState::failed) {
+                    material_viewport_diagnostic = completed.error;
+                } else if (matching && material_viewport_diagnostic.empty()) {
+                    material_viewport_diagnostic = "Resident viewport result could not be bound.";
+                }
+            }
+            if (viewport_worker_shutdown.bound && !viewport_worker_shutdown.stopping && !close_accepted &&
+                !material_requested_started && material_requested_identity) {
+                if (project_path_error) {
+                    material_requested_started = true;
+                    material_viewport_diagnostic = "Unable to resolve the project path for the viewport.";
+                } else if (material_viewport_authored_camera && !request.camera) {
+                    material_viewport_diagnostic = "Add an authored camera to use camera preview.";
+                } else {
+                    auto source = session.authoring_viewport_source(snapshot.project_revision);
+                    if (!source) {
+                        material_requested_started = true;
+                        material_viewport_diagnostic = source.error().message;
+                    } else {
+                        pending_resident_job.emplace(PendingResidentJob{*material_requested_identity,
+                            std::move(source.value()), worker_project_path, request, renderer.authoring_device()});
+                        material_requested_started = true;
+                        material_viewport_diagnostic = "Preparing rendered viewport.";
+                    }
+                }
+            }
+            material_image_current = material_viewport_image && material_viewport_key == desired_key &&
+                material_viewport_generation == snapshot.project_generation &&
+                material_viewport_image->source_revision == snapshot.project_revision &&
+                !native_transform_drag && !native_sculpt_stroke && !native_knife_stroke &&
+                !native_condition_gizmo_drag && !work_surface_camera_panning;
+#else
+            renderer.cancel_authoring_viewport_upload();
+            material_viewport_diagnostic = "Rendered viewport awaits the asynchronous worker.";
+            material_image_current = false;
+#endif
+            material_viewport_displayed = material_image_current;
+        } else {
+#if defined(CARTO_DESKTOP_ASYNC_READBACK) || defined(CARTO_DESKTOP_RESIDENT_WORKER)
+            if (viewport_worker_shutdown.bound && viewport_worker_shutdown.owner &&
+                !viewport_worker_shutdown.stopping)
+                static_cast<carto::d3d12::ReadbackViewportWorker*>(viewport_worker_shutdown.owner)->invalidate();
+#endif
+            renderer.clear_authoring_viewport_texture();
+            if (material_viewport_enabled && !showing_agent_preview && !authoring_on_main_viewport)
+                material_viewport_diagnostic =
+                    "Move or dock the work surface into the main window to use rendered preview; detached window color formats are not verified.";
+            else if (material_viewport_enabled && !showing_agent_preview && !authoring_view_supported)
+                material_viewport_diagnostic = navigation_view_error.empty()
+                    ? "Rendered preview is unavailable for this workspace view."
+                    : navigation_view_error;
+            material_viewport_image.reset();
+            material_viewport_key.clear();
+#if defined(CARTO_DESKTOP_ASYNC_READBACK) || defined(CARTO_DESKTOP_RESIDENT_WORKER)
+#ifdef CARTO_DESKTOP_RESIDENT_WORKER
+            pending_resident_job.reset();
+            completed_resident_job.reset();
+#endif
+            material_pending_upload.reset();
+            material_pending_upload_key.clear();
+            material_pending_pixel_digest.clear();
+            material_display_pixel_digest.clear();
+            material_requested_key.clear();
+            material_requested_identity.reset();
+            material_requested_started = false;
+#endif
+        }
+        if (material_image_current) {
+            // The retained CPU interaction cache uses the workspace camera.
+            // Do not apply it to a rendered image until the worker and overlay
+            // share a verified projection and exact request identity.
+            native_viewport_hits.interactive = false;
+            if (material_viewport_authored_camera) work_surface_camera_input_allowed = false;
         }
         const auto project = [&](Vec3d point) {
             const auto world = world_point(carto::core::Transform::identity(), point);
@@ -12048,6 +13336,33 @@ struct DesktopState {
             }
         }
 
+        if (material_image_current) {
+            // Cover all earlier workspace and offline-preview drawing. The
+            // uploaded image is precomposited over the same opaque black.
+            draw->AddRectFilled(origin, origin + extent, IM_COL32(0, 0, 0, 255));
+            draw->AddImage(ImTextureRef{renderer.authoring_viewport_texture_id()}, origin, origin + extent);
+            draw->AddRectFilled(origin + ImVec2(4.0F, extent.y - 44.0F),
+                origin + extent - ImVec2(4.0F, 4.0F), IM_COL32(10, 16, 22, 235));
+            draw->AddText(nullptr, 0.0F, origin + ImVec2(8.0F, extent.y - 40.0F),
+                IM_COL32(235, 240, 245, 255), material_viewport_metrics.c_str(), nullptr, extent.x - 16.0F);
+            if (material_viewport_image->diagnostics.size() > 1U)
+                draw->AddText(origin + ImVec2(8.0F, extent.y - 44.0F),
+                    rgba(snapshot.colors.semantic_warning, 1.0F),
+                    material_viewport_image->diagnostics.back().c_str());
+            // Preview pixels and workspace overlays use different camera
+            // contracts. Until their projection parity is proven, show the
+            // rendered frame alone and keep workspace picking disabled.
+            draw->AddText(origin + ImVec2(8.0F, 8.0F),
+                rgba(snapshot.colors.semantic_warning, 1.0F),
+                "Preview only. Save your work and restart to resume viewport editing.");
+            ImGui::EndChild();
+            return;
+        } else if (material_viewport_enabled) {
+            const std::string message = "Rendered viewport unavailable: " +
+                (showing_agent_preview ? std::string("agent preview") : material_viewport_diagnostic);
+            draw->AddText(origin + ImVec2(8.0F, extent.y - 24.0F),
+                rgba(snapshot.colors.semantic_warning, 1.0F), message.c_str());
+        }
         auto& faces = native_viewport_hits.faces;
         auto& vertices = native_viewport_hits.vertices;
         auto& edges = native_viewport_hits.edges;
@@ -13161,7 +14476,8 @@ struct DesktopState {
         // Perspective workspace picking is dispatched by the generation-bound
         // native hit route after this draw; raw screen-space hits here would bypass
         // its depth, cache-completeness, and stale-snapshot checks.
-        if (carto::studio::use_legacy_screen_pick(
+        if (!material_viewport_enabled && !viewport_edit_requires_restart &&
+            carto::studio::use_legacy_screen_pick(
                 surface == ShellSurface::workspace, perspective_camera_active) &&
             ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             const ImVec2 mouse = ImGui::GetMousePos();
@@ -13422,6 +14738,12 @@ struct DesktopState {
         }
 
         carto::project::PresentationCatalog candidate;
+        if (auto retained = candidate.set_environment(snapshot.presentation_catalog.environment());
+            !retained) {
+            action_feedback = retained.error().message;
+            action_feedback_error = true;
+            return false;
+        }
         bool camera_inserted = false;
         for (const auto& [object_id, source] : snapshot.presentation_catalog.cameras()) {
             auto value = source;
@@ -14266,7 +15588,9 @@ struct DesktopState {
             ? "Select material" : selected_material->name.c_str();
         if (ImGui::BeginCombo("Decal material", material_preview)) {
             for (const auto& material : snapshot.materials) {
-                ImGui::PushID(static_cast<int>(material.id & 0x7fffffffU));
+                const auto widget_id = carto::studio::material_source_widget_id(
+                    snapshot.project_generation, material.id);
+                ImGui::PushID(widget_id.c_str());
                 const std::string label = material.name + " · rev " +
                     std::to_string(material.revision.value());
                 if (ImGui::Selectable(label.c_str(),
@@ -15034,12 +16358,12 @@ struct DesktopState {
             const auto upload = renderer.set_scene_capture_texture(image.value().width,
                     image.value().height, image.value().srgb_rgba,
                     image.value().pixel_digest, upload_diagnostic);
-            if (upload == VulkanShell::TextureUploadResult::pending) {
+            if (upload == DesktopShell::TextureUploadResult::pending) {
                 scene_capture_feedback = "Preview upload is pending. Retry Capture to publish the current source-bound preview.";
                 scene_capture_feedback_error = false;
                 return;
             }
-            if (upload != VulkanShell::TextureUploadResult::ready) {
+            if (upload != DesktopShell::TextureUploadResult::ready) {
                 fail("Rendered scene could not be shown in the viewport: " +
                     upload_diagnostic);
                 return;
@@ -15920,8 +17244,8 @@ struct DesktopState {
                             if (current_raster.has_value()) {
                                 const auto upload = renderer.set_source_reimport_thumbnail_texture(
                                     0U, *current_raster, current_thumbnail_diagnostic);
-                                current_thumbnail_ready = upload == VulkanShell::TextureUploadResult::ready;
-                                current_thumbnail_pending = upload == VulkanShell::TextureUploadResult::pending;
+                                current_thumbnail_ready = upload == DesktopShell::TextureUploadResult::ready;
+                                current_thumbnail_pending = upload == DesktopShell::TextureUploadResult::pending;
                             } else {
                                 current_thumbnail_diagnostic =
                                     "Depth-correct thumbnail exceeds its safe geometry or raster budget.";
@@ -15932,8 +17256,8 @@ struct DesktopState {
                             if (candidate_raster.has_value()) {
                                 const auto upload = renderer.set_source_reimport_thumbnail_texture(
                                     1U, *candidate_raster, candidate_thumbnail_diagnostic);
-                                candidate_thumbnail_ready = upload == VulkanShell::TextureUploadResult::ready;
-                                candidate_thumbnail_pending = upload == VulkanShell::TextureUploadResult::pending;
+                                candidate_thumbnail_ready = upload == DesktopShell::TextureUploadResult::ready;
+                                candidate_thumbnail_pending = upload == DesktopShell::TextureUploadResult::pending;
                             } else {
                                 candidate_thumbnail_diagnostic =
                                     "Depth-correct thumbnail exceeds its safe geometry or raster budget.";
@@ -16728,11 +18052,26 @@ struct DesktopState {
 
         ImGui::TextDisabled("Project-owned PBR source · .carto persisted");
         ImGui::TextWrapped(
-            "Edit durable source factors and typed material graphs. Structural graph checks "
-            "do not compile GPU shaders or provide live viewport shading.");
+            "Edit PBR factors and bounded UV/texture graphs. "
+            "Surface-input nodes and unsupported outputs fail visibly.");
         ImGui::Separator();
 
-        ImGui::TextDisabled("Texture sources · bounded header inspection only");
+        ImGui::TextDisabled("Texture source records");
+        ImGui::Checkbox("I own or may reuse the imported material library",&material_library_rights_confirmed);
+        ImGui::BeginDisabled(!snapshot.project_path||!material_library_rights_confirmed);
+        if(ImGui::Button("Import GLTF/GLB material library...",ImVec2(-1,28))) {
+            if(auto path=choose_file(false,FileDialogKind::material_library)) {
+                std::ifstream input(*path,std::ios::binary|std::ios::ate);const auto size=input?input.tellg():std::streampos(-1);
+                if(size<=0||size>std::streamoff(128U*1024U*1024U)){action_feedback="Material library must be readable and within 128 MiB.";action_feedback_error=true;}
+                else {
+                    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));input.seekg(0);input.read(reinterpret_cast<char*>(bytes.data()),static_cast<std::streamsize>(bytes.size()));
+                    if(input)dispatch(carto::application::ImportGltfMaterialLibraryAction{snapshot.project_generation,snapshot.project_revision,std::move(bytes),true});
+                    else {action_feedback="Material library read failed; prior materials retained.";action_feedback_error=true;}
+                }
+            }
+        }
+        ImGui::EndDisabled();
+        ImGui::TextWrapped("Material library: embedded PNG/JPEG sources only. Assign an imported material below. To include geometry and hierarchy, use File > Import Mesh with GLTF/GLB.");
         ImGui::BeginDisabled(!snapshot.project_path.has_value());
         if (ImGui::Button("Import Texture Source…", ImVec2(-1, 28))) {
             const auto path = choose_file(false, FileDialogKind::texture_source);
@@ -16740,7 +18079,7 @@ struct DesktopState {
                 const auto imported = ui.import_material_texture(*path);
                 action_feedback_error = !imported;
                 action_feedback = imported
-                    ? "Texture source imported · pixels are not decoded or rendered."
+                    ? "Texture source imported; bind it to a supported material slot."
                     : imported.error().message;
             }
         }
@@ -16787,21 +18126,25 @@ struct DesktopState {
 
         if (snapshot.materials.empty()) {
             ImGui::TextDisabled("No material sources in this project.");
+            if (material_draft_dirty && ImGui::Button("Discard unavailable material draft", ImVec2(-1, 24))) {
+                material_draft_dirty = false;
+                material_draft_loaded = false;
+            }
         } else {
             if (std::none_of(snapshot.materials.begin(), snapshot.materials.end(),
                     [this](const auto& value) { return value.id == selected_material_id; })) {
                 selected_material_id = snapshot.materials.front().id;
-                material_draft_loaded = false;
+                if (!material_draft_dirty) material_draft_loaded = false;
             }
-            const auto selected = std::find_if(
-                snapshot.materials.begin(), snapshot.materials.end(),
-                [this](const auto& value) { return value.id == selected_material_id; });
+            auto selected = carto::studio::find_material_source(snapshot.materials, selected_material_id);
             const std::string preview = selected == snapshot.materials.end()
                 ? "Select material" : selected->name;
             ImGui::BeginDisabled(material_draft_dirty);
             if (ImGui::BeginCombo("Material source", preview.c_str())) {
                 for (const auto& material : snapshot.materials) {
-                    ImGui::PushID(static_cast<int>(material.id & 0x7fffffffU));
+                    const auto widget_id = carto::studio::material_source_widget_id(
+                        snapshot.project_generation, material.id);
+                    ImGui::PushID(widget_id.c_str());
                     const std::string label = material.name + "  ·  rev " +
                         std::to_string(material.revision.value());
                     if (ImGui::Selectable(label.c_str(), material.id == selected_material_id)) {
@@ -16814,17 +18157,25 @@ struct DesktopState {
             }
             ImGui::EndDisabled();
 
+            // The combo can change the selected ID this frame. Never load or
+            // apply a draft through the iterator for the previous selection.
+            selected = carto::studio::find_material_source(snapshot.materials, selected_material_id);
             if (selected != snapshot.materials.end()) {
-                if (!material_draft_loaded ||
-                    (!material_draft_dirty && material_draft_revision != selected->revision)) {
+                const carto::studio::MaterialDraftIdentity source_identity{
+                    snapshot.project_generation, selected->id, selected->revision};
+                const auto draft_state = carto::studio::material_draft_state(
+                    material_draft_loaded, material_draft_dirty,
+                    material_draft_identity, source_identity);
+                if (draft_state == carto::studio::MaterialDraftState::reload) {
                     material_draft = selected->definition;
-                    material_draft_revision = selected->revision;
+                    material_draft_identity = source_identity;
                     material_draft_loaded = true;
                     material_draft_dirty = false;
                 }
-                bool material_draft_stale = material_draft_dirty &&
-                    material_draft_revision != selected->revision;
-                ImGui::PushID(static_cast<int>(selected->id & 0x7fffffffU));
+                bool material_draft_stale = draft_state == carto::studio::MaterialDraftState::stale;
+                const auto material_widget_id = carto::studio::material_source_widget_id(
+                    snapshot.project_generation, selected->id);
+                ImGui::PushID(material_widget_id.c_str());
                 ImGui::Text("%s", selected->name.c_str());
                 ImGui::TextDisabled("Material %llu · source revision %llu",
                     static_cast<unsigned long long>(selected->id),
@@ -16881,17 +18232,24 @@ struct DesktopState {
                             expected_digest}));
                 }
                 ImGui::TextWrapped(
-                    "Bound current graphs with supported PBR outputs are evaluated for saved-scene "
-                    "D3D12 previews when required values are saved on the binding or supplied "
-                    "per capture. Texture "
-                    "sampling, missing or mistyped inputs, variants, and unsupported outputs fail closed; the live "
-                    "Vulkan material viewport does not evaluate graph shading.");
+                    "Saved-scene D3D12 captures can evaluate supported bound graphs with saved "
+                    "or capture inputs. Unsupported inputs, texture operations, variants, and "
+                    "outputs fail closed.");
+#ifdef CARTO_DESKTOP_ASYNC_READBACK
+                ImGui::TextWrapped(
+                    "Rendered viewport uses a separate bounded graph and texture path; "
+                    "unsupported content reports an error. The ordinary workspace is not graph-shaded.");
+#else
+                ImGui::TextWrapped(
+                    "The ordinary workspace is not graph-shaded. Rendered viewport is unavailable in this build.");
+#endif
                 if (material_draft_stale) {
                     ImGui::TextColored(color(snapshot.colors.semantic_warning),
-                        "Source changed. Your local draft is retained; reload before applying.");
+                        "Material or project changed. Your local draft is retained; reload before applying.");
                     if (ImGui::Button("Discard stale draft and reload", ImVec2(-1, 24))) {
                         material_draft = selected->definition;
-                        material_draft_revision = selected->revision;
+                        material_draft_identity = source_identity;
+                        material_draft_loaded = true;
                         material_draft_dirty = false;
                         material_draft_stale = false;
                     }
@@ -16919,7 +18277,9 @@ struct DesktopState {
                         requested_base_texture = 0U;
                     }
                     for (const auto& texture : snapshot.texture_sources) {
-                        ImGui::PushID(static_cast<int>(texture.id & 0x7fffffffU));
+                        const auto widget_id = carto::studio::material_source_widget_id(
+                            snapshot.project_generation, texture.id);
+                        ImGui::PushID(widget_id.c_str());
                         const std::string label = texture.name + " · " +
                             texture.content_digest.hex().substr(0U, 12U);
                         const bool selected_texture =
@@ -16934,13 +18294,8 @@ struct DesktopState {
                 }
                 ImGui::EndDisabled();
                 if (requested_base_texture.has_value()) {
-                    if (requested_base_texture.value() == 0U) {
-                        material_draft.base_color = {};
-                    } else {
-                        carto::render::TextureRef binding;
-                        binding.asset = requested_base_texture.value();
-                        material_draft.base_color = binding;
-                    }
+                    carto::studio::set_base_color_texture_source(
+                        material_draft.base_color, requested_base_texture.value());
                     material_draft_dirty = true;
                 }
                 if (material_draft.base_color.asset != 0U) {
@@ -17023,7 +18378,7 @@ struct DesktopState {
                     material_draft_dirty = true;
                 }
                 ImGui::TextDisabled(
-                    "Saved as source intent; this does not enable viewport emission rendering.");
+                    "Emission contributes linear HDR radiance; camera exposure controls its displayed brightness.");
                 ImGui::BeginDisabled(!material_draft_dirty || material_draft_stale);
                 if (ImGui::Button("Apply source changes", ImVec2(-1, 28))) {
                     if (dispatch(carto::application::UpdateMaterialAction{
@@ -17036,7 +18391,8 @@ struct DesktopState {
                 if (!material_draft_stale && material_draft_dirty &&
                     ImGui::Button("Discard draft", ImVec2(-1, 24))) {
                     material_draft = selected->definition;
-                    material_draft_revision = selected->revision;
+                    material_draft_identity = source_identity;
+                    material_draft_loaded = true;
                     material_draft_dirty = false;
                 }
                 ImGui::PopID();
@@ -17054,7 +18410,8 @@ struct DesktopState {
             snapshot.materials.begin(), snapshot.materials.end(),
             [this](const auto& value) { return value.id == selected_material_id; });
         ImGui::BeginDisabled(graph_material == snapshot.materials.end() ||
-                             material_graph_identity_buffer.front() == '\0');
+                             material_graph_identity_buffer.front() == '\0' ||
+                             material_graph_draft_dirty || pending_material_graph_selection.has_value());
         if (ImGui::Button("Create factor graph", ImVec2(-1, 26))) {
             carto::project::MaterialGraph graph;
             graph.identity = material_graph_identity_buffer.data();
@@ -17092,6 +18449,10 @@ struct DesktopState {
                     snapshot.project_revision, std::nullopt, std::nullopt,
                     std::move(graph)})) {
                 selected_material_graph_identity = identity;
+                pending_material_graph_selection = carto::studio::PendingMaterialGraphSelection{
+                    snapshot.project_generation, snapshot.project_revision, identity,
+                    carto::core::Revision{1U}};
+                material_graph_selection_needs_choice = false;
                 material_graph_draft_loaded = false;
                 material_graph_draft_dirty = false;
                 material_graph_identity_buffer.fill('\0');
@@ -17101,20 +18462,49 @@ struct DesktopState {
         }
         ImGui::EndDisabled();
 
-        if (!snapshot.material_graphs.empty() &&
+        bool graph_selection_waiting = false;
+        if (pending_material_graph_selection) {
+            const auto pending_view = std::find_if(snapshot.material_graphs.begin(),
+                snapshot.material_graphs.end(), [this](const auto& graph) {
+                    return graph.identity == pending_material_graph_selection->graph;
+                });
+            const auto observed_revision = pending_view == snapshot.material_graphs.end()
+                ? std::optional<carto::core::Revision>{}
+                : std::optional<carto::core::Revision>{pending_view->source_revision};
+            const auto state = carto::studio::pending_material_graph_state(
+                *pending_material_graph_selection, snapshot.project_generation,
+                snapshot.project_revision, observed_revision);
+            graph_selection_waiting = state == carto::studio::PendingMaterialGraphState::waiting;
+            if (!graph_selection_waiting) {
+                if (state == carto::studio::PendingMaterialGraphState::unavailable) {
+                    selected_material_graph_identity.clear();
+                    material_graph_selection_needs_choice = true;
+                }
+                pending_material_graph_selection.reset();
+            }
+        }
+        if (!graph_selection_waiting && !material_graph_selection_needs_choice &&
+            !snapshot.material_graphs.empty() &&
             std::none_of(snapshot.material_graphs.begin(), snapshot.material_graphs.end(),
                 [this](const auto& graph) {
                     return graph.identity == selected_material_graph_identity;
                 })) {
             selected_material_graph_identity = snapshot.material_graphs.front().identity;
-            material_graph_draft_loaded = false;
+            if (!material_graph_draft_dirty) material_graph_draft_loaded = false;
             clear_material_graph_cpu_preview();
             clear_material_graph_cpu_inputs();
         }
         if (snapshot.material_graphs.empty()) {
             clear_material_graph_cpu_preview();
             clear_material_graph_cpu_inputs();
-            ImGui::TextDisabled("No material graph sources in this project.");
+            ImGui::TextDisabled(graph_selection_waiting
+                ? "Refreshing the graph list for the new source."
+                : "No material graph sources in this project.");
+            if (material_graph_draft_dirty && ImGui::Button(
+                    "Discard unavailable graph draft", ImVec2(-1, 24))) {
+                material_graph_draft_loaded = false;
+                material_graph_draft_dirty = false;
+            }
         } else {
             auto selected_graph_view = std::find_if(
                 snapshot.material_graphs.begin(), snapshot.material_graphs.end(),
@@ -17123,6 +18513,7 @@ struct DesktopState {
                 });
             const std::string graph_preview = selected_graph_view == snapshot.material_graphs.end()
                 ? "Select graph" : selected_graph_view->identity;
+            ImGui::BeginDisabled(material_graph_draft_dirty || graph_selection_waiting);
             if (ImGui::BeginCombo("Graph source", graph_preview.c_str())) {
                 for (const auto& graph : snapshot.material_graphs) {
                     ImGui::PushID(graph.identity.c_str());
@@ -17132,6 +18523,7 @@ struct DesktopState {
                     if (ImGui::Selectable(label.c_str(),
                             graph.identity == selected_material_graph_identity)) {
                         selected_material_graph_identity = graph.identity;
+                        material_graph_selection_needs_choice = false;
                         material_graph_draft_loaded = false;
                         material_graph_draft_dirty = false;
                         clear_material_graph_cpu_preview();
@@ -17141,6 +18533,7 @@ struct DesktopState {
                 }
                 ImGui::EndCombo();
             }
+            ImGui::EndDisabled();
             selected_graph_view = std::find_if(
                 snapshot.material_graphs.begin(), snapshot.material_graphs.end(),
                 [this](const auto& graph) {
@@ -17151,22 +18544,33 @@ struct DesktopState {
             if (graph_removed) {
                 clear_material_graph_cpu_preview();
                 clear_material_graph_cpu_inputs();
-                material_graph_draft_loaded = false;
-                ImGui::TextColored(color(snapshot.colors.semantic_warning),
-                    "Selected graph source is no longer present.");
+                if (!material_graph_draft_dirty) material_graph_draft_loaded = false;
+                if (graph_selection_waiting) {
+                    ImGui::TextDisabled("Refreshing the graph list for the new source.");
+                } else {
+                    ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                        "Selected graph source is unavailable or changed. Choose a graph source.");
+                }
+                if (material_graph_draft_dirty && ImGui::Button(
+                        "Discard unavailable graph draft", ImVec2(-1, 24))) {
+                    material_graph_draft_loaded = false;
+                    material_graph_draft_dirty = false;
+                }
             } else {
-                const bool source_changed = material_graph_draft_loaded &&
-                    (material_graph_draft.revision != selected_graph_view->source_revision ||
-                     material_graph_draft_project_revision != snapshot.project_revision);
-                if (!material_graph_draft_loaded ||
-                    (!material_graph_draft_dirty && source_changed)) {
+                const carto::studio::MaterialGraphDraftIdentity source_identity{
+                    snapshot.project_generation, snapshot.project_revision,
+                    selected_graph_view->identity, selected_graph_view->source_revision};
+                const auto graph_draft_state = carto::studio::material_graph_draft_state(
+                    material_graph_draft_loaded, material_graph_draft_dirty,
+                    material_graph_draft_identity, source_identity);
+                if (graph_draft_state == carto::studio::MaterialGraphDraftState::reload) {
                     clear_material_graph_cpu_preview();
                     clear_material_graph_cpu_inputs();
                     const auto loaded = ui.material_graph_source(
                         selected_material_graph_identity);
                     if (loaded) {
                         material_graph_draft = loaded.value();
-                        material_graph_draft_project_revision = snapshot.project_revision;
+                        material_graph_draft_identity = source_identity;
                         const auto digest = material_graph_draft.canonical_digest();
                         material_graph_draft_digest = digest
                             ? std::optional<carto::assets::Sha256Digest>{digest.value()}
@@ -17189,9 +18593,8 @@ struct DesktopState {
                     }
                 }
 
-                const bool graph_stale = material_graph_draft_dirty &&
-                    (material_graph_draft_project_revision != snapshot.project_revision ||
-                     material_graph_draft.revision != selected_graph_view->source_revision);
+                const bool graph_stale =
+                    graph_draft_state == carto::studio::MaterialGraphDraftState::stale;
                 bool saved_binding_inputs_compatible = true;
                 if (material_graph_cpu_inputs_material != selected_material_id) {
                     clear_material_graph_cpu_preview();
@@ -17219,6 +18622,13 @@ struct DesktopState {
                 ImGui::Text("Source rev %llu · %zu nodes",
                     static_cast<unsigned long long>(selected_graph_view->source_revision.value()),
                     selected_graph_view->node_count);
+                if (!graph_stale && material_graph_draft_dirty && ImGui::Button(
+                        "Discard graph draft", ImVec2(-1, 24))) {
+                    material_graph_draft_loaded = false;
+                    material_graph_draft_dirty = false;
+                    clear_material_graph_cpu_preview();
+                    clear_material_graph_cpu_inputs();
+                }
                 if (graph_stale) {
                     ImGui::TextColored(color(snapshot.colors.semantic_warning),
                         "Project/source changed. Your graph draft is retained; reload before applying.");
@@ -17671,12 +19081,15 @@ struct DesktopState {
         ImGui::Separator();
         ImGui::TextDisabled("Mesh-region assignment");
         std::optional<std::uint64_t> selected_mesh_asset;
-        if (snapshot.selection.mode == carto::editor::SelectionMode::object &&
-            snapshot.selection.objects.size() == 1U) {
+        std::optional<carto::scene::ObjectId> material_target_object;
+        if(snapshot.selection.mode==carto::editor::SelectionMode::face && snapshot.selection.component_object)
+            material_target_object=snapshot.selection.component_object;
+        else if(snapshot.selection.objects.size()==1U)material_target_object=snapshot.selection.objects.front();
+        if (material_target_object) {
             const auto object = std::find_if(
                 snapshot.objects.begin(), snapshot.objects.end(),
-                [&snapshot](const auto& value) {
-                    return value.object.id == snapshot.selection.objects.front();
+                [&material_target_object](const auto& value) {
+                    return value.object.id == *material_target_object;
                 });
             if (object != snapshot.objects.end()) selected_mesh_asset = object->object.mesh_asset;
         }
@@ -17694,6 +19107,19 @@ struct DesktopState {
         } else {
             ImGui::Text("Mesh asset %llu · affects every instance",
                 static_cast<unsigned long long>(*selected_mesh_asset));
+            const auto direct_material=std::find_if(snapshot.materials.begin(),snapshot.materials.end(),
+                [this](const auto& value){return value.id==selected_material_id;});
+            ImGui::BeginDisabled(direct_material==snapshot.materials.end());
+            if(ImGui::Button("Assign material to mesh",ImVec2(-1,26))) {
+                dispatch(carto::application::AssignMaterialToMeshAction{snapshot.project_generation,
+                    snapshot.project_revision,*material_target_object,direct_material->id,direct_material->revision,{},{}});
+            }
+            if(snapshot.selection.mode==carto::editor::SelectionMode::face&&!snapshot.selection.faces.empty()&&
+                ImGui::Button("Assign material to selected faces",ImVec2(-1,26))) {
+                dispatch(carto::application::AssignMaterialToMeshAction{snapshot.project_generation,
+                    snapshot.project_revision,*material_target_object,direct_material->id,direct_material->revision,snapshot.selection.faces,{}});
+            }
+            ImGui::EndDisabled();
             ImGui::InputScalar("Region ID", ImGuiDataType_U32, &material_region_id,
                                nullptr, nullptr, "%u");
             ImGui::TextDisabled(
@@ -17746,6 +19172,17 @@ struct DesktopState {
                         snapshot.project_revision, key, std::nullopt, std::nullopt}));
             }
             ImGui::EndDisabled();
+            ImGui::Separator();
+            ImGui::TextUnformatted("Unique lightmap UVs");
+            ImGui::InputScalar("New UV set", ImGuiDataType_U32, &lightmap_uv_output);
+            ImGui::InputScalar("Packing resolution", ImGuiDataType_U32, &lightmap_uv_resolution);
+            ImGui::TextDisabled("New set only; 4 texel padding, one UDIM tile. Source UVs remain intact.");
+            if (ImGui::Button("Generate lightmap UVs", ImVec2(-1, 26))) {
+                dispatch(carto::application::GenerateUniqueLightmapUvAction{
+                    snapshot.project_revision, *material_target_object, lightmap_uv_output,
+                    lightmap_uv_resolution, 4U, 1U});
+            }
+            draw_object_aging(snapshot,*material_target_object);
         }
 
         const bool agent_material_selected = std::any_of(
@@ -17791,7 +19228,7 @@ struct DesktopState {
         ImGui::Separator();
         ImGui::InputText("New material", material_name_buffer.data(),
                          material_name_buffer.size());
-        ImGui::BeginDisabled(material_name_buffer.front() == '\0');
+        ImGui::BeginDisabled(material_name_buffer.front() == '\0' || material_draft_dirty);
         if (ImGui::Button("Create PBR source", ImVec2(-1, 28))) {
             carto::render::StandardMaterial definition;
             definition.base_color_factor = {0.62, 0.66, 0.70, 1.0};
@@ -29644,6 +31081,12 @@ struct DesktopState {
             }
         }
 
+        // Pan remains available, but editing never uses a cache from a
+        // preview or a transition whose displayed frame is unknown.
+        if (material_viewport_enabled || viewport_edit_requires_restart) {
+            native_event_window = nullptr;
+            return;
+        }
         if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             const auto event = make_event(carto::ui::NativePointerButton::primary, modifiers, true);
             if (mesh_loop_cut_seed_pick_active) {
@@ -29762,6 +31205,11 @@ struct DesktopState {
             workbench_origin = ImGui::GetWindowPos();
             workbench_extent = ImGui::GetWindowSize();
             workbench_bounds_valid = true;
+            if (ImGui::SmallButton(viewport_controls_open ? "Hide controls" : "Workspace controls"))
+                viewport_controls_open = !viewport_controls_open;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Restore docked tools (F11)")) dock_workspace.toggle_focus();
+            if (viewport_controls_open) draw_toolbar(snapshot);
             draw_viewport(snapshot, ImVec2(0.0F, 0.0F));
             route_viewport_mouse_frame();
             ImGui::End();
@@ -30216,6 +31664,7 @@ struct DesktopState {
             draw_workspace_surface(snapshot);
             if (!dock_workspace.focus_mode()) draw_workbench_instruments(snapshot);
         }
+        draw_shared_rigs(snapshot);
         draw_command_palette(snapshot);
     }
 };
@@ -30304,6 +31753,33 @@ HWND create_window(HINSTANCE instance, int show_command) {
     return window;
 }
 
+void trace_desktop_startup(const char* phase) {
+#ifdef CARTO_DESKTOP_STARTUP_TRACE
+    std::array<wchar_t,32768> path{};
+    const auto count = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    if (count != 0U && count < path.size()) {
+        std::ofstream log(std::filesystem::path(std::wstring(path.data(), count)).parent_path() / "startup.log", std::ios::app);
+        log << GetCurrentProcessId() << ' ' << GetTickCount64() << ' ' << phase << '\n';
+    }
+#else
+    static_cast<void>(phase);
+#endif
+}
+
+HWND create_worker_stopping_window(HINSTANCE instance) noexcept {
+    HWND window = CreateWindowExW(WS_EX_TOPMOST, L"STATIC", L"Cartographer: stopping renderer",
+        WS_OVERLAPPED | WS_CAPTION | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 620, 120, nullptr, nullptr, instance, nullptr);
+    if (window != nullptr) {
+        static_cast<void>(CreateWindowExW(0, L"STATIC",
+            L"Waiting for GPU resources to retire. Cartographer will close when it is safe.",
+            WS_CHILD | WS_VISIBLE, 12, 14, 580, 48, window, nullptr, instance, nullptr));
+    } else {
+        OutputDebugStringW(L"Cartographer is waiting for GPU worker retirement; the stopping window could not be created.\n");
+    }
+    return window;
+}
+
 int run(HINSTANCE instance, int show_command) {
     // Per-monitor DPI so torn-out windows scale per display; failure is
     // nonfatal on older Windows.
@@ -30319,13 +31795,20 @@ int run(HINSTANCE instance, int show_command) {
     }
     DesktopState state;
     g_state = &state;
+    try {
     state.window = create_window(instance, show_command);
+    trace_desktop_startup("preferences.begin");
     state.load_preferences();
     // The headless renderer has a separate, stricter device profile. Its
     // result is not used by this desktop. Admit the actual window's graphics
     // and presentation queue in VulkanShell::initialize instead.
+    trace_desktop_startup("preferences.end");
+    trace_desktop_startup("market.begin");
     state.load_market_library();
+    trace_desktop_startup("market.end");
+    trace_desktop_startup("workbench.preferences.begin");
     state.load_workbench_preferences();
+    trace_desktop_startup("workbench.preferences.end");
     // Arrangement selection and viewport view settings are local presentation
     // preferences; they load before the dock layout so the right per-
     // arrangement INI is chosen.
@@ -30340,52 +31823,202 @@ int run(HINSTANCE instance, int show_command) {
         ImGuiConfigFlags_ViewportsEnable | ImGuiConfigFlags_NavEnableKeyboard;
     imgui_io.ConfigDpiScaleFonts = true;
     imgui_io.ConfigDpiScaleViewports = true;
+    trace_desktop_startup("fonts.begin");
     state.load_fonts();
+    trace_desktop_startup("fonts.end");
     ImGui::StyleColorsDark();
         if (!ImGui_ImplWin32_Init(state.window)) throw std::runtime_error("Dear ImGui Win32 initialization failed");
+#ifndef CARTO_DESKTOP_D3D12_UI
         ImGui::GetPlatformIO().Platform_CreateVkSurface = &create_imgui_vulkan_surface;
+#endif
+        trace_desktop_startup("native.renderer.begin");
         state.renderer.initialize(state.window);
+        trace_desktop_startup("native.renderer.end");
         state.renderer_ready = true;
         if (!carto::studio::DockingWorkspace::platform_windows_enabled()) {
             // Keep docking inside the main window rather than failing.
             imgui_io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
             state.action_feedback =
-                "OS-window tear-out is unavailable: the Win32/Vulkan backends did not enable platform windows.";
+                "OS-window tear-out is unavailable: the active native backends did not enable platform windows.";
             state.action_feedback_error = true;
         }
+        trace_desktop_startup("layout.begin");
         state.load_docking_layout();
+        trace_desktop_startup("layout.end");
+#if defined(CARTO_DESKTOP_D3D12_UI) && defined(CARTO_DESKTOP_STARTUP_TRACE)
+        if (const auto* fixture = std::getenv("CARTO_DESKTOP_VIEWPORT_PROFILE_PROJECT");
+            fixture && state.material_profile_remaining) {
+            // Local diagnostic entry point uses the same project action as File/Open.
+            // It neither saves nor changes the source scene for the timing workload.
+            static_cast<void>(state.dispatch(carto::application::OpenProjectAction{
+                std::filesystem::path(fixture)}));
+            state.material_viewport_enabled = true;
+            state.viewport_edit_requires_restart = true;
+            state.material_viewport_authored_camera = true;
+            const auto* hold = std::getenv("CARTO_DESKTOP_VIEWPORT_PROFILE_HOLD");
+            state.material_profile_auto_close = !(hold && std::string_view(hold)=="1");
+        }
+#endif
 
+    trace_desktop_startup("message.loop");
     MSG message{};
     bool running = true;
+    HWND worker_stopping_window = nullptr;
+#ifdef CARTO_DESKTOP_RESIDENT_WORKER
+    const auto show_worker_stopping_window = [&] {
+        if (state.close_accepted && !IsWindow(state.window) &&
+            (worker_stopping_window == nullptr || !IsWindow(worker_stopping_window)))
+            worker_stopping_window = create_worker_stopping_window(instance);
+    };
+#endif
+    bool trace_first_frame = true;
+    unsigned trace_frames_remaining = 4U;
     while (running) {
-        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != 0) {
-            if (message.message == WM_QUIT) running = false;
+        // A continuous input/paint stream must not starve rendering or close.
+        for (std::size_t drained = 0U; drained < 256U &&
+             PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != 0; ++drained) {
+            if (trace_first_frame && drained < 16U)
+                trace_desktop_startup(("message." + std::to_string(message.message)).c_str());
+            if (message.message == WM_QUIT) {
+                // Unexpected quit still must retire the process-owned worker.
+                state.approve_close();
+                continue;
+            }
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
         if (!running) break;
-        ImGui_ImplVulkan_NewFrame();
+#ifdef CARTO_DESKTOP_RESIDENT_WORKER
+        if (state.close_requested && IsIconic(state.window))
+            ShowWindow(state.window, SW_RESTORE);
+        state.process_close_request();
+        if (viewport_worker_shutdown.bound && viewport_worker_shutdown.owner) {
+            auto& worker = *static_cast<carto::d3d12::ReadbackViewportWorker*>(viewport_worker_shutdown.owner);
+            if (worker.in_flight()) {
+                auto completed = worker.poll();
+                if (worker.in_flight() && worker.device_in_use()) {
+                    show_worker_stopping_window();
+                    MsgWaitForMultipleObjectsEx(0U, nullptr, 16U, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                    continue;
+                }
+                if (!worker.in_flight() && !state.close_accepted)
+                    state.completed_resident_job = std::move(completed);
+            }
+        }
+        if (state.close_accepted) {
+            if (viewport_worker_shutdown.shutdown_ready()) break;
+            show_worker_stopping_window();
+            MsgWaitForMultipleObjectsEx(0U, nullptr, 16U, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            continue;
+        }
+#else
+        if (state.close_accepted && viewport_worker_shutdown.shutdown_ready()) break;
+#endif
+#ifdef CARTO_DESKTOP_D3D12_UI
+        state.renderer.begin_host_frame();
+#endif
+        if (state.close_accepted && !IsWindow(state.window)) {
+            if (worker_stopping_window == nullptr || !IsWindow(worker_stopping_window)) {
+                worker_stopping_window = create_worker_stopping_window(instance);
+            }
+            MsgWaitForMultipleObjectsEx(0U, nullptr, 16U, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            continue;
+        }
+#if defined(CARTO_DESKTOP_D3D12_UI) && defined(CARTO_DESKTOP_STARTUP_TRACE)
+        // An occluded/background diagnostic window is not a controlled display
+        // benchmark. Keep processing messages and begin sampling only in front.
+        if (state.material_profile_auto_close && state.material_profile_first_paint &&
+            GetForegroundWindow() != state.window) {
+            MsgWaitForMultipleObjectsEx(0U,nullptr,16U,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
+            continue;
+        }
+#endif
+        if (state.close_accepted && IsIconic(state.window))
+            ShowWindow(state.window, SW_RESTORE);
+        if (IsIconic(state.window)) {
+            MsgWaitForMultipleObjectsEx(0U, nullptr, 16U, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            continue;
+        }
+        if (trace_first_frame) trace_desktop_startup("frame.begin");
+#ifdef CARTO_DESKTOP_D3D12_UI
+        if (!state.renderer.new_frame()) continue;
+#else
+        state.renderer.new_frame();
+#endif
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
-        state.draw();
+        if (trace_first_frame) trace_desktop_startup("ui.draw.begin");
+        state.viewport_producer_seen_this_frame = false;
+        if (state.close_accepted) {
+            ImGui::OpenPopup("Stopping renderer");
+            if (ImGui::BeginPopupModal("Stopping renderer", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::TextUnformatted("Waiting for the rendering worker to release GPU resources.");
+                ImGui::TextUnformatted("The application will close when it is safe.");
+                ImGui::EndPopup();
+            }
+        } else {
+            state.draw();
+            if (!state.viewport_producer_seen_this_frame)
+                state.invalidate_unseen_viewport();
+        }
+        if (trace_first_frame) trace_desktop_startup("ui.draw.end");
         ImGui::Render();
-        // An accepted clean-project close posts WM_QUIT during draw(). Do not
-        // enter another driver call before handling that accepted close.
-        if (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_NOREMOVE)) break;
+        // An accepted close never submits another frame once worker retirement
+        // is complete. While pending, continue painting the stopping state.
+#ifdef CARTO_DESKTOP_RESIDENT_WORKER
+        if (state.close_accepted) {
+            if (viewport_worker_shutdown.shutdown_ready()) break;
+            show_worker_stopping_window();
+            MsgWaitForMultipleObjectsEx(0U, nullptr, 16U, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            continue;
+        }
+#else
+        if (state.close_accepted && viewport_worker_shutdown.shutdown_ready()) break;
+#endif
+        if (trace_first_frame) trace_desktop_startup("present.begin");
         const bool presented = state.renderer.render(ImGui::GetDrawData());
+        if (trace_first_frame) trace_desktop_startup("present.end");
         if ((imgui_io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0) {
             ImGui::UpdatePlatformWindows();
+            state.dock_workspace.finish_platform_window_drag();
             carto::studio::DockingWorkspace::recover_offscreen_platform_windows();
             apply_detached_window_chrome(state.applied_system_high_contrast.value_or(false));
             ImGui::RenderPlatformWindowsDefault();
+            if (trace_first_frame) trace_desktop_startup("platform.present.end");
         }
         if (!presented) {
             // Finite GPU waits must not become a tight CPU loop. Wake as soon
             // as resize, input, activation or close messages are available.
             MsgWaitForMultipleObjectsEx(0, nullptr, 8, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         }
+        if (trace_frames_remaining > 0U) --trace_frames_remaining;
+#ifdef CARTO_DESKTOP_D3D12_UI
+        state.renderer.finish_host_frame();
+#ifdef CARTO_DESKTOP_RESIDENT_WORKER
+        if (viewport_worker_shutdown.bound && !state.close_accepted && !viewport_worker_shutdown.stopping) {
+            auto& worker = carto::d3d12::ReadbackViewportWorker::process_owned();
+            if (state.pending_resident_job && !worker.in_flight()) {
+                auto pending = std::move(*state.pending_resident_job);
+                state.pending_resident_job.reset();
+                auto started = worker.begin_resident(pending.identity, std::move(pending.source),
+                    std::move(pending.path), std::move(pending.request), std::move(pending.device));
+                if (!started || !started.value())
+                    state.material_viewport_diagnostic = started ? "Resident viewport worker is busy." : started.error().message;
+            }
+            if (worker.device_requested()) static_cast<void>(worker.grant_device());
+        }
+#endif
+#ifdef CARTO_DESKTOP_STARTUP_TRACE
+        state.material_profile_first_paint = true;
+        if (state.material_profile_auto_close && !state.material_profile_remaining &&
+            ++state.material_profile_tail >= 4U) state.approve_close();
+#endif
+#endif
+        trace_first_frame = trace_frames_remaining > 0U;
     }
 
+    if (worker_stopping_window != nullptr && IsWindow(worker_stopping_window))
+        DestroyWindow(worker_stopping_window);
     state.save_preferences();
     state.save_workbench_preferences();
     state.save_viewport_workspace_preferences();
@@ -30413,11 +32046,41 @@ int run(HINSTANCE instance, int show_command) {
     ImGui::DestroyContext();
     g_state = nullptr;
     return 0;
+    } catch (...) {
+        // Do not unwind DesktopState or process-owned worker state while a
+        // GPU operation may still own resources. This path uses Win32 only:
+        // the graphics backend may be the component that failed.
+        viewport_worker_shutdown.request_stop();
+        HWND stopping = nullptr;
+        while (!viewport_worker_shutdown.shutdown_ready()) {
+            if (stopping == nullptr || !IsWindow(stopping)) {
+                stopping = create_worker_stopping_window(instance);
+            }
+            MSG pending{};
+            while (PeekMessageW(&pending, nullptr, 0, 0, PM_REMOVE)) {
+                if (pending.message == WM_QUIT) continue;
+                TranslateMessage(&pending);
+                DispatchMessageW(&pending);
+            }
+            MsgWaitForMultipleObjectsEx(0U, nullptr, 32U, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+        if (stopping != nullptr && IsWindow(stopping)) DestroyWindow(stopping);
+        g_state = nullptr;
+        throw;
+    }
 }
 
 } // namespace
 
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show_command) {
+#ifdef CARTO_DESKTOP_D3D12_COMPILE_CHECK
+    // Force the real entry path into the link, but never invoke it.
+    auto* volatile checked_entry = &run;
+    (void)checked_entry;
+    (void)instance;
+    (void)show_command;
+    return 1;
+#else
     try {
         return run(instance, show_command);
     } catch (const std::exception& error) {
@@ -30426,4 +32089,5 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show_command) {
         MessageBoxW(nullptr, wide(error.what()).c_str(), L"Cartographer desktop error", MB_OK | MB_ICONERROR);
         return 1;
     }
+#endif
 }

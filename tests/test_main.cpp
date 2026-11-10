@@ -672,6 +672,17 @@ void primitives_are_deterministic_and_dimension_validated() {
     REQUIRE(!invalid_plane);
 }
 
+void orphan_vertices_remain_editable_without_invalid_derived_normals() {
+    carto::geometry::EditableMesh mesh;
+    REQUIRE(mesh.insert_bulk({{{1},{0,0,0}},{{2},{1,0,0}},{{3},{0,1,0}},{{4},{5,5,5}}},{{{1},{{1},{2},{3}}}}));
+    const auto revision=mesh.revision();const auto compiled=mesh.compile();REQUIRE(compiled);
+    REQUIRE(compiled.value().valid());REQUIRE(compiled.value().positions.size()==4);
+    REQUIRE(compiled.value().indices.size()==3);REQUIRE(compiled.value().normals[3].finite());
+    REQUIRE(compiled.value().normals[3].length_squared()==0);
+    REQUIRE(compiled.value().normals[0].z==1);
+    REQUIRE(mesh.vertex_count()==4&&mesh.revision()==revision);
+    REQUIRE(mesh.compile().value().vertex_ids==compiled.value().vertex_ids);
+}
 void vector_normalization_preserves_invalid_state() {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     const carto::core::Vec3d zero{};
@@ -2364,7 +2375,7 @@ void gltf_export_is_deterministic_bounded_and_feature_honest() {
     REQUIRE(first.value().vertices == 8U && first.value().triangles == 12U);
     REQUIRE(first.value().index_bytes == 72U);
     REQUIRE(!first.value().used_uint32_indices);
-    REQUIRE(first.value().warnings.size() == 2U);
+    REQUIRE(first.value().warnings.size() == 3U);
     REQUIRE(carto::io::export_gltf(document.value(), second_path));
 
     std::ifstream first_input(first_path, std::ios::binary);
@@ -2558,6 +2569,7 @@ int main() {
         {"primitives are deterministic and validated", primitives_are_deterministic_and_dimension_validated},
         {"vector normalization preserves invalid state", vector_normalization_preserves_invalid_state},
         {"vector2 arithmetic preserves projection and invalid evidence", vector2_arithmetic_preserves_projection_and_nonfinite_evidence},
+        {"orphan vertices retain finite derived placeholders", orphan_vertices_remain_editable_without_invalid_derived_normals},
         {"stale render result is rejected", stale_render_result_is_rejected},
         {"command bus is reversible", command_bus_is_reversible_and_rejects_failed_commands},
         {"command rollback restores redo until durable acceptance", command_bus_rollback_restores_redo_until_durable_acceptance},

@@ -5,6 +5,7 @@
 #include <carto/io/gltf_material_import.hpp>
 #include <carto/io/gltf_scene_import.hpp>
 #include <carto/assets/texture_image_decoder.hpp>
+#include "gltf_dependency_reader.hpp"
 #include <cctype>
 #include <charconv>
 #include <cmath>
@@ -154,11 +155,47 @@ project::SamplerAddressMode wrap(std::uint64_t n) {
 struct GltfContainer {
     std::string_view json;
     std::span<const std::uint8_t> binary;
+    struct External { std::string uri; std::span<const std::uint8_t> bytes; };
+    std::vector<External> external;
 };
+constexpr std::string_view kSourcePackageMagic = "CARTOGLTFPK1";
 GltfContainer container(std::span<const std::uint8_t> bytes) {
     if (bytes.empty() || bytes.size() > 128U * 1024U * 1024U)
         throw std::runtime_error("glTF source must be within 128 MiB");
-    GltfContainer c{{reinterpret_cast<const char *>(bytes.data()), bytes.size()}, {}};
+    if (bytes.size() >= kSourcePackageMagic.size() &&
+        std::equal(kSourcePackageMagic.begin(), kSourcePackageMagic.end(), bytes.begin())) {
+        std::size_t cursor = kSourcePackageMagic.size();
+        const auto take_u32 = [&]() {
+            const auto value = u32(bytes, cursor);
+            cursor += 4U;
+            return value;
+        };
+        const auto document_size = take_u32();
+        const auto count = take_u32();
+        if (!document_size || count == 0U || count > 16U || document_size > bytes.size() - cursor)
+            throw std::runtime_error("invalid glTF source package header");
+        const auto document = bytes.subspan(cursor, document_size);
+        cursor += document_size;
+        if (document.size() >= kSourcePackageMagic.size() &&
+            std::equal(kSourcePackageMagic.begin(), kSourcePackageMagic.end(), document.begin()))
+            throw std::runtime_error("nested glTF source package is not supported");
+        auto c = container(document);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto name_size = take_u32(), data_size = take_u32();
+            if (!name_size || name_size > 240U || !data_size || name_size > bytes.size() - cursor)
+                throw std::runtime_error("invalid glTF source package resource");
+            const std::string name(reinterpret_cast<const char*>(bytes.data() + cursor), name_size);
+            cursor += name_size;
+            if (data_size > bytes.size() - cursor ||
+                std::any_of(c.external.begin(), c.external.end(), [&](const auto& entry) { return entry.uri == name; }))
+                throw std::runtime_error("invalid or duplicate glTF source package resource");
+            c.external.push_back({name, bytes.subspan(cursor, data_size)});
+            cursor += data_size;
+        }
+        if (cursor != bytes.size()) throw std::runtime_error("trailing glTF source package data");
+        return c;
+    }
+    GltfContainer c{{reinterpret_cast<const char *>(bytes.data()), bytes.size()}, {}, {}};
     if (bytes.size() >= 4 && u32(bytes, 0) == 0x46546c67) {
         if (bytes.size() < 20 || u32(bytes, 4) != 2 || u32(bytes, 8) != bytes.size() ||
             u32(bytes, 16) != 0x4e4f534a)
@@ -194,10 +231,15 @@ std::vector<std::vector<std::uint8_t>> buffers(const Object &root, GltfContainer
             const auto skip = source.starts_with(prefix)      ? prefix.size()
                               : source.starts_with(alternate) ? alternate.size()
                                                               : 0;
-            if (!skip)
-                throw std::runtime_error(
-                    "external glTF buffers are not read; use embedded GLTF or GLB");
-            data = base64(std::string_view(source).substr(skip), 90U * 1024U * 1024U);
+            if (skip) {
+                data = base64(std::string_view(source).substr(skip), 90U * 1024U * 1024U);
+            } else {
+                const auto found = std::find_if(c.external.begin(), c.external.end(),
+                    [&](const auto& entry) { return entry.uri == source; });
+                if (found == c.external.end())
+                    throw std::runtime_error("external glTF buffer was not captured in the source package");
+                data.assign(found->bytes.begin(), found->bytes.end());
+            }
             if (data.size() != n)
                 throw std::runtime_error("glTF buffer byteLength mismatch");
         } else {
@@ -221,6 +263,50 @@ std::span<const std::uint8_t> buffer_view(const std::vector<std::vector<std::uin
                                                     static_cast<std::size_t>(size));
 }
 } // namespace
+core::Result<std::vector<std::uint8_t>> capture_gltf_scene_source(
+    const std::filesystem::path& path, std::span<const std::uint8_t> bytes) {
+    using Result = core::Result<std::vector<std::uint8_t>>;
+    try {
+        const auto contents = container(bytes);
+        if (!contents.external.empty()) throw std::runtime_error("source packages cannot be recaptured as files");
+        const auto root = object(contents.json);
+        std::vector<std::pair<std::string, std::vector<std::uint8_t>>> captured;
+        std::uint64_t total = bytes.size();
+        for (auto raw : array(get(root, "buffers", "[]"), 16)) {
+            const auto entry = object(raw);
+            const auto uri = get(entry, "uri");
+            if (uri.empty()) continue;
+            const auto name = text(uri);
+            if (name.starts_with("data:")) continue;
+            if (std::any_of(captured.begin(), captured.end(), [&](const auto& item) { return item.first == name; }))
+                continue;
+            auto data = detail::read_gltf_sibling(path, name, 64U * 1024U * 1024U);
+            if (!data) return Result::failure(data.error());
+            if (data.value().empty() || (total += data.value().size() + name.size() + 8U) > 128U * 1024U * 1024U - 20U)
+                throw std::runtime_error("glTF source package exceeds its size limit");
+            captured.emplace_back(name, std::move(data.value()));
+        }
+        if (captured.empty()) return Result::success({bytes.begin(), bytes.end()});
+        std::vector<std::uint8_t> result(kSourcePackageMagic.begin(), kSourcePackageMagic.end());
+        const auto append_u32 = [&](std::uint32_t value) {
+            for (unsigned shift = 0; shift != 32U; shift += 8U)
+                result.push_back(static_cast<std::uint8_t>(value >> shift));
+        };
+        append_u32(static_cast<std::uint32_t>(bytes.size()));
+        append_u32(static_cast<std::uint32_t>(captured.size()));
+        result.insert(result.end(), bytes.begin(), bytes.end());
+        for (const auto& [name, data] : captured) {
+            append_u32(static_cast<std::uint32_t>(name.size()));
+            append_u32(static_cast<std::uint32_t>(data.size()));
+            result.insert(result.end(), name.begin(), name.end());
+            result.insert(result.end(), data.begin(), data.end());
+        }
+        return Result::success(std::move(result));
+    } catch (const std::exception& e) {
+        return Result::failure({core::ErrorCode::validation_failed,
+            std::string("glTF source capture: ") + e.what()});
+    }
+}
 core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::uint8_t> bytes,
                                                           bool require_cartographer_profile) {
     using Result = core::Result<ImportedGltfMaterials>;
@@ -314,7 +400,9 @@ core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::u
                 throw std::runtime_error(admitted.error().message);
             result.encoded_images.push_back(std::move(encoded));
         }
-        for (auto raw : array(get(root, "samplers", "[]"), 64)) {
+        const auto source_samplers = array(get(root, "samplers", "[]"), 64);
+        const auto source_sampler_count = source_samplers.size();
+        for (auto raw : source_samplers) {
             const auto s = object(raw);
             fields(s, {"name", "wrapS", "wrapT", "magFilter", "minFilter"});
             project::SamplerIntent sampler;
@@ -361,8 +449,14 @@ core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::u
             fields(texture, {"source", "sampler", "name"});
             render::TextureRef ref;
             ref.asset = integer(get(texture, "source")) + 1;
-            ref.sampler = get(texture, "sampler").empty() ? default_sampler
-                                                          : integer(get(texture, "sampler")) + 1;
+            if (auto sampler = get(texture, "sampler"); !sampler.empty()) {
+                const auto index = integer(sampler);
+                if (index >= source_sampler_count)
+                    throw std::runtime_error("texture sampler index exceeds source sampler count");
+                ref.sampler = index + 1;
+            } else {
+                ref.sampler = default_sampler;
+            }
             ref.uv_set = uv;
             ref.normal_convention = render::NormalConvention::opengl_y_plus;
             if (!result.catalog.textures().contains(ref.asset) ||
@@ -427,6 +521,9 @@ core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::u
                 v.occlusion_strength =
                     number(get(object(get(material, "occlusionTexture")), "strength", "1"));
             const auto emission = vector(get(material, "emissiveFactor", "[0,0,0]"), 3);
+            for (double c : emission)
+                if (c < 0 || c > 1)
+                    throw std::runtime_error("glTF emissive factor outside [0,1]");
             v.emissive_factor = {emission[0], emission[1], emission[2]};
             v.emissive_strength = 1;
             const auto alpha = text(get(material, "alphaMode", "\"OPAQUE\""));
@@ -529,7 +626,8 @@ core::Transform node_transform(const Object &n) {
     return t;
 }
 } // namespace
-core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> bytes) {
+core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> bytes,
+                                                  GltfSceneImportOptions options) {
     try {
         const auto contents = container(bytes);
         const auto root = object(contents.json);
@@ -619,10 +717,16 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
         };
         const auto mesh_sources = array(get(root, "meshes", "[]"), 64);
         std::size_t total_vertices = 0, total_faces = 0;
+        bool omitted_source_regions = false;
+        bool has_vanta_material_slots = false;
         const auto source_material_count = result.materials.catalog.materials().size();
+        std::optional<std::uint64_t> default_material;
         for (auto raw_mesh : mesh_sources) {
             const auto source = object(raw_mesh);
             fields(source, {"name", "primitives", "extras"});
+            if (const auto extra = get(source, "extras"); !extra.empty() && extra.front() == '{')
+                omitted_source_regions = omitted_source_regions ||
+                    !get(object(extra), "condition_material_region").empty();
             std::vector<geometry::Vertex> vertices;
             std::vector<geometry::Face> faces;
             std::vector<attributes::AttributeValue> normals, tangents, uvs, slots;
@@ -632,6 +736,15 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
             for (auto raw : array(get(source, "primitives"), 128)) {
                 const auto primitive = object(raw);
                 fields(primitive, {"attributes", "indices", "material", "mode", "extras"});
+                if (const auto extra = get(primitive, "extras"); !extra.empty() && extra.front() == '{') {
+                    const auto metadata = object(extra);
+                    omitted_source_regions = omitted_source_regions ||
+                        !get(metadata, "cartographer_material_region").empty() ||
+                        !get(metadata, "condition_material_region").empty() ||
+                        !get(metadata, "cartographer_triangle_faces").empty();
+                    has_vanta_material_slots = has_vanta_material_slots ||
+                        !get(metadata, "vanta_material_slot").empty();
+                }
                 if (integer(get(primitive, "mode", "4")) != 4)
                     throw std::runtime_error("only triangle-list primitives are supported");
                 const auto attrs = object(get(primitive, "attributes"));
@@ -683,9 +796,23 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
                         throw std::runtime_error("primitive refers to missing material");
                     material = index + 1;
                 } else {
-                    throw std::runtime_error(
-                        "glTF default material is single-sided; provide an explicit supported "
-                        "double-sided material rather than silently changing culling");
+                    if (!options.allow_default_material_projection)
+                        throw std::runtime_error(
+                            "glTF default material is single-sided; explicitly accept the "
+                            "two-sided default-material projection to import it");
+                    if (!default_material) {
+                        render::MaterialAsset projected;
+                        projected.id = source_material_count + 1U;
+                        projected.name = "glTF default material (two-sided projection)";
+                        projected.revision = core::Revision{1U};
+                        projected.definition.metallic = 1.0;
+                        projected.definition.roughness = 1.0;
+                        if (auto added = result.materials.catalog.insert_material(projected); !added)
+                            throw std::runtime_error(added.error().message);
+                        default_material = projected.id;
+                        result.projected_default_material = projected.id;
+                    }
+                    material = *default_material;
                 }
                 const auto &mat = result.materials.catalog.materials().at(material).definition;
                 for (const auto *ref : {&mat.base_color, &mat.metallic_roughness, &mat.normal,
@@ -808,6 +935,7 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
         }
         const auto nodes = array(get(root, "nodes", "[]"), 4096);
         scene::Scene validation;
+        bool has_vanta_object_ids = false;
         for (std::size_t i = 0; i < nodes.size(); ++i) {
             const auto n = object(nodes[i]);
             fields(n, {"name", "mesh", "children", "translation", "rotation", "scale", "matrix",
@@ -825,15 +953,23 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
                 node.mesh_asset = id + 1;
             }
             const auto extras = object(get(n, "extras", "{}"));
-            for (const auto key : {"visible", "locked"})
-                if (auto flag = get(extras, key); !flag.empty()) {
-                    if (flag != "true" && flag != "false")
-                        throw std::runtime_error("invalid authoring node flag");
-                    if (std::string_view(key) == "visible")
-                        node.visible = flag == "true";
-                    else
-                        node.locked = flag == "true";
-                }
+            const auto authoring_flag = [&](std::string_view key, std::string_view vanta_key,
+                                            bool default_value) {
+                const auto own = get(extras, key);
+                const auto vanta = get(extras, vanta_key);
+                const auto valid = [](std::string_view flag) {
+                    return flag.empty() || flag == "true" || flag == "false";
+                };
+                if (!valid(own) || !valid(vanta))
+                    throw std::runtime_error("invalid authoring node flag");
+                if (!own.empty() && !vanta.empty() && own != vanta)
+                    throw std::runtime_error("conflicting Cartographer and VANTA node flags");
+                const auto flag = own.empty() ? vanta : own;
+                return flag.empty() ? default_value : flag == "true";
+            };
+            node.visible = authoring_flag("visible", "vanta_visible", node.visible);
+            node.locked = authoring_flag("locked", "vanta_locked", node.locked);
+            has_vanta_object_ids = has_vanta_object_ids || !get(extras, "vanta_object_id").empty();
             result.nodes.push_back(std::move(node));
         }
         for (std::size_t i = 0; i < nodes.size(); ++i)
@@ -872,10 +1008,28 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
             throw std::runtime_error("source has no static mesh scene");
         std::uint64_t instanced_triangles=0;
         for(const auto& node:result.nodes)if(node.mesh_asset){instanced_triangles+=result.meshes.at(*node.mesh_asset-1).face_count();if(instanced_triangles>1000000)throw std::runtime_error("scene exceeds one million instanced triangles");}
+        if (omitted_source_regions)
+            result.warnings.push_back(
+                "Cartographer source face IDs and material-region identity are not reconstructed; imported regions are assigned by material and may merge distinct source regions.");
         result.warnings.push_back(
             "Static glTF import uses meters, right-handed Y-up coordinates; no "
-            "external resource is fetched. Exported triangles remain triangles; "
+            "external resource is fetched during admission. Exported triangles remain triangles; "
             "original pre-export polygon topology is not recoverable.");
+        if (!contents.external.empty())
+            result.warnings.push_back("The exact glTF document and its external buffers were captured together as the retained source.");
+        if (has_vanta_object_ids)
+            result.warnings.push_back(
+                "VANTA object IDs are not used as Cartographer IDs; imported objects "
+                "receive new IDs and are mapped by source node index.");
+        if (has_vanta_material_slots)
+            result.warnings.push_back(
+                "VANTA material-slot IDs are not transferred; imported material "
+                "assignments use glTF material indices instead.");
+        if (default_material)
+            result.warnings.push_back(
+                "glTF's implicit material is single-sided; it was projected to a "
+                "two-sided default PBR material, so back-face appearance can differ. "
+                "Projects containing this projection require an updated Cartographer reader.");
         return core::Result<ImportedGltfScene>::success(std::move(result));
     } catch (const std::exception &e) {
         return core::Result<ImportedGltfScene>::failure(

@@ -18,13 +18,21 @@ public:
     explicit TextureUploadTicket(TextureUploadIdentity identity) : identity_(std::move(identity)) {}
     const TextureUploadIdentity& identity() const { return identity_; }
     bool mark_submitted() {
-        if (submitted_ || complete_) return false;
+        if (submitted_ || complete_ || cancelled_) return false;
         submitted_ = true;
         return true;
     }
     bool observe_completion() {
         if (!submitted_) return false;
         complete_ = true;
+        return true;
+    }
+    // Only call when the API guarantees that no submission was accepted.
+    // Cancellation of uncertain or accepted work must not use this path.
+    bool reject_unaccepted_submission() noexcept {
+        if (!submitted_ || complete_) return false;
+        submitted_ = false;
+        cancelled_ = true;
         return true;
     }
     void cancel() { cancelled_ = true; }

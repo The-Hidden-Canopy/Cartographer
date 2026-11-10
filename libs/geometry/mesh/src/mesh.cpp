@@ -7009,9 +7009,14 @@ core::Result<CompiledMesh> EditableMesh::compile() const {
             compiled.normals[third] = compiled.normals[third] + normal;
         }
     }
-    for (auto& normal : compiled.normals) {
-        normal = normal.normalized();
-    }
+    // Orphan vertices are valid editable source data, but have no surface
+    // normal. Keep their finite zero placeholder; only triangle-referenced
+    // normals participate in rendering. Referenced cancellation/degeneracy
+    // still normalizes to invalid and is rejected below.
+    std::vector<bool> referenced(compiled.positions.size(), false);
+    for(const auto index:compiled.indices)referenced[index]=true;
+    for(std::size_t index=0;index<compiled.normals.size();++index)
+        if(referenced[index])compiled.normals[index]=compiled.normals[index].normalized();
     if (!compiled.valid()) {
         return core::Result<CompiledMesh>::failure(
             validation("compiled mesh failed derived-data validation"));

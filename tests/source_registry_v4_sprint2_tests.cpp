@@ -144,6 +144,37 @@ void corrupt_and_duplicate_bindings_refuse() {
     changed.document_products.erase(changed.document_products.begin() + 3);
     changed.artifact_digest = assets::source_document_product_digest(changed.source_digest, changed.document_products);
     require(!changed.validate(), "mapping without required material refuses even with new digest");
+    changed.importer_version = 2U;
+    require(bool(changed.validate()), "projected-material importer can bind a scene without authored materials");
+    const auto projected = assets::SourceImportRecord::deserialize(changed.serialize());
+    require(projected && projected.value().importer_version == 2U &&
+            projected.value().document_products == changed.document_products,
+            "projected-material importer lineage survives record round trip");
+    registry_round_trip(changed);
+    assets::ProjectAssetRegistry projected_registry;
+    require(bool(projected_registry.set_record(changed)), "projected record enters registry");
+    auto future = changed;
+    future.importer_version = 3U;
+    const auto future_record = assets::SourceImportRecord::deserialize(future.serialize());
+    require(!future_record && future_record.error().code == core::ErrorCode::version_mismatch,
+            "future glTF lineage version refuses with a version diagnostic");
+    auto future_registry = projected_registry.serialize();
+    const auto encoded_record = quote(changed.serialize());
+    const auto record_position = future_registry.find(encoded_record);
+    require(record_position != std::string::npos, "projected registry contains its exact record");
+    future_registry.replace(record_position, encoded_record.size(), quote(future.serialize()));
+    const auto future_registry_result = assets::ProjectAssetRegistry::deserialize(future_registry);
+    require(!future_registry_result && future_registry_result.error().code == core::ErrorCode::version_mismatch &&
+            future_registry_result.error().message.find("maximum 2") != std::string::npos,
+            "registry preserves future lineage version diagnostic");
+    auto future_schema = changed.serialize();
+    const auto schema_position = future_schema.find("SOURCE_IMPORT_RECORD 4\n");
+    require(schema_position == 0U, "projected record has the expected schema header");
+    future_schema.replace(schema_position, std::string("SOURCE_IMPORT_RECORD 4\n").size(),
+                          "SOURCE_IMPORT_RECORD 5\n");
+    const auto future_schema_result = assets::SourceImportRecord::deserialize(future_schema);
+    require(!future_schema_result && future_schema_result.error().code == core::ErrorCode::version_mismatch,
+            "future record schema refuses with a version diagnostic");
     auto malformed = encoded;
     const auto product = malformed.find("PRODUCT 0 1 11\n");
     require(product != std::string::npos, "fixture product exists");

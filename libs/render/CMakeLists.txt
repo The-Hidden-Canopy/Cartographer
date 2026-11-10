@@ -7,6 +7,7 @@ add_library(carto_render STATIC
     src/render_scene.cpp
     src/tangent.cpp
     src/temporal.cpp
+    src/temporal_reprojection.cpp
     src/viewport.cpp
 )
 

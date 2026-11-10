@@ -116,6 +116,40 @@ add_executable(cartographer_render_architecture_tests
     render_architecture_tests.cpp
 )
 
+add_executable(cartographer_authoring_viewport_tests authoring_viewport_tests.cpp)
+target_link_libraries(cartographer_authoring_viewport_tests PRIVATE carto_production carto_ui)
+carto_target(cartographer_authoring_viewport_tests)
+add_test(NAME cartographer_authoring_viewport_tests COMMAND cartographer_authoring_viewport_tests)
+
+add_executable(cartographer_authoring_material_tests authoring_material_tests.cpp)
+target_link_libraries(cartographer_authoring_material_tests PRIVATE carto_production carto_ui)
+carto_target(cartographer_authoring_material_tests)
+add_test(NAME cartographer_authoring_material_tests COMMAND cartographer_authoring_material_tests)
+
+add_executable(cartographer_authoring_surface_tests authoring_surface_tests.cpp)
+target_link_libraries(cartographer_authoring_surface_tests PRIVATE carto_production carto_ui)
+carto_target(cartographer_authoring_surface_tests)
+add_test(NAME cartographer_authoring_surface_tests COMMAND cartographer_authoring_surface_tests)
+add_executable(cartographer_authoring_texture_snapshot_tests authoring_texture_snapshot_tests.cpp)
+target_link_libraries(cartographer_authoring_texture_snapshot_tests PRIVATE carto_production carto_ui)
+carto_target(cartographer_authoring_texture_snapshot_tests)
+add_test(NAME cartographer_authoring_texture_snapshot_tests COMMAND cartographer_authoring_texture_snapshot_tests)
+add_executable(cartographer_authoring_shadow_tests authoring_shadow_tests.cpp)
+target_link_libraries(cartographer_authoring_shadow_tests PRIVATE carto_production)
+carto_target(cartographer_authoring_shadow_tests)
+add_test(NAME cartographer_authoring_shadow_tests COMMAND cartographer_authoring_shadow_tests)
+add_executable(cartographer_authoring_environment_tests authoring_environment_tests.cpp)
+target_link_libraries(cartographer_authoring_environment_tests PRIVATE carto_production carto_ui)
+carto_target(cartographer_authoring_environment_tests)
+add_test(NAME cartographer_authoring_environment_tests COMMAND cartographer_authoring_environment_tests)
+add_executable(cartographer_authoring_temporal_tests authoring_temporal_tests.cpp)
+target_link_libraries(cartographer_authoring_temporal_tests PRIVATE carto_production)
+carto_target(cartographer_authoring_temporal_tests)
+add_test(NAME cartographer_authoring_temporal_tests COMMAND cartographer_authoring_temporal_tests)
+add_executable(cartographer_authoring_realism_scene authoring_realism_scene.cpp)
+target_link_libraries(cartographer_authoring_realism_scene PRIVATE carto_production)
+carto_target(cartographer_authoring_realism_scene)
+
 add_executable(cartographer_kernel_evidence_tests
     kernel_evidence_tests.cpp
 )
@@ -574,6 +608,10 @@ target_link_libraries(cartographer_texture_source_tests
 )
 carto_target(cartographer_texture_source_tests)
 add_test(NAME cartographer_texture_source_tests COMMAND cartographer_texture_source_tests)
+add_executable(cartographer_png_decode_tests png_decode_tests.cpp)
+target_link_libraries(cartographer_png_decode_tests PRIVATE carto_assets)
+carto_target(cartographer_png_decode_tests)
+add_test(NAME cartographer_png_decode_tests COMMAND cartographer_png_decode_tests)
 
 add_executable(cartographer_material_artifact_tests
     material_artifact_tests.cpp
@@ -932,6 +970,64 @@ if(CARTO_BUILD_DEVICE_CPU)
 endif()
 
 if(CARTO_ENABLE_D3D12)
+    add_executable(cartographer_d3d12_unsignaled_execution_tests
+        d3d12_unsignaled_execution_tests.cpp)
+    target_link_libraries(cartographer_d3d12_unsignaled_execution_tests PRIVATE carto_d3d12)
+    carto_target(cartographer_d3d12_unsignaled_execution_tests)
+    add_test(NAME cartographer_d3d12_unsignaled_execution_tests
+        COMMAND cartographer_d3d12_unsignaled_execution_tests)
+    add_executable(cartographer_d3d12_try_submit_contract_tests
+        d3d12_try_submit_contract_tests.cpp)
+    target_link_libraries(cartographer_d3d12_try_submit_contract_tests PRIVATE carto_d3d12)
+    carto_target(cartographer_d3d12_try_submit_contract_tests)
+    add_test(NAME cartographer_d3d12_try_submit_contract_tests
+        COMMAND cartographer_d3d12_try_submit_contract_tests)
+    add_executable(cartographer_d3d12_fence_timeout_integration_tests
+        d3d12_fence_timeout_integration_tests.cpp)
+    target_link_libraries(cartographer_d3d12_fence_timeout_integration_tests PRIVATE carto_d3d12)
+    carto_target(cartographer_d3d12_fence_timeout_integration_tests)
+    add_test(NAME cartographer_d3d12_fence_timeout_integration_tests
+        COMMAND cartographer_d3d12_fence_timeout_integration_tests)
+    set_tests_properties(cartographer_d3d12_fence_timeout_integration_tests PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(cartographer_d3d12_shell_quarantine_tests d3d12_shell_quarantine_tests.cpp)
+    file(GLOB _carto_shell_test_includes LIST_DIRECTORIES true
+        "${PROJECT_SOURCE_DIR}/libs/*/include" "${PROJECT_SOURCE_DIR}/libs/*/*/include")
+    target_include_directories(cartographer_d3d12_shell_quarantine_tests PRIVATE
+        ${_carto_shell_test_includes} "${PROJECT_SOURCE_DIR}/third_party/imgui")
+    target_link_libraries(cartographer_d3d12_shell_quarantine_tests PRIVATE carto_d3d12)
+    carto_target(cartographer_d3d12_shell_quarantine_tests)
+    add_test(NAME cartographer_d3d12_shell_quarantine_tests COMMAND cartographer_d3d12_shell_quarantine_tests)
+    set_tests_properties(cartographer_d3d12_shell_quarantine_tests PROPERTIES SKIP_RETURN_CODE 77)
+    add_library(carto_imgui_dx12_convergence_test_backend STATIC
+        "${PROJECT_SOURCE_DIR}/third_party/imgui/imgui.cpp"
+        "${PROJECT_SOURCE_DIR}/third_party/imgui/imgui_draw.cpp"
+        "${PROJECT_SOURCE_DIR}/third_party/imgui/imgui_tables.cpp"
+        "${PROJECT_SOURCE_DIR}/third_party/imgui/imgui_widgets.cpp"
+        "${PROJECT_SOURCE_DIR}/third_party/imgui/backends/imgui_impl_dx12.cpp")
+    target_include_directories(carto_imgui_dx12_convergence_test_backend PUBLIC
+        "${PROJECT_SOURCE_DIR}/third_party/imgui" "${PROJECT_SOURCE_DIR}/libs/d3d12/include")
+    target_compile_definitions(carto_imgui_dx12_convergence_test_backend PRIVATE CARTO_IMGUI_DX12_TESTING=1)
+    target_link_libraries(carto_imgui_dx12_convergence_test_backend PUBLIC d3d12 dxgi d3dcompiler)
+    add_executable(cartographer_d3d12_imgui_texture_retirement_tests d3d12_imgui_texture_retirement_tests.cpp)
+    target_link_libraries(cartographer_d3d12_imgui_texture_retirement_tests PRIVATE
+        carto_d3d12 carto_imgui_dx12_convergence_test_backend)
+    carto_target(cartographer_d3d12_imgui_texture_retirement_tests)
+    add_test(NAME cartographer_d3d12_imgui_texture_retirement_tests COMMAND cartographer_d3d12_imgui_texture_retirement_tests)
+    set_tests_properties(cartographer_d3d12_imgui_texture_retirement_tests PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME cartographer_d3d12_imgui_window_wait_tests COMMAND cartographer_d3d12_imgui_texture_retirement_tests window)
+    add_test(NAME cartographer_d3d12_imgui_presentation_guard_tests COMMAND cartographer_d3d12_imgui_texture_retirement_tests presentation)
+    add_test(NAME cartographer_d3d12_imgui_platform_shutdown_tests COMMAND cartographer_d3d12_imgui_texture_retirement_tests platform)
+    set_tests_properties(cartographer_d3d12_imgui_window_wait_tests cartographer_d3d12_imgui_presentation_guard_tests cartographer_d3d12_imgui_platform_shutdown_tests PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(cartographer_d3d12_readback_worker_tests
+        d3d12_readback_worker_tests.cpp)
+    target_link_libraries(cartographer_d3d12_readback_worker_tests PRIVATE carto_d3d12_viewport carto_ui)
+    carto_target(cartographer_d3d12_readback_worker_tests)
+    add_test(NAME cartographer_d3d12_readback_worker_tests
+        COMMAND cartographer_d3d12_readback_worker_tests)
+    add_test(NAME cartographer_d3d12_resident_worker_tests
+        COMMAND cartographer_d3d12_readback_worker_tests resident)
+    set_tests_properties(cartographer_d3d12_resident_worker_tests PROPERTIES SKIP_RETURN_CODE 77)
+
     add_executable(cartographer_d3d12_render_graph_dispatch_tests
         d3d12_render_graph_dispatch_tests.cpp)
     target_link_libraries(cartographer_d3d12_render_graph_dispatch_tests
@@ -2061,6 +2157,19 @@ target_link_libraries(cartographer_gpudef_tests PRIVATE carto_gpudef)
 carto_target(cartographer_gpudef_tests)
 add_test(NAME cartographer_gpudef_tests COMMAND cartographer_gpudef_tests)
 
+add_executable(cartographer_d3d12_ui_retirement_tests d3d12_ui_retirement_tests.cpp)
+carto_target(cartographer_d3d12_ui_retirement_tests)
+add_test(NAME cartographer_d3d12_ui_retirement_tests COMMAND cartographer_d3d12_ui_retirement_tests)
+add_executable(cartographer_d3d12_platform_frame_admission_tests d3d12_platform_frame_admission_tests.cpp)
+carto_target(cartographer_d3d12_platform_frame_admission_tests)
+add_test(NAME cartographer_d3d12_platform_frame_admission_tests COMMAND cartographer_d3d12_platform_frame_admission_tests)
+add_executable(cartographer_d3d12_bounded_fence_wait_tests d3d12_bounded_fence_wait_tests.cpp)
+carto_target(cartographer_d3d12_bounded_fence_wait_tests)
+add_test(NAME cartographer_d3d12_bounded_fence_wait_tests COMMAND cartographer_d3d12_bounded_fence_wait_tests)
+add_executable(cartographer_detached_window_retirement_tests detached_window_retirement_tests.cpp)
+carto_target(cartographer_detached_window_retirement_tests)
+add_test(NAME cartographer_detached_window_retirement_tests COMMAND cartographer_detached_window_retirement_tests)
+
 add_executable(cartographer_uv_planar_projection_tests uv_planar_projection_tests.cpp)
 target_link_libraries(cartographer_uv_planar_projection_tests PRIVATE carto_production)
 carto_target(cartographer_uv_planar_projection_tests)
@@ -2130,6 +2239,57 @@ add_test(NAME cartographer_desktop_admission_boundary
         -P "${CMAKE_CURRENT_SOURCE_DIR}/desktop_admission_boundary.cmake")
 set_tests_properties(cartographer_desktop_admission_boundary PROPERTIES TIMEOUT 30)
 
+add_executable(cartographer_gltf_material_export_tests gltf_material_export_tests.cpp)
+add_executable(cartographer_gltf_scene_import_tests gltf_scene_import_tests.cpp)
+add_executable(cartographer_object_aging_tests object_aging_tests.cpp)
+target_link_libraries(cartographer_object_aging_tests PRIVATE carto_application carto_io carto_ui)
+carto_target(cartographer_object_aging_tests)
+add_test(NAME cartographer_object_aging_tests COMMAND cartographer_object_aging_tests)
+set_tests_properties(cartographer_object_aging_tests PROPERTIES TIMEOUT 120)
+add_executable(cartographer_jpeg_decode_tests jpeg_decode_tests.cpp)
+target_link_libraries(cartographer_jpeg_decode_tests PRIVATE carto_io)
+carto_target(cartographer_jpeg_decode_tests)
+add_test(NAME cartographer_jpeg_decode_tests COMMAND cartographer_jpeg_decode_tests)
+target_link_libraries(cartographer_gltf_scene_import_tests PRIVATE carto_application carto_io carto_ui)
+carto_target(cartographer_gltf_scene_import_tests)
+add_test(NAME cartographer_gltf_scene_import_tests COMMAND cartographer_gltf_scene_import_tests)
+target_link_libraries(cartographer_gltf_material_export_tests PRIVATE carto_io carto_editor carto_application carto_ui)
+carto_target(cartographer_gltf_material_export_tests)
+add_test(NAME cartographer_gltf_material_export_tests COMMAND cartographer_gltf_material_export_tests)
+
+if(TARGET cartographer_cli)
+    add_dependencies(cartographer_gltf_scene_import_tests cartographer_cli)
+    add_test(NAME cartographer_gltf_scene_cli_import_tests
+        COMMAND ${CMAKE_COMMAND}
+            "-DCARTO_CLI=$<TARGET_FILE:cartographer_cli>"
+            "-DCARTO_FIXTURE=$<TARGET_FILE:cartographer_gltf_scene_import_tests>"
+            "-DCARTO_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/run_gltf_scene_cli_tests.cmake")
+    set_tests_properties(cartographer_gltf_scene_cli_import_tests PROPERTIES RUN_SERIAL TRUE)
+    add_dependencies(cartographer_gltf_material_export_tests cartographer_cli)
+    add_test(NAME cartographer_gltf_material_cli_export_tests
+        COMMAND ${CMAKE_COMMAND}
+            "-DCARTO_CLI=$<TARGET_FILE:cartographer_cli>"
+            "-DCARTO_FIXTURE=$<TARGET_FILE:cartographer_gltf_material_export_tests>"
+            "-DCARTO_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/run_gltf_material_cli_tests.cmake")
+    set_tests_properties(cartographer_gltf_material_cli_export_tests PROPERTIES RUN_SERIAL TRUE)
+endif()
+
+add_executable(cartographer_material_assignment_integration_tests material_assignment_integration_tests.cpp)
+target_link_libraries(cartographer_material_assignment_integration_tests PRIVATE carto_application carto_io)
+carto_target(cartographer_material_assignment_integration_tests)
+add_test(NAME cartographer_material_assignment_integration_tests COMMAND cartographer_material_assignment_integration_tests)
+
+add_executable(cartographer_hdr_environment_integration_tests hdr_environment_integration_tests.cpp)
+add_executable(cartographer_shared_rig_application_tests shared_rig_application_tests.cpp)
+target_link_libraries(cartographer_shared_rig_application_tests PRIVATE carto_application carto_io)
+carto_target(cartographer_shared_rig_application_tests)
+add_test(NAME cartographer_shared_rig_application_tests COMMAND cartographer_shared_rig_application_tests)
+target_link_libraries(cartographer_hdr_environment_integration_tests PRIVATE carto_application carto_io)
+carto_target(cartographer_hdr_environment_integration_tests)
+add_test(NAME cartographer_hdr_environment_integration_tests COMMAND cartographer_hdr_environment_integration_tests)
+
 get_property(CARTO_REGISTERED_TESTS DIRECTORY PROPERTY TESTS)
 set(CARTO_TEST_TEMP_INDEX 0)
 foreach(CARTO_TEST_NAME IN LISTS CARTO_REGISTERED_TESTS)
@@ -2140,3 +2300,40 @@ foreach(CARTO_TEST_NAME IN LISTS CARTO_REGISTERED_TESTS)
         ENVIRONMENT
             "TMP=${CARTO_TEST_TEMP_DIR};TEMP=${CARTO_TEST_TEMP_DIR};TMPDIR=${CARTO_TEST_TEMP_DIR}")
 endforeach()
+
+if(CARTO_ENABLE_D3D12)
+    add_executable(cartographer_authoring_gpu_viewport_tests authoring_gpu_viewport_tests.cpp)
+    target_link_libraries(cartographer_authoring_gpu_viewport_tests PRIVATE carto_d3d12_viewport)
+    carto_target(cartographer_authoring_gpu_viewport_tests)
+    add_test(NAME cartographer_authoring_gpu_viewport_tests COMMAND cartographer_authoring_gpu_viewport_tests)
+    add_executable(cartographer_authoring_shader_compile_tests authoring_shader_compile_tests.cpp)
+    target_link_libraries(cartographer_authoring_shader_compile_tests PRIVATE carto_d3d12)
+    target_include_directories(cartographer_authoring_shader_compile_tests PRIVATE "${PROJECT_BINARY_DIR}/libs/d3d12/generated")
+    carto_target(cartographer_authoring_shader_compile_tests)
+    add_test(NAME cartographer_authoring_shader_compile_tests COMMAND cartographer_authoring_shader_compile_tests)
+    set_tests_properties(cartographer_authoring_shader_compile_tests PROPERTIES TIMEOUT 120)
+    add_executable(cartographer_builtin_shader_cache_tests builtin_shader_cache_tests.cpp)
+    target_link_libraries(cartographer_builtin_shader_cache_tests PRIVATE carto_d3d12)
+    target_include_directories(cartographer_builtin_shader_cache_tests PRIVATE "${PROJECT_BINARY_DIR}/libs/d3d12/generated")
+    carto_target(cartographer_builtin_shader_cache_tests)
+    add_test(NAME cartographer_builtin_shader_cache_tests COMMAND cartographer_builtin_shader_cache_tests)
+    add_executable(cartographer_authoring_temporal_preparation_tests authoring_temporal_preparation_tests.cpp)
+    target_link_libraries(cartographer_authoring_temporal_preparation_tests PRIVATE carto_d3d12_viewport)
+    carto_target(cartographer_authoring_temporal_preparation_tests)
+    add_test(NAME cartographer_authoring_temporal_preparation_tests COMMAND cartographer_authoring_temporal_preparation_tests)
+    add_executable(cartographer_authoring_temporal_native_tests authoring_temporal_native_tests.cpp)
+    target_link_libraries(cartographer_authoring_temporal_native_tests PRIVATE carto_d3d12_viewport)
+    carto_target(cartographer_authoring_temporal_native_tests)
+    add_test(NAME cartographer_authoring_temporal_native_tests COMMAND cartographer_authoring_temporal_native_tests)
+    set_tests_properties(cartographer_authoring_temporal_native_tests PROPERTIES TIMEOUT 180 LABELS "GPU")
+    add_executable(cartographer_authoring_temporal_gpu_tests authoring_temporal_gpu_tests.cpp)
+    target_link_libraries(cartographer_authoring_temporal_gpu_tests PRIVATE carto_d3d12_viewport)
+    carto_target(cartographer_authoring_temporal_gpu_tests)
+    add_test(NAME cartographer_authoring_temporal_gpu_tests COMMAND cartographer_authoring_temporal_gpu_tests)
+    set_tests_properties(cartographer_authoring_temporal_gpu_tests PROPERTIES TIMEOUT 90 LABELS "GPU")
+endif()
+if(CARTO_ENABLE_D3D12)
+    add_executable(cartographer_authoring_gpu_viewport_benchmark authoring_gpu_viewport_benchmark.cpp)
+    target_link_libraries(cartographer_authoring_gpu_viewport_benchmark PRIVATE carto_d3d12_viewport)
+    carto_target(cartographer_authoring_gpu_viewport_benchmark)
+endif()

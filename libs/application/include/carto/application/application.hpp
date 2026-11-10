@@ -36,6 +36,7 @@
 #include <carto/production/uv_planar_projection.hpp>
 #include <carto/production/uv_relax.hpp>
 #include <carto/render/render_scene.hpp>
+#include <carto/production/authoring_viewport.hpp>
 #include <carto/terrain/terrain_tile.hpp>
 
 #include <cstddef>
@@ -1160,6 +1161,7 @@ struct ImportGltfSceneAction {
     assets::Sha256Digest source_digest;
     bool rights_confirmed = false;
     std::string justification;
+    bool allow_default_material_projection = false;
 };
 
 // Canonical digest for the geometry domain imported by Cartographer's native
@@ -1552,6 +1554,60 @@ struct SetMaterialRegionAssignmentAction {
     std::optional<project::MaterialVariantId> variant;
 };
 
+// Human assignment creates/updates face slots and catalog binding atomically.
+// Empty faces means the entire mesh; shared instances observe the same asset.
+struct AssignMaterialToMeshAction {
+    std::uint64_t expected_project_generation=0;
+    core::Revision expected_project_revision;
+    scene::ObjectId object;
+    render::MaterialId material=0;
+    core::Revision expected_material_revision;
+    std::vector<geometry::FaceId> faces;
+    std::optional<project::MaterialVariantId> variant;
+};
+
+struct ImportRigModuleAction {
+    std::uint64_t expected_project_generation = 0;
+    core::Revision expected_project_revision;
+    std::string canonical_module;
+    bool ownership_or_license_confirmed = false;
+};
+struct ImportGltfMaterialLibraryAction {
+    std::uint64_t expected_project_generation = 0;
+    core::Revision expected_project_revision;
+    std::vector<std::uint8_t> source_bytes;
+    bool ownership_or_license_confirmed = false;
+};
+struct ApplyObjectAgingAction {
+    std::uint64_t expected_project_generation = 0;
+    core::Revision expected_project_revision;
+    project::ObjectAgingLayer layer;
+};
+struct RemoveObjectAgingAction {
+    std::uint64_t expected_project_generation = 0;
+    core::Revision expected_project_revision;
+    scene::ObjectId object;
+};
+struct ApplySharedRigAction {
+    std::uint64_t expected_project_generation = 0;
+    core::Revision expected_project_revision;
+    project::RigTemplateBinding binding;
+    bool correspondence_confirmed = false;
+    bool ownership_or_license_confirmed = false;
+};
+struct CaptureSharedRigModuleAction {
+    std::uint64_t expected_project_generation = 0;
+    core::Revision expected_project_revision;
+    scene::ObjectId root;
+    std::string module_identity;
+    bool ownership_or_license_confirmed = false;
+};
+struct UnlinkSharedRigAction {
+    std::uint64_t expected_project_generation = 0;
+    core::Revision expected_project_revision;
+    scene::ObjectId root;
+};
+
 struct GenerateUniqueLightmapUvAction {
     core::Revision expected_project_revision;
     scene::ObjectId object;
@@ -1824,6 +1880,14 @@ using ApplicationAction = std::variant<
     CreateMaterialAction,
     UpdateMaterialAction,
     SetMaterialRegionAssignmentAction,
+    AssignMaterialToMeshAction,
+    ImportRigModuleAction,
+    ImportGltfMaterialLibraryAction,
+    ApplyObjectAgingAction,
+    RemoveObjectAgingAction,
+    ApplySharedRigAction,
+    CaptureSharedRigModuleAction,
+    UnlinkSharedRigAction,
     GenerateUniqueLightmapUvAction,
     PackUvIslandsAction,
     ProjectUvPlanarAction,
@@ -2263,6 +2327,14 @@ public:
         OperationSource source = OperationSource::human,
         std::string_view provenance_id = {});
     [[nodiscard]] ApplicationSnapshot snapshot() const;
+    [[nodiscard]] core::Result<project::ProjectDocument> authoring_viewport_source(
+        core::Revision expected_revision) const;
+    // Read-only, digest-verified derived pixels from the saved project's store.
+    // Native hosts retain this request with the matching immutable source.
+    [[nodiscard]] core::Result<production::AuthoringViewportRequest> prepare_authoring_viewport_request(
+        const production::AuthoringViewportRequest& request, core::Revision expected_revision) const;
+    [[nodiscard]] core::Result<production::AuthoringViewportImage> render_authoring_viewport(
+        const production::AuthoringViewportRequest& request, core::Revision expected_revision) const;
     [[nodiscard]] core::Result<assets::Sha256Digest> native_structure_signature(
         scene::ObjectId object,
         std::variant<std::monostate, geometry::FaceId, geometry::VertexId> component) const;
@@ -2457,6 +2529,15 @@ private:
         const UpdateMaterialAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> set_material_region_assignment(
         const SetMaterialRegionAssignmentAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> assign_material_to_mesh(
+        const AssignMaterialToMeshAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> import_rig_module(const ImportRigModuleAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> import_gltf_material_library(const ImportGltfMaterialLibraryAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> apply_object_aging(const ApplyObjectAgingAction&);
+    [[nodiscard]] core::Result<DispatchReceipt> remove_object_aging(const RemoveObjectAgingAction&);
+    [[nodiscard]] core::Result<DispatchReceipt> apply_shared_rig(const ApplySharedRigAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> capture_shared_rig(const CaptureSharedRigModuleAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> unlink_shared_rig(const UnlinkSharedRigAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> generate_unique_lightmap_uv(
         const GenerateUniqueLightmapUvAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> pack_uv_islands(

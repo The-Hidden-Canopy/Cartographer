@@ -2,6 +2,7 @@
 #include "accepted_autorig_internal.hpp"
 #include <carto/project/accepted_autorig.hpp>
 #include <carto/character/rig_record.hpp>
+#include <carto/project/mesh_digest.hpp>
 #include <carto/biological/proxy_mesh.hpp>
 #include <carto/character/rig_module.hpp>
 #include <carto/kinematic/graph.hpp>
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <charconv>
 #include <cmath>
@@ -33,6 +35,7 @@
 #include <system_error>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 
 #ifdef _WIN32
@@ -567,6 +570,18 @@ void write_attribute_value(
 std::vector<std::size_t> serialized_attribute_value_order(
     const geometry::EditableMesh& mesh,
     attributes::AttributeDomain domain) {
+    // Only edge/corner domains need topology to remap payload order. Face,
+    // vertex and other domains already use their stored canonical order;
+    // rebuilding topology here redundantly validates the whole mesh for
+    // every such layer during save and viewport source hashing.
+    if (domain != attributes::AttributeDomain::edge &&
+        domain != attributes::AttributeDomain::corner) {
+        const auto count = mesh.attributes().domain_count(domain);
+        if (!count) return {};
+        std::vector<std::size_t> order(*count);
+        for (std::size_t i = 0; i < *count; ++i) order[i] = i;
+        return order;
+    }
     const auto topology = mesh.topology();
     if (!topology) return {};
 
@@ -1054,6 +1069,88 @@ core::Result<std::string> prepare_historical_autorig_ik_fk_clear(
 
 assets::Sha256Digest canonical_mesh_snapshot_digest(const geometry::EditableMesh& mesh) {
     return mesh_state_digest(mesh);
+}
+
+assets::Sha256Digest canonical_mesh_source_digest(const geometry::EditableMesh& mesh) {
+    // Length-prefixed typed values avoid stream formatting, padding, host
+    // endianness and ambiguous concatenation. This cache key is not serialized
+    // project truth and has its own fixed version tag.
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(mesh.vertex_count()*32U + mesh.face_count()*40U);
+    const auto integer = [&](std::uint64_t value) {
+        for (unsigned shift = 0; shift < 64; shift += 8)
+            bytes.push_back(static_cast<std::uint8_t>(value >> shift));
+    };
+    const auto real = [&](double value) { integer(std::bit_cast<std::uint64_t>(value)); };
+    const auto text = [&](std::string_view value) {
+        integer(value.size());
+        bytes.insert(bytes.end(), value.begin(), value.end());
+    };
+    text("cartographer.mesh-input.v1");
+    integer(mesh.revision().value());
+    const auto vertices = mesh.vertices_sorted();
+    integer(vertices.size());
+    for (const auto& vertex : vertices) {
+        integer(vertex.id.value);
+        real(vertex.position.x); real(vertex.position.y); real(vertex.position.z);
+    }
+    const auto faces = mesh.faces_sorted();
+    integer(faces.size());
+    for (const auto& face : faces) {
+        integer(face.id.value); integer(face.vertices.size());
+        for (auto vertex : face.vertices) integer(vertex.value);
+    }
+    integer(mesh.attributes().domain_counts().size());
+    for (const auto& [domain, count] : mesh.attributes().domain_counts()) {
+        integer(static_cast<std::uint64_t>(domain)); integer(count);
+    }
+    bool topology_payload = false;
+    integer(mesh.attributes().layer_count());
+    for (const auto& [id, layer] : mesh.attributes().layers()) {
+        text(id); integer(static_cast<std::uint64_t>(layer.descriptor.domain));
+        integer(static_cast<std::uint64_t>(layer.descriptor.type)); integer(layer.values.size());
+        topology_payload |= layer.descriptor.domain == attributes::AttributeDomain::edge ||
+                            layer.descriptor.domain == attributes::AttributeDomain::corner;
+        for (const auto& value : layer.values) {
+            integer(value.index());
+            std::visit([&](const auto& v) {
+                using T = std::decay_t<decltype(v)>;
+                if constexpr (std::is_same_v<T, core::Vec2d>) {
+                    real(v.x); real(v.y);
+                } else if constexpr (std::is_same_v<T, core::Vec3d>) {
+                    real(v.x); real(v.y); real(v.z);
+                } else if constexpr (std::is_same_v<T, core::Vec4d>) {
+                    real(v.x); real(v.y); real(v.z); real(v.w);
+                } else if constexpr (std::is_same_v<T, float>) {
+                    integer(std::bit_cast<std::uint32_t>(v));
+                } else if constexpr (std::is_same_v<T, double>) real(v);
+                else integer(static_cast<std::uint64_t>(v));
+            }, value);
+        }
+    }
+    integer(topology_payload);
+    if (topology_payload) {
+        const auto edges = mesh.edges_sorted(std::numeric_limits<std::size_t>::max());
+        integer(edges.size());
+        for (const auto& edge : edges) {
+            integer(edge.id.value); integer(edge.first.value); integer(edge.second.value);
+            integer(edge.first_half_edge.value);
+            integer(edge.second_half_edge ? edge.second_half_edge->value : 0U);
+        }
+        const auto corners = mesh.corners_sorted(std::numeric_limits<std::size_t>::max());
+        integer(corners.size());
+        for (const auto& corner : corners) {
+            integer(corner.id.value); integer(corner.face.value);
+            integer(corner.vertex.value); integer(corner.half_edge.value);
+        }
+    }
+    integer(mesh.uv_sets().descriptors().size());
+    for (const auto& [id, uv] : mesh.uv_sets().descriptors()) {
+        integer(id); text(uv.name); text(uv.layer_id);
+        integer(uv.active_for_editing); integer(uv.active_for_render);
+        integer(uv.lightmap_candidate); integer(uv.tile_policy_version);
+    }
+    return assets::sha256(bytes);
 }
 
 core::Result<void> SignTextInstanceReceipt::validate() const {
@@ -1601,8 +1698,25 @@ core::Result<ProjectDocument> ProjectDocument::merge_disjoint_scene_mesh_changes
         return left_projection.serialize() == right_projection.serialize();
     };
 
+    const auto same_rig_bindings=[](const auto& left,const auto& right) {
+        if(left.size()!=right.size())return false;
+        for(const auto& [root,a]:left) {
+            const auto found=right.find(root);if(found==right.end())return false;
+            const auto& b=found->second;
+            if(a.root!=b.root||a.module_identity!=b.module_identity||a.module_revision!=b.module_revision||
+                a.module_digest!=b.module_digest||a.provenance!=b.provenance||a.length_scale!=b.length_scale||a.joint_objects!=b.joint_objects)return false;
+        }
+        return true;
+    };
+    const auto same_aging=[](const auto& left,const auto& right){if(left.size()!=right.size())return false;for(const auto& [id,layer]:left){auto found=right.find(id);if(found==right.end()||layer.serialize()!=found->second.serialize())return false;}return true;};
     if (base.condition_authoring_ != current.condition_authoring_ ||
+        !same_aging(base.aging_layers_,current.aging_layers_) ||
+        !same_aging(base.aging_layers_,speculative.aging_layers_) ||
         base.engineering_authoring_ != current.engineering_authoring_ ||
+        base.rig_module_templates_ != current.rig_module_templates_ ||
+        base.rig_module_templates_ != speculative.rig_module_templates_ ||
+        !same_rig_bindings(base.rig_template_bindings_,current.rig_template_bindings_) ||
+        !same_rig_bindings(base.rig_template_bindings_,speculative.rig_template_bindings_) ||
         base.authoring_standards_.serialize() != current.authoring_standards_.serialize() ||
         base.authoring_standards_.serialize() != speculative.authoring_standards_.serialize()) {
         return stale("checkpoint rebase semantic sidecars changed without field-level provenance");
@@ -2047,6 +2161,16 @@ core::Result<void> ProjectDocument::remove_object(scene::ObjectId object) {
             ErrorCode::invalid_state,
             "cannot remove a scene object referenced by authored presentation data"));
     }
+    for (const auto& [root, binding] : rig_template_bindings_) {
+        if (root == object || std::any_of(binding.joint_objects.begin(),
+                binding.joint_objects.end(), [object](const auto& entry) {
+                    return entry.second == object;
+                })) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::invalid_state,
+                "unlink the shared rig binding before removing a mapped scene object"));
+        }
+    }
     if (std::any_of(connection_port_graph_.ports().begin(),
             connection_port_graph_.ports().end(), [object](const auto& entry) {
                 return entry.second.owner == object;
@@ -2062,6 +2186,7 @@ core::Result<void> ProjectDocument::remove_object(scene::ObjectId object) {
     road_surface_instance_receipts_.erase(object);
     biological_proxy_instance_receipts_.erase(object);
     condition_vegetation_placement_receipts_.erase(object);
+    aging_layers_.erase(object);
     bump_revision();
     return core::Result<void>::success();
 }
@@ -3391,6 +3516,7 @@ core::Result<void> ProjectDocument::set_material_catalog(MaterialCatalog catalog
                 "material-region assignment references a missing authored region"));
         }
     }
+    for(const auto& [object,layer]:aging_layers_){static_cast<void>(object);if(!catalog.materials().contains(layer.source_material)||!catalog.materials().contains(layer.output_material)||!catalog.samplers().contains(layer.output_sampler)||(layer.source_variant&&!catalog.variants().contains(*layer.source_variant)))return core::Result<void>::failure({core::ErrorCode::validation_failed,"unlink aging before removing its source or output material"});for(auto id:layer.output_textures)if(!catalog.textures().contains(id))return core::Result<void>::failure({core::ErrorCode::validation_failed,"unlink aging before removing its output texture"});}
     if (material_catalog_.serialize() == catalog.serialize()) {
         return core::Result<void>::success();
     }
@@ -5083,6 +5209,8 @@ core::Result<void> ProjectDocument::validate() const {
                 "project GarmentAsset digest does not bind its serialized bytes"));
         }
     }
+    if(auto valid=validate_rig_template_bindings();!valid)return valid;
+    if(auto valid=validate_aging_layers();!valid)return valid;
     if (rig_module_templates_.size() > kMaxSerializedRigModuleTemplates) {
         return core::Result<void>::failure(parse_error(
             "project contains too many serialized rig-module templates"));
@@ -5927,6 +6055,8 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
     biological_authoring_sources_.swap(other.biological_authoring_sources_);
     biological_authoring_lineage_.swap(other.biological_authoring_lineage_);
     rig_module_templates_.swap(other.rig_module_templates_);
+    rig_template_bindings_.swap(other.rig_template_bindings_);
+    aging_layers_.swap(other.aging_layers_);
     decal_placements_.swap(other.decal_placements_);
     pose_libraries_.swap(other.pose_libraries_);
     kinematic_graphs_.swap(other.kinematic_graphs_);
@@ -6258,6 +6388,16 @@ std::string ProjectDocument::serialize() const {
                << control_workspace_->rig_revision.value() << ' ' << control_workspace_->rig_digest.hex() << ' '
                << control_workspace_->digest.hex() << ' ' << control_workspace_->envelope_digest.hex() << ' '
                << std::quoted(control_workspace_->bytes) << '\n';
+    output << "RIG_TEMPLATE_BINDINGS " << rig_template_bindings_.size() << '\n';
+    for(const auto& [root,b]:rig_template_bindings_) {
+        output << "RIG_TEMPLATE_BINDING " << root.value << ' ' << std::quoted(b.module_identity) << ' '
+            << b.module_revision.value() << ' ' << b.module_digest.hex() << ' ' << std::quoted(b.provenance) << ' '
+            << b.length_scale << ' ' << b.joint_objects.size();
+        for(const auto& [joint,object]:b.joint_objects)output << ' ' << joint << ' ' << object.value;
+        output << '\n';
+    }
+    output << "AGING_LAYERS " << aging_layers_.size() << '\n';
+    for(const auto& [object,layer]:aging_layers_){static_cast<void>(object);output << "AGING_LAYER " << std::quoted(layer.serialize()) << '\n';}
     output << "END\n";
     return output.str();
 }
@@ -8648,6 +8788,10 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
         return core::Result<ProjectDocument>::failure(parse_error(
             "project schema v33 is missing its curve edit receipts"));
     }
+    // Project versions 34 and 35 were independently assigned by both histories.
+    // The first post-v33 table identifies the complete legacy layout.
+    const bool legacy_realism_layout = (version.value() == 34U || version.value() == 35U) &&
+        terminal_record == "RIG_TEMPLATE_BINDINGS";
     bool connection_port_graph_seen = false;
     if (terminal_record == "CONNECTION_PORT_GRAPH") {
         connection_port_graph_seen = true;
@@ -8673,7 +8817,7 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
                 "project is missing its END record"));
         }
     }
-    if (version.value() >= 34U && !connection_port_graph_seen) {
+    if (version.value() >= 34U && !legacy_realism_layout && !connection_port_graph_seen) {
         return core::Result<ProjectDocument>::failure(parse_error(
             "project schema v34 is missing its connection port graph"));
     }
@@ -8737,7 +8881,7 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
                 "project is missing its END record"));
         }
     }
-    if (version.value() >= 35U && !kinematic_graphs_seen) {
+    if (version.value() >= 35U && !legacy_realism_layout && !kinematic_graphs_seen) {
         return core::Result<ProjectDocument>::failure(parse_error(
             "project schema v35 is missing its kinematic graph table"));
     }
@@ -8865,6 +9009,32 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
     }
     if (version.value() >= 39U && !control_workspace_seen)
         return core::Result<ProjectDocument>::failure(parse_error("project schema v39 is missing control workspace"));
+    if(terminal_record=="RIG_TEMPLATE_BINDINGS") {
+        if (!legacy_realism_layout && version.value() < 40U)
+            return core::Result<ProjectDocument>::failure(Diagnostic(ErrorCode::version_mismatch, "shared rig bindings are not valid in this project schema layout"));
+        const auto count=read_uint(input,"shared rig binding count");
+        if(version.value()<34||!count||count.value()>128)return core::Result<ProjectDocument>::failure(parse_error("invalid shared rig binding table"));
+        for(std::uint64_t i=0;i<count.value();++i) {
+            if(auto line=require_line(input,"RIG_TEMPLATE_BINDING");!line)return core::Result<ProjectDocument>::failure(line.error());
+            RigTemplateBinding b;std::uint64_t root=0,binding_revision=0,n=0;std::string digest;
+            if(!(input>>root>>std::quoted(b.module_identity)>>binding_revision>>digest>>std::quoted(b.provenance)>>b.length_scale>>n)||n==0||n>1024)
+                return core::Result<ProjectDocument>::failure(parse_error("invalid shared rig binding record"));
+            auto decoded=assets::Sha256Digest::from_hex(digest);if(!decoded)return core::Result<ProjectDocument>::failure(decoded.error());
+            b.root=scene::ObjectId{root};b.module_revision=core::Revision{binding_revision};b.module_digest=decoded.value();
+            for(std::uint64_t j=0;j<n;++j){std::uint64_t joint=0,object=0;if(!(input>>joint>>object)||!b.joint_objects.emplace(joint,scene::ObjectId{object}).second)
+                return core::Result<ProjectDocument>::failure(parse_error("duplicate or invalid shared rig joint mapping"));}
+            if(!document.rig_template_bindings_.emplace(b.root,std::move(b)).second)return core::Result<ProjectDocument>::failure(parse_error("duplicate shared rig root"));
+        }
+        if(!(input>>terminal_record))return core::Result<ProjectDocument>::failure(parse_error("shared rig table missing END"));
+    } else if(legacy_realism_layout || version.value()>=40U)return core::Result<ProjectDocument>::failure(parse_error("project schema requires shared rig binding table"));
+    if(terminal_record=="AGING_LAYERS") {
+        if ((!legacy_realism_layout || version.value() != 35U) && version.value() < 40U)
+            return core::Result<ProjectDocument>::failure(Diagnostic(ErrorCode::version_mismatch, "aging layers are not valid in this project schema layout"));
+        const auto count=read_uint(input,"aging layer count");
+        if(version.value()<35||!count||count.value()>64)return core::Result<ProjectDocument>::failure(parse_error("invalid aging table"));
+        for(std::uint64_t i=0;i<count.value();++i){if(auto line=require_line(input,"AGING_LAYER");!line)return core::Result<ProjectDocument>::failure(line.error());std::string bytes;if(!(input>>std::quoted(bytes))||bytes.size()>4096)return core::Result<ProjectDocument>::failure(parse_error("invalid aging payload"));auto layer=ObjectAgingLayer::deserialize(bytes);if(!layer)return core::Result<ProjectDocument>::failure(layer.error());if(!document.aging_layers_.emplace(layer.value().object,std::move(layer.value())).second)return core::Result<ProjectDocument>::failure(parse_error("duplicate aging object"));}
+        if(!(input>>terminal_record))return core::Result<ProjectDocument>::failure(parse_error("aging table missing END"));
+    } else if((legacy_realism_layout && version.value()>=35U) || version.value()>=40U)return core::Result<ProjectDocument>::failure(parse_error("project schema requires aging table"));
     if (terminal_record != "END") {
         return core::Result<ProjectDocument>::failure(
             parse_error("project is missing its END record"));

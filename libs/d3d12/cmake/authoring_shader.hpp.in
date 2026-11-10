@@ -1,0 +1,19 @@
+#pragma once
+inline constexpr const char* carto_authoring_motion_source = R"CARTOMOTION(
+@CARTO_AUTHORING_MOTION_SOURCE@
+)CARTOMOTION";
+inline constexpr const char* carto_authoring_temporal_source = R"CARTOTEMPORAL(
+@CARTO_AUTHORING_TEMPORAL_SOURCE@
+)CARTOTEMPORAL";
+inline constexpr const char* carto_authoring_surface_source = R"CARTOSURFACE(
+@CARTO_AUTHORING_SURFACE_SOURCE@
+)CARTOSURFACE";
+inline constexpr const char* carto_authoring_pbr_source = R"CARTOPBR(
+#define CARTO_AUTHORING_VIEWPORT 1
+@CARTO_AUTHORING_ENVIRONMENT_SOURCE@
+@CARTO_AUTHORING_PBR_SOURCE@
+)CARTOPBR";
+inline constexpr const char* carto_authoring_display_source = R"CARTODISPLAY(
+#define CARTO_AUTHORING_VIEWPORT 1
+@CARTO_AUTHORING_DISPLAY_SOURCE@
+)CARTODISPLAY";

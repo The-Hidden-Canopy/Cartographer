@@ -132,6 +132,64 @@ void exact_rhi_descriptors_reject_ambiguous_intent() {
     REQUIRE(carto::gpu::validate(capabilities));
 }
 
+void pipeline_contract_uses_resolved_shader_stages() {
+    using namespace carto::gpu;
+    ShaderRegistry shaders;
+    auto add = [&](ShaderStage stage) {
+        const auto handle = shaders.insert(ShaderDesc{"contract.fixture",stage,"main",{1}});
+        REQUIRE(handle);return handle.value();
+    };
+    const auto cs=add(ShaderStage::compute),vs=add(ShaderStage::vertex),fs=add(ShaderStage::fragment);
+    const std::array compute_stage{ShaderStage::compute};
+    const std::array graphics_stages{ShaderStage::vertex,ShaderStage::fragment};
+    PipelineDesc compute;
+    compute.debug_name="contract.compute";compute.shaders={cs};
+    compute.color_format=compute.depth_format=Format::unknown;
+    compute.descriptor_bindings={{0,0,ShaderStage::compute},{0,1,ShaderStage::compute}};
+    compute.sampled_texture_count=1;compute.push_constant_bytes=32;
+    // Legacy raster defaults are irrelevant to compute. No dummy attachment.
+    REQUIRE(validate(compute,compute_stage));
+    REQUIRE(!validate(compute)); // unresolved opaque handles cannot claim compute
+    auto default_attachments=compute;default_attachments.color_format=Format::rgba16_float;
+    default_attachments.depth_format=Format::depth32_float;
+    REQUIRE(validate(default_attachments,compute_stage)); // ignored, never fake PSO attachments
+    REQUIRE(!validate(default_attachments)); // binding visibility still rejects compute as graphics
+    auto invalid=compute;invalid.sample_count=0;REQUIRE(!validate(invalid,compute_stage));
+    invalid=compute;invalid.vertex_stride_bytes=16;
+    invalid.vertex_attributes={{"POSITION",0,VertexFormat::float4,0,0}};
+    REQUIRE(!validate(invalid,compute_stage));
+    invalid=compute;invalid.shaders.front()={};REQUIRE(!validate(invalid,compute_stage));
+    invalid=compute;invalid.push_constant_bytes=260;REQUIRE(!validate(invalid,compute_stage));
+    invalid=compute;invalid.descriptor_bindings.push_back({0,0,ShaderStage::compute});
+    REQUIRE(!validate(invalid,compute_stage));
+    invalid=compute;invalid.sampled_texture_count=3;REQUIRE(!validate(invalid,compute_stage));
+    invalid=compute;invalid.descriptor_bindings[0].stages=ShaderStage::fragment;
+    REQUIRE(!validate(invalid,compute_stage));
+    REQUIRE(!validate(compute,std::span<const ShaderStage>{}));
+    REQUIRE(!validate(compute,graphics_stages));
+    const std::array invalid_stage{ShaderStage::vertex|ShaderStage::compute};
+    REQUIRE(!validate(compute,invalid_stage));
+    PipelineDesc graphics;
+    graphics.debug_name="contract.graphics";graphics.shaders={vs,fs};
+    graphics.vertex_stride_bytes=16;
+    graphics.vertex_attributes={{"POSITION",0,VertexFormat::float4,0,0}};
+    REQUIRE(validate(graphics));REQUIRE(validate(graphics,graphics_stages));
+    invalid=graphics;invalid.color_format=Format::unknown;
+    REQUIRE(!validate(invalid));REQUIRE(!validate(invalid,graphics_stages));
+    invalid=graphics;invalid.color_format=Format::depth32_float;
+    REQUIRE(!validate(invalid,graphics_stages));
+    invalid=graphics;invalid.sample_count=0;REQUIRE(!validate(invalid,graphics_stages));
+    invalid=graphics;invalid.depth_format=Format::unknown;REQUIRE(!validate(invalid,graphics_stages));
+    invalid.depth_test=false;REQUIRE(!validate(invalid,graphics_stages)); // depth write remains enabled
+    invalid=graphics;invalid.vertex_stride_bytes=4;REQUIRE(!validate(invalid,graphics_stages));
+    invalid=graphics;invalid.descriptor_bindings={{0,0,ShaderStage::compute}};
+    REQUIRE(!validate(invalid,graphics_stages));
+    const std::array mixed{ShaderStage::vertex,ShaderStage::compute};
+    REQUIRE(!validate(graphics,mixed));
+    const std::array duplicate{ShaderStage::vertex,ShaderStage::vertex};
+    REQUIRE(!validate(graphics,duplicate));
+}
+
 void texture_material_and_render_contracts_preserve_fidelity() {
     carto::assets::TextureAsset base_color{
         1U,
@@ -564,6 +622,7 @@ int main() {
         generational_registries_reject_stale_handles();
         deferred_destruction_waits_for_completed_submission();
         exact_rhi_descriptors_reject_ambiguous_intent();
+        pipeline_contract_uses_resolved_shader_stages();
         texture_material_and_render_contracts_preserve_fidelity();
         shadow_and_temporal_reference_contracts_preserve_boundaries();
         gpu_plan_attaches_explicit_kernel_intents_to_each_pass();

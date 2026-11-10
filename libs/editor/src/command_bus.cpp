@@ -5488,6 +5488,7 @@ core::Result<void> DuplicateProjectMeshInstanceCommand::create_first_instance() 
         *document_ = before;
         object_.reset();
         biological_proxy_receipt_.reset();
+        aging_layer_.reset();
         return core::Result<void>::failure(std::move(diagnostic));
     };
 
@@ -5524,6 +5525,15 @@ core::Result<void> DuplicateProjectMeshInstanceCommand::create_first_instance() 
                 "duplicated biological proxy receipt identity is already present"));
         }
     }
+    if (auto source_aging = document_->aging_layers_.find(source_);
+        source_aging != document_->aging_layers_.end()) {
+        aging_layer_ = source_aging->second;
+        aging_layer_->object = object_id;
+        // Keep the source's baked identity/appearance. Explicit re-bake isolates
+        // resources and derives the duplicate's own stable variation seed.
+        if (auto result = document_->set_aging_layer(*aging_layer_); !result)
+            return rollback(result.error());
+    }
     return core::Result<void>::success();
 }
 
@@ -5542,6 +5552,12 @@ core::Result<void> DuplicateProjectMeshInstanceCommand::restore_instance() {
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::validation_failed,
             "duplicated biological proxy receipt could not be restored"));
+    }
+    if (aging_layer_) {
+        if (auto result = document_->set_aging_layer(*aging_layer_); !result) {
+            *document_ = before;
+            return result;
+        }
     }
     return core::Result<void>::success();
 }

@@ -563,7 +563,7 @@ void gltf_export_preserves_condition_material_regions_in_extras() {
     std::filesystem::remove(path, ignored);
     const auto exported = carto::io::export_gltf(document.value(), path);
     REQUIRE(exported);
-    REQUIRE(exported.value().warnings.size() == 2U);
+    REQUIRE(exported.value().warnings.size() == 3U);
     REQUIRE(exported.value().warnings.front().find("condition.material_region") !=
             std::string::npos);
 
@@ -574,7 +574,8 @@ void gltf_export_preserves_condition_material_regions_in_extras() {
     REQUIRE(text.find("condition_material_region") != std::string::npos);
     REQUIRE(text.find("\"id\":1,\"region\":1001") != std::string::npos);
     REQUIRE(text.find("\"id\":2,\"region\":1002") != std::string::npos);
-    REQUIRE(text.find("\"materials\"") == std::string::npos);
+    REQUIRE(text.find("\"materials\"") != std::string::npos);
+    REQUIRE(exported.value().materials == 1U);
     REQUIRE(text.find("TEXCOORD_0") != std::string::npos);
     REQUIRE(text.find("TANGENT") != std::string::npos);
     std::filesystem::remove(path, ignored);

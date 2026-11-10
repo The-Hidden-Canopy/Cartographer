@@ -1,8 +1,11 @@
 #pragma once
 
 #include <carto/application/application.hpp>
+#include <carto/editor/editor_camera.hpp>
+#include <carto/production/authoring_viewport.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <locale>
@@ -10,8 +13,36 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace carto::studio {
+
+// Preserve the editor camera's right/up/forward convention when the native
+// authoring renderer consumes its navigation state.
+[[nodiscard]] inline core::Result<production::AuthoringView>
+authoring_view_from_editor_camera(const editor::EditorCamera& camera, double aspect) {
+    using Result = core::Result<production::AuthoringView>;
+    if (!camera.valid() || !std::isfinite(aspect) || aspect <= 0.0 || aspect > 1.0e9)
+        return Result::failure({core::ErrorCode::invalid_argument, "Viewport camera or aspect is invalid"});
+    const double far_plane = std::max(1000.0, camera.distance() * 4.0);
+    if (!std::isfinite(far_plane) || far_plane > 1.0e8 ||
+        camera.vertical_fov() > 3.13 || camera.orthographic_height() > 1.0e8)
+        return Result::failure({core::ErrorCode::unsupported, "Viewport camera exceeds renderer bounds"});
+    const double sy = std::sin(camera.yaw() * 0.5), cy = std::cos(camera.yaw() * 0.5);
+    const double sp = std::sin(camera.pitch() * 0.5), cp = std::cos(camera.pitch() * 0.5);
+    production::AuthoringView view;
+    view.position = camera.position();
+    view.rotation = {cy * sp, -sy * cp, sy * sp, cy * cp};
+    view.projection = camera.projection() == editor::EditorProjection::perspective
+        ? project::CameraProjection::perspective : project::CameraProjection::orthographic;
+    view.vertical_fov_radians = camera.vertical_fov();
+    view.orthographic_height = camera.orthographic_height();
+    view.near_plane = std::max(1.0e-6, camera.distance() * 1.0e-3);
+    view.far_plane = far_plane;
+    view.aspect_ratio = aspect;
+    if (auto valid = view.validate(); !valid) return Result::failure(valid.error());
+    return Result::success(std::move(view));
+}
 
 struct SavedScenePreviewCameraBinding {
     std::string state;

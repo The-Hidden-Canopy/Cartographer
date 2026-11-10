@@ -1227,7 +1227,8 @@ public:
         std::uint64_t expected_project_generation,
         core::Revision expected_project_revision,
         std::string_view expected_source_namespace,
-        bool rights_confirmed, std::string justification);
+        bool rights_confirmed, std::string justification,
+        bool allow_default_material_projection = false);
     // Parses a candidate without project mutation and returns a snapshot-bound
     // source/geometry comparison for explicit operator review.
     [[nodiscard]] core::Result<SourceMeshReimportReview> preview_source_mesh_reimport(

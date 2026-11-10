@@ -100,8 +100,10 @@ void project_save_reopen_and_lineage_are_governed() {
         "active sweep binding passes full project validation");
 
     const std::string encoded = document.serialize();
-    require(encoded.starts_with("CARTOGRAPHER_PROJECT 39\n"),
-        "project schema 38 preserves current source-authoring format compatibility");
+    const std::string current_header = "CARTOGRAPHER_PROJECT " +
+        std::to_string(project::ProjectDocument::kSchemaVersion) + "\n";
+    require(encoded.starts_with(current_header),
+        "current project schema preserves source-authoring format compatibility");
     const auto reopened = project::ProjectDocument::deserialize(encoded);
     require(reopened && reopened.value().sweep_sources().size() == 1U &&
             reopened.value().sweep_sources().at("fixture.pipe.recipe").serialize() ==

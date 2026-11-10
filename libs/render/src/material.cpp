@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numbers>
+#include <limits>
 #include <utility>
 
 namespace carto::render {
@@ -367,4 +368,46 @@ core::Result<Vec3d> linear_to_srgb(Vec3d linear_color) {
         encode(linear_color.x), encode(linear_color.y), encode(linear_color.z)});
 }
 
+} // namespace carto::render
+
+namespace carto::render {
+core::Result<std::vector<std::uint8_t>> encode_display_rgba8(std::span<const core::Vec3d> hdr,
+                                                             std::span<const std::uint8_t> coverage,
+                                                             double exposure_ev, ToneMapMode mode) {
+    using Result = core::Result<std::vector<std::uint8_t>>;
+    const auto index = static_cast<unsigned>(mode);
+    const double multiplier = std::exp2(exposure_ev);
+    if (hdr.size() != coverage.size() || index > 2U || !std::isfinite(exposure_ev) ||
+        !std::isfinite(multiplier) || hdr.size() > std::numeric_limits<std::size_t>::max() / 4U)
+        return Result::failure(invalid("invalid display encoding batch"));
+    static const auto thresholds = [] {
+        std::array<std::array<double, 255U>, 3U> tables{};
+        for (std::size_t byte = 0U; byte < 255U; ++byte) {
+            const double encoded = (static_cast<double>(byte) + 0.5) / 255.0;
+            const double linear =
+                encoded <= 0.04045 ? encoded / 12.92 : std::pow((encoded + 0.055) / 1.055, 2.4);
+            const double a = 2.51 - 2.43 * linear, b = 0.03 - 0.59 * linear, c = -0.14 * linear;
+            tables[0U][byte] = (-b + std::sqrt(b * b - 4.0 * a * c)) / (2.0 * a);
+            tables[1U][byte] = linear / (1.0 - linear);
+            tables[2U][byte] = linear;
+        }
+        return tables;
+    }();
+    const auto &table = thresholds[index];
+    std::vector<std::uint8_t> output(hdr.size() * 4U);
+    for (std::size_t p = 0U; p < hdr.size(); ++p) {
+        if (coverage[p] == 0U)
+            continue;
+        const std::array<double, 3U> values{hdr[p].x * multiplier, hdr[p].y * multiplier,
+                                            hdr[p].z * multiplier};
+        for (std::size_t c = 0U; c < 3U; ++c) {
+            if (!std::isfinite(values[c]))
+                return Result::failure(invalid("nonfinite exposed display pixel"));
+            output[p * 4U + c] = static_cast<std::uint8_t>(
+                std::upper_bound(table.begin(), table.end(), values[c]) - table.begin());
+        }
+        output[p * 4U + 3U] = coverage[p];
+    }
+    return Result::success(std::move(output));
+}
 } // namespace carto::render

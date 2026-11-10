@@ -17,6 +17,7 @@
 #include <carto/project/file_lock.hpp>
 #include <carto/project/material_catalog.hpp>
 #include <carto/project/presentation_catalog.hpp>
+#include <carto/project/aging_layer.hpp>
 #include <carto/project/road_source.hpp>
 #include <carto/spatial_field/scalar_field.hpp>
 #include <carto/scientific/model.hpp>
@@ -191,6 +192,18 @@ struct SerializedRigModuleTemplate {
     [[nodiscard]] bool operator==(const SerializedRigModuleTemplate&) const noexcept = default;
 };
 
+// Rigid-part correspondence to an existing source module. Meshes remain owned
+// by the target scene; skin weights and ambiguous retargeting are not inferred.
+struct RigTemplateBinding {
+    scene::ObjectId root;
+    std::string module_identity;
+    core::Revision module_revision;
+    assets::Sha256Digest module_digest;
+    std::string provenance;
+    double length_scale = 1;
+    std::map<std::uint64_t, scene::ObjectId> joint_objects;
+};
+
 // Opaque revision-bound decal placement bytes. The project preserves exact
 // placement state; production validates the decal codec before projection.
 struct SerializedDecalPlacement {
@@ -360,7 +373,7 @@ struct RoadSurfaceInstanceReceipt {
 
 class ProjectDocument {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 39;
+    static constexpr std::uint32_t kSchemaVersion = 40;
     static constexpr std::uint32_t kMinimumReadableSchemaVersion = 1;
     static constexpr std::string_view kMagic = "CARTOGRAPHER_PROJECT";
     static constexpr std::string_view kAuthoringFormat = "cartographer.authoring";
@@ -437,6 +450,7 @@ public:
     [[nodiscard]] const PresentationCatalog& presentation_catalog() const noexcept {
         return presentation_catalog_;
     }
+    [[nodiscard]] const std::map<scene::ObjectId,ObjectAgingLayer>& aging_layers() const noexcept { return aging_layers_; }
     [[nodiscard]] const ProjectAuthoringStandards& authoring_standards() const noexcept {
         return authoring_standards_;
     }
@@ -475,6 +489,8 @@ public:
     rig_module_templates() const noexcept {
         return rig_module_templates_;
     }
+    [[nodiscard]] const std::map<scene::ObjectId, RigTemplateBinding>& rig_template_bindings() const noexcept { return rig_template_bindings_; }
+    [[nodiscard]] core::Result<void> validate_rig_template_bindings() const;
     [[nodiscard]] const std::map<std::uint64_t, SerializedDecalPlacement>&
     decal_placements() const noexcept { return decal_placements_; }
     // Canonical pose libraries keyed by stable library identity. Each entry
@@ -643,6 +659,9 @@ private:
     [[nodiscard]] core::Result<void> set_connection_port_graph(
         connection::ConnectionPortGraph graph);
     [[nodiscard]] core::Result<void> set_material_catalog(MaterialCatalog catalog);
+    [[nodiscard]] core::Result<void> validate_aging_layers() const;
+    [[nodiscard]] core::Result<void> set_aging_layer(ObjectAgingLayer);
+    [[nodiscard]] core::Result<void> erase_aging_layer(scene::ObjectId);
     [[nodiscard]] core::Result<void> set_presentation_catalog(PresentationCatalog catalog);
     [[nodiscard]] core::Result<void> set_authoring_standards(
         ProjectAuthoringStandards standards);
@@ -685,6 +704,9 @@ private:
         assets::Sha256Digest digest);
     [[nodiscard]] core::Result<void> insert_rig_module_template(
         std::string serialized_template);
+    [[nodiscard]] core::Result<void> set_rig_template_binding(RigTemplateBinding binding);
+    [[nodiscard]] core::Result<void> erase_rig_template_binding(scene::ObjectId root);
+    [[nodiscard]] core::Result<void> set_rig_part_parent(scene::ObjectId part, scene::ObjectId parent);
     [[nodiscard]] core::Result<core::Revision> replace_rig_module_template_if_revision(
         std::string_view identity,
         core::Revision expected_revision,
@@ -825,6 +847,8 @@ private:
     // cannot be recreated with a stale revision.
     std::map<BiologicalAuthoringKey, core::Revision> biological_authoring_lineage_;
     std::map<std::string, SerializedRigModuleTemplate> rig_module_templates_;
+    std::map<scene::ObjectId, RigTemplateBinding> rig_template_bindings_;
+    std::map<scene::ObjectId,ObjectAgingLayer> aging_layers_;
     std::map<std::uint64_t, SerializedDecalPlacement> decal_placements_;
     std::map<std::string, SerializedPoseLibrary> pose_libraries_;
     std::map<std::string, SerializedKinematicGraph> kinematic_graphs_;

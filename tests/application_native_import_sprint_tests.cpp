@@ -1,6 +1,8 @@
 #include <carto/application/application.hpp>
 #include <carto/assets/blob_store.hpp>
 #include <carto/journal/journal.hpp>
+#include <carto/io/gltf_export.hpp>
+#include <carto/project/package.hpp>
 #include <carto/ui/ui.hpp>
 
 #include <algorithm>
@@ -23,8 +25,36 @@ void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(m
 void u32(std::vector<std::uint8_t>& out, std::uint32_t n) {
     for (unsigned shift = 0; shift < 32; shift += 8) out.push_back(static_cast<std::uint8_t>(n >> shift));
 }
-std::vector<std::uint8_t> fixture(std::string_view extra = {}) {
+std::vector<std::uint8_t> fixture(std::string_view extra = {}, std::string_view node_extras = {},
+                                  std::string_view primitive_extras = {}, bool missing_materials = false) {
     std::string json = R"({"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],"nodes":[{"name":"parent","children":[1,2]},{"name":"first","mesh":0},{"name":"second","mesh":1}],"meshes":[{"primitives":[{"attributes":{"POSITION":0},"material":0}]},{"primitives":[{"attributes":{"POSITION":0},"material":1}]}],"materials":[{"name":"red","doubleSided":true,"pbrMetallicRoughness":{"baseColorFactor":[1,0,0,1]}},{"name":"green","doubleSided":true,"pbrMetallicRoughness":{"baseColorFactor":[0,1,0,1]}}],"buffers":[{"byteLength":36}],"bufferViews":[{"buffer":0,"byteLength":36}],"accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"}]})";
+    if (!node_extras.empty()) {
+        const std::string marker = R"({"name":"first","mesh":0})";
+        const auto position = json.find(marker);
+        require(position != std::string::npos, "node fixture marker found");
+        json.replace(position, marker.size(),
+            R"({"name":"first","mesh":0,"extras":)" + std::string(node_extras) + "}");
+    }
+    if (!primitive_extras.empty()) {
+        const std::string marker = R"({"attributes":{"POSITION":0},"material":0})";
+        const auto position = json.find(marker);
+        require(position != std::string::npos, "primitive fixture marker found");
+        json.replace(position, marker.size(),
+            R"({"attributes":{"POSITION":0},"material":0,"extras":)" +
+                std::string(primitive_extras) + "}");
+    }
+    if (missing_materials) {
+        for (const auto* marker : {",\"material\":0", ",\"material\":1"}) {
+            const auto position = json.find(marker);
+            require(position != std::string::npos, "material fixture marker found");
+            json.erase(position, std::string_view(marker).size());
+        }
+        const auto materials = json.find(",\"materials\":[");
+        const auto buffers = json.find(",\"buffers\":", materials);
+        require(materials != std::string::npos && buffers != std::string::npos,
+                "material array fixture marker found");
+        json.erase(materials, buffers - materials);
+    }
     json.insert(json.size() - 1U, extra);
     while (json.size() % 4U) json.push_back(' ');
     std::vector<std::uint8_t> bin;
@@ -186,7 +216,9 @@ void ui_import_and_retained_generation(const std::filesystem::path& root) {
     std::filesystem::create_directories(root);
     const auto project_path = root / "ui.carto";
     const auto source_path = root / "selected.glb";
-    const auto source = fixture();
+    const auto source = fixture({},
+        R"({"vanta_object_id":42,"vanta_visible":false,"vanta_locked":true,"visible":false})",
+        R"({"vanta_material_slot":17})");
     write_source(source_path, source);
     ApplicationSession session;
     ui::UiController controller(session);
@@ -228,7 +260,9 @@ void ui_import_and_retained_generation(const std::filesystem::path& root) {
     require(!controller.submit_ai_proposal(ImportGltfSceneAction{}), "raw AI import is refused");
     unchanged();
     for (const auto& rejected : {std::vector<std::uint8_t>{'b', 'a', 'd'},
-                                 fixture(R"(,"skins":[{}])"), fixture(R"(,"animations":[{}])")}) {
+                                 fixture(R"(,"skins":[{}])"), fixture(R"(,"animations":[{}])"),
+                                 fixture({}, R"({"visible":true,"vanta_visible":false})"),
+                                 fixture({}, R"({"vanta_locked":"true"})")}) {
         const auto rejected_path = root / "unsupported.glb";
         write_source(rejected_path, rejected);
         require(!controller.import_static_gltf_scene(rejected_path, before.project_generation,
@@ -244,7 +278,17 @@ void ui_import_and_retained_generation(const std::filesystem::path& root) {
         before.project_revision, before.source_namespace, true, "Append reviewed static source");
     require(admitted && admitted.value().document_changed &&
             admitted.value().source == OperationSource::human, "UI uses the human scene action");
+    require(std::any_of(admitted.value().warnings.begin(), admitted.value().warnings.end(),
+            [](const auto& warning) { return warning.message.find("VANTA object IDs") != std::string::npos; }),
+            "source identity remapping is reported");
+    require(std::any_of(admitted.value().warnings.begin(), admitted.value().warnings.end(),
+            [](const auto& warning) { return warning.message.find("VANTA material-slot IDs") != std::string::npos; }),
+            "unmapped source material slots are reported");
     const auto imported = controller.snapshot();
+    const auto imported_node = std::find_if(imported.objects.begin(), imported.objects.end(),
+        [](const auto& view) { return view.object.name == "first"; });
+    require(imported_node != imported.objects.end() && !imported_node->object.visible &&
+            imported_node->object.locked, "VANTA visibility and locking preserved");
     require(imported.source_assets.size() == 1U && imported.source_assets.front().identity == identity &&
             imported.source_assets.front().source_generation == core::Revision{1U} &&
             imported.operations.size() == before.operations.size() + 1U,
@@ -272,6 +316,10 @@ void ui_import_and_retained_generation(const std::filesystem::path& root) {
     require(bool(HumanApplicationAccess::dispatch(reopened, OpenProjectAction{project_path})),
             "cold reopen UI-imported project");
     const auto reopened_state = reopened.snapshot();
+    const auto reopened_node = std::find_if(reopened_state.objects.begin(), reopened_state.objects.end(),
+        [](const auto& view) { return view.object.name == "first"; });
+    require(reopened_node != reopened_state.objects.end() && !reopened_node->object.visible &&
+            reopened_node->object.locked, "VANTA node flags survive cold reopen");
     require(reopened_state.source_assets.size() == 1U &&
             reopened_state.source_assets.front().document_products ==
                 reimported.source_assets.front().document_products &&
@@ -280,16 +328,229 @@ void ui_import_and_retained_generation(const std::filesystem::path& root) {
     journal::Journal journal(std::filesystem::path(project_path.string() + ".journal"));
     require(bool(journal.verify()), "UI import history has a valid journal chain");
 }
+
+void ui_default_material_projection(const std::filesystem::path& root) {
+    using namespace application;
+    std::filesystem::create_directories(root);
+    const auto project_path = root / "projection.carto";
+    const auto source_path = root / "default.glb";
+    const auto source = fixture({}, {}, {}, true);
+    write_source(source_path, source);
+    ApplicationSession session;
+    ui::UiController controller(session);
+    require(bool(controller.dispatch(NewProjectAction{"Projection"})), "projection project created");
+    require(bool(controller.dispatch(SaveProjectAction{project_path})), "projection project saved");
+    const auto before = controller.snapshot();
+    require(!controller.import_static_gltf_scene(source_path, before.project_generation,
+        before.project_revision, before.source_namespace, true, "reviewed"),
+        "implicit material requires explicit projection");
+    require(controller.snapshot().project_revision == before.project_revision &&
+            controller.snapshot().source_assets.empty() && blob_inventory(root).empty(),
+            "projection refusal leaves project and cache unchanged");
+    const auto admitted = controller.import_static_gltf_scene(source_path, before.project_generation,
+        before.project_revision, before.source_namespace, true, "reviewed", true);
+    require(bool(admitted), "explicit default-material projection admitted");
+    require(std::any_of(admitted.value().warnings.begin(), admitted.value().warnings.end(),
+            [](const auto& warning) { return warning.message.find("back-face appearance") != std::string::npos; }),
+            "projection loss is reported");
+    require(std::any_of(admitted.value().warnings.begin(), admitted.value().warnings.end(),
+            [](const auto& warning) { return warning.message.find("updated Cartographer reader") != std::string::npos; }),
+            "project reader compatibility is reported");
+    const auto after = controller.snapshot();
+    require(after.source_assets.size() == 1U && after.source_assets.front().importer_version == 2U,
+            "projection records the versioned source contract");
+    require(after.materials.size() == 1U && after.materials.back().definition.metallic == 1.0 &&
+            after.materials.back().definition.roughness == 1.0,
+            "implicit glTF material uses its default PBR factors");
+    require(std::none_of(after.source_assets.front().document_products.begin(),
+                         after.source_assets.front().document_products.end(),
+        [](const auto& product) {
+            return product.kind == assets::SourceDocumentProductKind::material;
+        }), "derived material is not presented as an authored source material");
+    assets::BlobStore store(root / ".carto-assets" / "source-blobs");
+    const auto retained = store.read(assets::sha256(source));
+    require(retained && retained.value() == source, "projection preserves exact source bytes");
+    require(bool(controller.dispatch(UndoAction{})), "projection undo");
+    require(bool(controller.dispatch(RedoAction{})), "projection redo");
+    const auto redone = controller.snapshot();
+    require(bool(controller.dispatch(SaveProjectAction{})), "save projection");
+    ApplicationSession reopened;
+    require(bool(HumanApplicationAccess::dispatch(reopened, OpenProjectAction{project_path})),
+            "reopen projected scene");
+    const auto restored = reopened.snapshot();
+    require(restored.materials.size() == 1U && restored.source_assets.size() == 1U &&
+            restored.source_assets.front().importer_version == 2U &&
+            restored.source_assets.front().source_digest == redone.source_assets.front().source_digest &&
+            restored.source_assets.front().artifact_digest == redone.source_assets.front().artifact_digest &&
+            restored.source_assets.front().domain_digests == redone.source_assets.front().domain_digests &&
+            restored.source_assets.front().document_products == redone.source_assets.front().document_products,
+            "projected source lineage survives undo, redo, save, and reopen");
+    require(restored.materials.front().id == redone.materials.front().id &&
+            restored.materials.front().definition.metallic == 1.0 &&
+            restored.materials.front().definition.roughness == 1.0 &&
+            restored.material_assignments.size() == redone.material_assignments.size() &&
+            !restored.material_assignments.empty(), "projected material and assignments survive reopen");
+    for (std::size_t i = 0; i < restored.material_assignments.size(); ++i) {
+        require(restored.material_assignments[i].key == redone.material_assignments[i].key &&
+                restored.material_assignments[i].material == redone.material_assignments[i].material &&
+                restored.material_assignments[i].variant == redone.material_assignments[i].variant,
+                "each projected material assignment survives reopen");
+    }
+    const auto original_document = project::ProjectDocument::load(project_path);
+    require(bool(original_document), "projected document loads for migration");
+    const auto package = project::ProjectPackage::migrate_flat_project(project_path, root / "projected-package");
+    require(bool(package), "projected document migrates into package");
+    const auto exported = package.value().export_project_document();
+    require(bool(exported), "migrated projected document exports");
+    const auto migrated_document = project::ProjectDocument::deserialize(exported.value());
+    require(migrated_document &&
+            migrated_document.value().source_asset_registry().serialize() ==
+                original_document.value().source_asset_registry().serialize() &&
+            migrated_document.value().material_catalog().serialize() ==
+                original_document.value().material_catalog().serialize(),
+            "package migration preserves lineage and material catalog bytes");
+    assets::BlobStore migrated_store(package.value().root() / ".carto-assets" / "source-blobs");
+    const auto migrated_source = migrated_store.read(restored.source_assets.front().source_digest);
+    require(migrated_source && migrated_source.value() == source,
+            "package migration preserves exact captured source bytes");
+    const auto missing_root = root / "missing-source";
+    require(std::filesystem::create_directory(missing_root), "missing-source fixture created");
+    std::filesystem::copy_file(project_path, missing_root / "projection.carto");
+    const auto missing = project::ProjectPackage::migrate_flat_project(
+        missing_root / "projection.carto", missing_root / "rejected-package");
+    require(!missing && !std::filesystem::exists(missing_root / "rejected-package"),
+            "migration refuses to publish a package without its captured source");
 }
 
-int main() {
+void ui_external_buffer_capture(const std::filesystem::path& root) {
+    using namespace application;
+    std::filesystem::create_directories(root);
+    const auto project_path = root / "external.carto";
+    const auto source_path = root / "scene.gltf";
+    const auto buffer_path = root / "scene.bin";
+    const auto glb = fixture({}, R"({"vanta_object_id":42,"vanta_visible":false,"vanta_locked":true})", {}, true);
+    const auto json_size = static_cast<std::uint32_t>(glb[12]) |
+        (static_cast<std::uint32_t>(glb[13]) << 8U) |
+        (static_cast<std::uint32_t>(glb[14]) << 16U) |
+        (static_cast<std::uint32_t>(glb[15]) << 24U);
+    std::string json(glb.begin() + 20, glb.begin() + 20 + json_size);
+    const std::string marker = R"({"byteLength":36})";
+    const auto position = json.find(marker);
+    require(position != std::string::npos, "external buffer fixture marker found");
+    const auto document_with_uri = [&](std::string_view uri) {
+        auto result = json;
+        result.replace(position, marker.size(),
+            R"({"byteLength":36,"uri":")" + std::string(uri) + R"("})");
+        return std::vector<std::uint8_t>(result.begin(), result.end());
+    };
+    const auto document = document_with_uri("scene.bin");
+    const std::vector<std::uint8_t> buffer(glb.end() - 36, glb.end());
+    write_source(source_path, document_with_uri("../outside.bin"));
+    write_source(buffer_path, buffer);
+    ApplicationSession session;
+    ui::UiController controller(session);
+    require(bool(controller.dispatch(NewProjectAction{"External buffer"})), "external project created");
+    require(bool(controller.dispatch(SaveProjectAction{project_path})), "external project saved");
+    const auto before = controller.snapshot();
+    const auto attempt = [&] {
+        return controller.import_static_gltf_scene(source_path, before.project_generation,
+            before.project_revision, before.source_namespace, true, "reviewed", true);
+    };
+    require(!attempt(), "traversal buffer URI rejected");
+    write_source(source_path, document_with_uri("missing.bin"));
+    require(!attempt(), "missing buffer rejected");
+    write_source(source_path, document_with_uri("http:%2f%2fexample.bin"));
+    require(!attempt(), "URL and encoded path syntax rejected");
+    std::error_code link_error;
+    std::filesystem::create_symlink(buffer_path, root / "linked.bin", link_error);
+    if (!link_error) {
+        write_source(source_path, document_with_uri("linked.bin"));
+        require(!attempt(), "linked dependency rejected");
+    } else {
+        std::cout << "SKIP: dependency symlink fixture unavailable: " << link_error.message() << '\n';
+    }
+    write_source(source_path, document);
+    auto short_buffer = buffer;
+    short_buffer.pop_back();
+    write_source(buffer_path, short_buffer);
+    require(!attempt(), "incorrect buffer length rejected");
+    require(controller.snapshot().project_revision == before.project_revision &&
+            controller.snapshot().source_assets.empty() && blob_inventory(root).empty(),
+            "dependency refusals preserve project and source cache");
+    write_source(buffer_path, buffer);
+    const auto imported = attempt();
+    require(bool(imported), "captured external buffer imports");
+    require(std::any_of(imported.value().warnings.begin(), imported.value().warnings.end(),
+        [](const auto& warning) { return warning.message.find("captured together") != std::string::npos; }),
+        "capture is reported");
+    const auto after = controller.snapshot();
+    require(after.source_assets.size() == 1U, "source package has one lineage record");
+    assets::BlobStore store(root / ".carto-assets" / "source-blobs");
+    const auto retained = store.read(after.source_assets.front().source_digest);
+    require(retained && std::search(retained.value().begin(), retained.value().end(), document.begin(), document.end()) != retained.value().end() &&
+            std::search(retained.value().begin(), retained.value().end(), buffer.begin(), buffer.end()) != retained.value().end(),
+            "source package retains exact document and buffer bytes");
+    std::filesystem::remove(source_path);
+    std::filesystem::remove(buffer_path);
+    require(bool(controller.dispatch(UndoAction{})) && bool(controller.dispatch(RedoAction{})),
+            "undo and redo use captured source after originals disappear");
+    require(bool(controller.dispatch(SaveProjectAction{})), "save captured scene");
+    ApplicationSession reopened;
+    require(bool(HumanApplicationAccess::dispatch(reopened, OpenProjectAction{project_path})),
+            "reopen captured scene without originals");
+    require(reopened.snapshot().source_assets.front().source_digest == after.source_assets.front().source_digest,
+            "source package identity survives reopen");
+}
+
+void vanta_roundtrip(const std::filesystem::path& source, const std::filesystem::path& root) {
+    using namespace application;
+    require(!std::filesystem::exists(root), "round-trip output directory must be new");
+    require(std::filesystem::create_directories(root), "round-trip output directory created");
+    const auto project_path = root / "roundtrip.carto";
+    ApplicationSession session;
+    ui::UiController controller(session);
+    require(bool(controller.dispatch(NewProjectAction{"VANTA round trip"})), "round-trip project created");
+    require(bool(controller.dispatch(SaveProjectAction{project_path})), "round-trip project saved");
+    const auto before = controller.snapshot();
+    const auto imported = controller.import_static_gltf_scene(source, before.project_generation,
+        before.project_revision, before.source_namespace, true, "VANTA compatibility acceptance", true);
+    if (!imported) std::cerr << "round-trip import: " << imported.error().message << '\n';
+    require(bool(imported), "VANTA output imported");
+    const auto imported_snapshot = controller.snapshot();
+    require(!imported_snapshot.objects.empty() && !imported_snapshot.source_assets.empty(),
+            "VANTA scene and source are present");
+    require(bool(controller.dispatch(UndoAction{})) && bool(controller.dispatch(RedoAction{})),
+            "round-trip scene undo and redo");
+    require(bool(controller.dispatch(SaveProjectAction{})), "round-trip imported project saved");
+    const auto project = project::ProjectDocument::load(project_path);
+    require(bool(project), "round-trip project cold loaded");
+    const auto exported = io::export_gltf(project.value(), root / "roundtrip.gltf");
+    if (!exported) std::cerr << "round-trip export: " << exported.error().message << '\n';
+    require(bool(exported), "Cartographer re-export succeeded");
+    std::cout << "VANTA exchange: objects=" << imported_snapshot.objects.size()
+              << " meshes=" << exported.value().meshes << " triangles=" << exported.value().triangles << '\n';
+    for (const auto& warning : imported.value().warnings)
+        std::cout << "import warning: " << warning.message << '\n';
+    for (const auto& warning : exported.value().warnings)
+        std::cout << "export warning: " << warning << '\n';
+}
+}
+
+int main(int argc, char** argv) {
     try {
+        if (argc == 3) {
+            vanta_roundtrip(argv[1], argv[2]);
+            return 0;
+        }
+        require(argc == 1, "usage: native_scene_import_tests [vanta.gltf new-output-directory]");
         registry_compatibility();
         const auto root = std::filesystem::temp_directory_path() /
             ("carto-import-sprint-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         std::filesystem::create_directories(root);
         import_and_history(root);
         ui_import_and_retained_generation(root / "ui");
+        ui_default_material_projection(root / "projection");
+        ui_external_buffer_capture(root / "external");
         std::filesystem::remove_all(root);
         std::cout << "import sprint regression source complete\n";
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

@@ -3,7 +3,9 @@
 #include <carto/io/ply.hpp>
 #include <carto/io/stl.hpp>
 #include <carto/io/gltf_export.hpp>
+#include <carto/io/gltf_scene_import.hpp>
 #include <carto/application/application.hpp>
+#include <carto/ui/ui.hpp>
 #if CARTO_CLI_HAS_D3D12_BAKE
 #include <carto/d3d12/bake_graph.hpp>
 #endif
@@ -2800,6 +2802,33 @@ int import_mesh_to_project(
     return EXIT_SUCCESS;
 }
 
+int import_gltf_scene(const std::filesystem::path& path,const std::filesystem::path& output) {
+    if(std::filesystem::exists(output)){std::cerr<<"refusing to replace an existing project; import through the desktop to append undoably\n";return EXIT_FAILURE;}
+    std::ifstream input(path,std::ios::binary|std::ios::ate);const auto size=input?input.tellg():std::streampos(-1);
+    if(size<=0||size>std::streamoff(128U*1024U*1024U)){std::cerr<<"GLTF/GLB must be readable and within 128 MiB\n";return EXIT_FAILURE;}
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));input.seekg(0);input.read(reinterpret_cast<char*>(bytes.data()),static_cast<std::streamsize>(bytes.size()));if(!input)return EXIT_FAILURE;
+    auto captured=carto::io::capture_gltf_scene_source(path,bytes);if(!captured){print_error(captured.error());return EXIT_FAILURE;}
+    auto parsed=carto::io::import_gltf_scene(captured.value());if(!parsed){print_error(parsed.error());return EXIT_FAILURE;}
+    carto::application::ApplicationSession session;
+    const auto send=[&](const carto::application::ApplicationAction& action){auto r=carto::application::HumanApplicationAccess::dispatch(session,action);if(!r)print_error(r.error());return bool(r);};
+    if(!send(carto::application::NewProjectAction{path.stem().string()})||!send(carto::application::SaveProjectAction{output}))return EXIT_FAILURE;
+    carto::ui::UiController controller(session);
+    const auto snapshot=controller.snapshot();
+    auto imported=controller.import_static_gltf_scene(path,snapshot.project_generation,
+        snapshot.project_revision,snapshot.source_namespace,true,"CLI confirmed source reuse");
+    if(!imported){print_error(imported.error());return EXIT_FAILURE;}
+    if(!send(carto::application::SaveProjectAction{std::nullopt}))return EXIT_FAILURE;
+    const auto admitted=session.snapshot();
+    if(admitted.source_assets.size()!=1U){std::cerr<<"imported source mapping is unavailable\n";return EXIT_FAILURE;}
+    const auto& products=admitted.source_assets.front().document_products;
+    const auto count_products=[&](carto::assets::SourceDocumentProductKind kind){
+        return std::count_if(products.begin(),products.end(),[&](const auto& product){return product.kind==kind;});
+    };
+    std::cout<<"imported static glTF scene: nodes="<<count_products(carto::assets::SourceDocumentProductKind::node)
+             <<" meshes="<<count_products(carto::assets::SourceDocumentProductKind::mesh)
+             <<" materials="<<count_products(carto::assets::SourceDocumentProductKind::material)<<" journaled=true\n";
+    for(const auto& warning:imported.value().warnings)std::cout<<"warning: "<<warning.message<<'\n';return EXIT_SUCCESS;
+}
 int import_obj(const std::filesystem::path& obj_path, const std::filesystem::path& project_path) {
     carto::providers::Registry providers;
     if (auto result = carto::io::register_builtin_obj_providers(providers); !result) {
@@ -2860,7 +2889,7 @@ int import_stl(const std::filesystem::path& stl_path, const std::filesystem::pat
 int export_interchange(
     const std::filesystem::path& project_path,
     const std::filesystem::path& output_path,
-    bool binary_container) {
+    bool binary_container, std::uint32_t graph_bake_resolution = 0) {
     carto::providers::Registry providers;
     if (auto result = carto::io::register_builtin_gltf_providers(providers); !result) {
         print_error(result.error().with_context("glTF exporter provider"));
@@ -2883,8 +2912,8 @@ int export_interchange(
         return EXIT_FAILURE;
     }
     auto report = binary_container
-        ? carto::io::export_glb(document.value(), output_path)
-        : carto::io::export_gltf(document.value(), output_path);
+        ? carto::io::export_glb(document.value(), output_path, carto::io::GltfExportOptions{project_path,{},graph_bake_resolution})
+        : carto::io::export_gltf(document.value(), output_path, carto::io::GltfExportOptions{project_path,{},graph_bake_resolution});
     if (!report) {
         print_error(report.error());
         return EXIT_FAILURE;
@@ -2897,6 +2926,9 @@ int export_interchange(
               << " triangles=" << report.value().triangles
               << " index_bytes=" << report.value().index_bytes
               << " index_type=" << (report.value().used_uint32_indices ? "uint32" : "uint16")
+              << " materials=" << report.value().materials
+              << " textures=" << report.value().textures
+              << " images=" << report.value().images
               << '\n';
     for (const auto& warning : report.value().warnings) {
         std::cout << "warning: " << warning << '\n';
@@ -8861,8 +8893,8 @@ void usage(std::ostream& output) {
            << "  cartographer_cli export-obj <project.carto> [mesh-asset-id] <mesh.obj>\n"
            << "  cartographer_cli export-ply <project.carto> [mesh-asset-id] <mesh.ply>\n"
            << "  cartographer_cli export-stl <project.carto> [mesh-asset-id] <mesh.stl>\n"
-           << "  cartographer_cli export-gltf <project.carto> <scene.gltf>\n"
-           << "  cartographer_cli export-glb <project.carto> <scene.glb>\n"
+           << "  cartographer_cli export-gltf <project.carto> <scene.gltf> [explicit-graph-bake-resolution]\n"
+           << "  cartographer_cli export-glb <project.carto> <scene.glb> [explicit-graph-bake-resolution]\n"
            << "  cartographer_cli write-default-preparation-profile <profile.carto-prep>\n"
            << "  cartographer_cli inspect-preparation-profile <profile.carto-prep>\n"
            << "  cartographer_cli prepare <project.carto> <output-directory> scene\n"
@@ -8904,7 +8936,8 @@ void usage(std::ostream& output) {
            << "  cartographer_cli bake-normal-tiles-d3d12 <project.carto> <source-mesh-id> <target-mesh-id> <uv-set-id> <width> <height> <projection-half-extent> <reject-misses:0|1> <output-directory>\n"
            << "  cartographer_cli inspect-bake-normal-tiles-d3d12 <project.carto> <source-mesh-id> <target-mesh-id> <output-directory>\n";
 #endif
-    output << "  cartographer_cli import-obj <mesh.obj> <project.carto>\n"
+    output << "  cartographer_cli import-gltf <scene.gltf|scene.glb> <new-project.carto> --confirm-reuse-rights\n"
+           << "  cartographer_cli import-obj <mesh.obj> <project.carto>\n"
            << "  cartographer_cli import-ply <mesh.ply> <project.carto>\n"
            << "  cartographer_cli import-stl <mesh.stl> <project.carto>\n";
 }
@@ -9033,11 +9066,15 @@ int main(int argc, char** argv) {
         }
         return export_stl(argv[2], argv[4], mesh_asset.value());
     }
-    if (command == "export-gltf" && argc == 4) {
-        return export_interchange(argv[2], argv[3], false);
-    }
-    if (command == "export-glb" && argc == 4) {
-        return export_interchange(argv[2], argv[3], true);
+    if ((command == "export-gltf" || command == "export-glb") && (argc == 4 || argc == 5)) {
+        std::uint32_t bake=0;
+        if(argc==5) {
+            auto parsed=parse_bake_u32_argument(argv[4],"explicit graph bake resolution");
+            if(!parsed){print_error(parsed.error());return EXIT_FAILURE;}
+            bake=parsed.value();
+            if(bake<4||bake>256||(bake&(bake-1))){std::cerr<<"graph bake resolution requires power of two 4..256\n";return EXIT_FAILURE;}
+        }
+        return export_interchange(argv[2], argv[3], command=="export-glb",bake);
     }
     if (command == "write-default-preparation-profile" && argc == 3) {
         return write_default_preparation_profile(argv[2]);
@@ -9154,6 +9191,7 @@ int main(int argc, char** argv) {
     if (command == "import-obj" && argc == 4) {
         return import_obj(argv[2], argv[3]);
     }
+    if(command=="import-gltf"&&argc==5&&std::string_view(argv[4])=="--confirm-reuse-rights")return import_gltf_scene(argv[2],argv[3]);
     if (command == "import-ply" && argc == 4) {
         return import_ply(argv[2], argv[3]);
     }

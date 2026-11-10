@@ -8,6 +8,8 @@ add_library(carto_assets STATIC
     src/texture_mip.cpp
     src/texture_paint.cpp
     src/texture_source.cpp
+    src/texture_decode.cpp
+    src/hdr_environment.cpp
     src/source_registry.cpp
 )
 
@@ -22,6 +24,9 @@ target_include_directories(carto_assets
 )
 
 target_link_libraries(carto_assets PUBLIC carto_core carto_botanical_contract)
+if(WIN32)
+    target_link_libraries(carto_assets PRIVATE windowscodecs ole32)
+endif()
 carto_target(carto_assets)
 
 install(TARGETS carto_assets EXPORT CartographerTargets)

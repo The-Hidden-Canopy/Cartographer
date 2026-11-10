@@ -10,7 +10,7 @@ namespace carto::io {
 [[nodiscard]] core::Result<void> register_builtin_obj_providers(
     providers::Registry& registry);
 
-// Registers the deterministic public glTF export profile through the same
+// Registers the bounded static scene importer and deterministic glTF exporter through the same
 // lifecycle gate.  The profile is derived interchange, not authoring truth or
 // a moat runtime adapter.
 [[nodiscard]] core::Result<void> register_builtin_gltf_providers(

@@ -2,6 +2,8 @@
 #include "studio_scene_camera.hpp"
 
 #include <stdexcept>
+#include <array>
+#include <cmath>
 #include <limits>
 #include <string>
 
@@ -11,6 +13,38 @@ namespace {
     if (!(expression)) throw std::runtime_error( \
         std::string("requirement failed: ") + #expression); \
 } while (false)
+
+void editor_camera_matches_authoring_projection() {
+    using namespace carto;
+    for (const auto projection : {editor::EditorProjection::perspective,
+                                  editor::EditorProjection::orthographic}) {
+        for (const auto [yaw, pitch] : std::array{
+                 std::pair{0.0, 0.0}, std::pair{0.72, 0.43}, std::pair{-1.31, -0.71}}) {
+            editor::EditorCamera camera;
+            REQUIRE(camera.set_orientation(yaw, pitch));
+            camera.set_projection(projection);
+            REQUIRE(camera.frame({2.0, -1.0, 3.0}, 4.0, 4.0 / 3.0));
+            const auto view = studio::authoring_view_from_editor_camera(camera, 4.0 / 3.0);
+            REQUIRE(view);
+            const auto axes = camera.axes();
+            for (const auto point : {camera.target(),
+                    camera.target() + axes.right * 1.2 + axes.up * 0.7,
+                    camera.target() - axes.right * 0.9 - axes.up * 0.4 + axes.forward}) {
+                const auto marker = camera.project_marker(point, {800.0, 600.0});
+                const auto rendered = view.value().project(point, 800U, 600U);
+                REQUIRE(marker && rendered && marker.value().in_front);
+                REQUIRE(std::abs(marker.value().screen_position.x - rendered.value().x) < 1.0e-8);
+                REQUIRE(std::abs(marker.value().screen_position.y - rendered.value().y) < 1.0e-8);
+                REQUIRE(std::abs(marker.value().view_depth - rendered.value().z) < 1.0e-8);
+            }
+            REQUIRE(!studio::authoring_view_from_editor_camera(camera, 0.0));
+            REQUIRE(!studio::authoring_view_from_editor_camera(camera, std::numeric_limits<double>::infinity()));
+        }
+    }
+    editor::EditorCamera huge;
+    REQUIRE(huge.frame({}, 5.0e7, 1.0));
+    REQUIRE(!studio::authoring_view_from_editor_camera(huge, 1.0));
+}
 
 void explicit_viewshed_observer_preserves_finite_world_coordinates() {
     carto::application::ApplicationSnapshot snapshot;
@@ -223,6 +257,7 @@ void viewshed_cell_footprints_preserve_projected_grid_geometry() {
 } // namespace
 
 int main() {
+    editor_camera_matches_authoring_projection();
     explicit_viewshed_observer_preserves_finite_world_coordinates();
     bound_viewshed_observer_uses_current_world_origin();
     bound_viewshed_observer_rejects_stale_missing_and_invalid_sources();

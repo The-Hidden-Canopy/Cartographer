@@ -64,6 +64,8 @@ project::AuthoredCamera camera_source(scene::ObjectId object, bool active = fals
     camera.far_plane = 800.0;
     camera.active_for_review = active;
     camera.revision = core::Revision{2U};
+    camera.exposure_ev = 1.5;
+    camera.tone_mode = render::ToneMapMode::neutral;
     return camera;
 }
 
@@ -160,6 +162,8 @@ void typed_records_round_trip_and_reject_invalid_intent() {
     const auto encoded = catalog.serialize();
     const auto decoded = project::PresentationCatalog::deserialize(encoded);
     require(decoded && decoded.value().serialize() == encoded &&
+            decoded.value().cameras().at(scene::ObjectId{1U}).exposure_ev == 1.5 &&
+            decoded.value().cameras().at(scene::ObjectId{1U}).tone_mode == render::ToneMapMode::neutral &&
             decoded.value().cameras().at(scene::ObjectId{1U}).review_purpose ==
                 project::CameraReviewPurpose::silhouette_review &&
             decoded.value().lights().at(scene::ObjectId{2U}).color_temperature_kelvin ==
@@ -171,6 +175,19 @@ void typed_records_round_trip_and_reject_invalid_intent() {
         "presentation source digest is stable across reopen");
 
     auto invalid_camera = camera_source(scene::ObjectId{3U});
+    invalid_camera.exposure_ev = 33;
+    require(!invalid_camera.validate(), "unbounded camera exposure is rejected");
+    auto replacement = catalog.cameras().at(scene::ObjectId{1U});
+    require(!catalog.replace_camera(replacement), "camera replacement requires newer revision");
+    replacement.revision = replacement.revision.next();
+    replacement.exposure_ev = -2;
+    require(static_cast<bool>(catalog.replace_camera(replacement)), "camera display edit replaces existing source");
+    const auto good = catalog.serialize();
+    replacement.revision = replacement.revision.next();
+    replacement.tone_mode = static_cast<render::ToneMapMode>(255);
+    require(!catalog.replace_camera(replacement) && catalog.serialize() == good,
+        "failed camera display replacement preserves prior good source");
+    invalid_camera.exposure_ev = 0;
     invalid_camera.vertical_fov_radians = std::numeric_limits<double>::quiet_NaN();
     require(!invalid_camera.validate(), "non-finite camera projection is rejected");
     invalid_camera = camera_source(scene::ObjectId{3U});
@@ -201,7 +218,9 @@ void typed_records_round_trip_and_reject_invalid_intent() {
 
 void reference_image_planes_are_bounded_calibrated_and_fail_closed() {
     project::PresentationCatalog catalog;
-    const auto camera = camera_source(scene::ObjectId{40U});
+    auto camera = camera_source(scene::ObjectId{40U});
+    camera.exposure_ev = 1.25;
+    camera.tone_mode = render::ToneMapMode::neutral;
     require(static_cast<bool>(catalog.insert_camera(camera)),
         "camera-pinned plane fixture has an authored camera");
 
@@ -325,42 +344,76 @@ void reference_image_planes_are_bounded_calibrated_and_fail_closed() {
             reopened.value().reference_planes().at("motel.camera").camera_local_placement,
         "source digest, calibration, placement, visibility, lock, and view binding round-trip");
 
-    auto legacy_v2 = encoded;
+    // Both histories emitted a different presentation v3. Derive each
+    // complete legacy grammar from the combined v5 fixture.
+    const std::string schema_current = "CARTOGRAPHER_PRESENTATION_CATALOG 5\n";
     const std::string schema_three = "CARTOGRAPHER_PRESENTATION_CATALOG 3\n";
     const std::string schema_two = "CARTOGRAPHER_PRESENTATION_CATALOG 2\n";
-    require(legacy_v2.starts_with(schema_three),
-        "current presentation records use schema v3");
-    legacy_v2.replace(0U, schema_three.size(), schema_two);
-    std::size_t record_start = legacy_v2.find("REFERENCE_PLANE ");
+    require(encoded.starts_with(schema_current), "current presentation records use schema v5");
+    auto remove_display = [](std::string& value) {
+        const auto start = value.find("CAMERA ");
+        const auto end = value.find('\n', start);
+        require(start != std::string::npos && end != std::string::npos,
+            "legacy fixture contains a camera record");
+        const auto last = value.rfind(' ', end);
+        const auto previous = value.rfind(' ', last - 1U);
+        value.erase(previous, end - previous);
+    };
+    auto remove_environment = [](std::string& value) {
+        const auto at = value.find("ENVIRONMENT 0\n");
+        require(at != std::string::npos, "legacy fixture contains an empty environment");
+        value.erase(at, std::string("ENVIRONMENT 0\n").size());
+    };
+    auto main_v3 = encoded;
+    main_v3.replace(0U, schema_current.size(), schema_three);
+    remove_environment(main_v3);
+    remove_display(main_v3);
+    const auto migrated_main = project::PresentationCatalog::deserialize(main_v3);
+    require(migrated_main &&
+            migrated_main.value().reference_planes().at("motel.camera").camera_local_placement &&
+            migrated_main.value().cameras().at(camera.object).exposure_ev == 0.0,
+        "main schema-v3 retains camera-local placement and defaults display intent");
+
+    auto realism_v3 = encoded;
+    realism_v3.replace(0U, schema_current.size(), schema_three);
+    remove_environment(realism_v3);
+    std::size_t record_start = realism_v3.find("REFERENCE_PLANE ");
     while (record_start != std::string::npos) {
-        const auto record_end = legacy_v2.find('\n', record_start);
-        require(record_end != std::string::npos,
-            "serialized reference-plane record is line terminated");
-        std::istringstream fields_input(legacy_v2.substr(record_start,
-            record_end - record_start));
+        const auto record_end = realism_v3.find('\n', record_start);
+        require(record_end != std::string::npos, "serialized reference plane is line terminated");
+        std::istringstream fields_input(realism_v3.substr(record_start, record_end - record_start));
         std::vector<std::string> fields;
         for (std::string field; fields_input >> field;) fields.push_back(std::move(field));
-        require(fields.size() == 32U,
-            "schema-v3 reference plane includes the camera-local placement field");
+        require(fields.size() == 32U, "v5 plane includes camera-local placement");
         fields.erase(fields.begin() + 19);
         std::string legacy_record;
         for (const auto& field : fields) {
             if (!legacy_record.empty()) legacy_record.push_back(' ');
             legacy_record += field;
         }
-        legacy_v2.replace(record_start, record_end - record_start, legacy_record);
-        record_start = legacy_v2.find("REFERENCE_PLANE ",
-            record_start + legacy_record.size() + 1U);
+        realism_v3.replace(record_start, record_end - record_start, legacy_record);
+        record_start = realism_v3.find("REFERENCE_PLANE ", record_start + legacy_record.size() + 1U);
     }
+    const auto migrated_realism = project::PresentationCatalog::deserialize(realism_v3);
+    require(migrated_realism &&
+            !migrated_realism.value().reference_planes().at("motel.camera").camera_local_placement &&
+            migrated_realism.value().cameras().at(camera.object).exposure_ev == 1.25 &&
+            migrated_realism.value().cameras().at(camera.object).tone_mode == render::ToneMapMode::neutral,
+        "realism schema-v3 retains its display intent and world-space plane interpretation");
+    auto mixed_v3 = encoded;
+    mixed_v3.replace(0U, schema_current.size(), schema_three);
+    remove_environment(mixed_v3);
+    require(!project::PresentationCatalog::deserialize(mixed_v3),
+        "a mixed v3 layout is rejected rather than reinterpreted");
+    auto legacy_v2 = realism_v3;
+    legacy_v2.replace(0U, schema_three.size(), schema_two);
+    remove_display(legacy_v2);
     const auto migrated_v2 = project::PresentationCatalog::deserialize(legacy_v2);
     require(migrated_v2 &&
             !migrated_v2.value().reference_planes().at("motel.camera").camera_local_placement &&
-            migrated_v2.value().reference_planes().at("motel.camera").origin.x ==
-                camera_pinned.origin.x &&
-            migrated_v2.value().reference_planes().at("motel.camera").normal.z ==
-                camera_pinned.normal.z &&
-            migrated_v2.value().serialize().starts_with(schema_three),
-        "schema-v2 camera pins retain legacy world placement when upgraded to schema v3");
+            migrated_v2.value().reference_planes().at("motel.camera").origin.x == camera_pinned.origin.x &&
+            migrated_v2.value().serialize().starts_with(schema_current),
+        "schema-v2 camera pins retain world placement when upgraded to schema v5");
     const auto first_digest = catalog.canonical_digest();
     const auto reopened_digest = reopened.value().canonical_digest();
     require(first_digest && reopened_digest && first_digest.value() == reopened_digest.value(),
@@ -661,21 +714,130 @@ void project_transaction_binds_presentation_to_scene_and_journal() {
         "failed presentation mutations append no journal event");
 }
 
+void presentation_size_admission_preserves_project() {
+    TempDirectory temp;
+    project::ProjectDocument document;
+    journal::Journal journal(temp.path() / "presentation-size.log");
+    auto transaction = project::ProjectTransaction::begin(document, journal, "presentation-size");
+    require(static_cast<bool>(transaction), "size fixture transaction begins");
+    const auto camera_object = transaction.value().create_object("Camera");
+    require(static_cast<bool>(camera_object), "size fixture scene camera created");
+    const auto camera_id = camera_object.value();
+    project::PresentationCatalog catalog;
+    require(static_cast<bool>(catalog.insert_camera(camera_source(camera_id))),
+        "size fixture camera admitted");
+    const auto plane_for = [camera_id](std::size_t index) {
+        const auto digits = std::to_string(10'000U + index).substr(1U);
+        auto plane = reference_plane_source("budget-" + digits,
+            project::ReferencePlaneView::camera_pinned, {}, camera_id);
+        plane.source_locator = std::string(assets::SourceImportRecord::kMaxRelativePathBytes, 'a');
+        return plane;
+    };
+    const auto empty_bytes = catalog.serialize().size();
+    auto sample = catalog;
+    require(static_cast<bool>(sample.insert_reference_plane(plane_for(0U))),
+        "size fixture reference plane admitted");
+    const auto record_bytes = sample.serialize().size() - empty_bytes;
+    const auto cap = project::PresentationCatalog::kMaxSerializedBytes;
+    require(record_bytes > 0U && cap > empty_bytes + 8U + record_bytes,
+        "size fixture can approach catalog limit");
+    const auto count = (cap - empty_bytes - 8U) / record_bytes - 1U;
+    require(count + 4U < project::PresentationCatalog::kMaxRecords,
+        "size fixture stays below record-count limit");
+    for (std::size_t i = 0; i < count; ++i)
+        require(static_cast<bool>(catalog.insert_reference_plane(plane_for(i))),
+            "near-limit reference plane admitted");
+    const auto near_bytes = catalog.serialize().size();
+    require(near_bytes <= cap && cap - near_bytes <= record_bytes * 2U + 8U &&
+            static_cast<bool>(catalog.validate()), "near-limit catalog remains valid");
+    require(static_cast<bool>(transaction.value().set_presentation_catalog(catalog)),
+        "near-limit catalog admitted to project");
+    require(static_cast<bool>(transaction.value().commit("presentation.size.boundary")),
+        "near-limit project commits");
+    const auto before = document.serialize();
+    const auto revision = document.revision();
+    require(static_cast<bool>(project::ProjectDocument::deserialize(before)),
+        "near-limit catalog project reopens");
+    const auto save_path = temp.path() / "presentation-size.carto";
+    require(static_cast<bool>(document.save_atomic(save_path)),
+        "near-limit catalog project saves atomically");
+    const auto reopened = project::ProjectDocument::load(save_path);
+    require(reopened && reopened.value().serialize() == before,
+        "near-limit catalog survives disk save and reopen");
+    const auto prior_events = journal.read_all();
+    require(prior_events && prior_events.value().size() == 1U,
+        "near-limit commit has one journal event");
+    auto oversized = std::move(catalog);
+    for (std::size_t i = count; oversized.serialize().size() <= cap && i < count + 4U; ++i)
+        require(static_cast<bool>(oversized.insert_reference_plane(plane_for(i))),
+            "over-limit draft plane constructed");
+    require(oversized.serialize().size() > cap && !oversized.validate(),
+        "over-limit catalog fails validation before project admission");
+    auto reject = project::ProjectTransaction::begin(document, journal, "presentation-size-reject");
+    require(reject && !reject.value().set_presentation_catalog(std::move(oversized)) &&
+            static_cast<bool>(reject.value().rollback()) && document.revision() == revision &&
+            document.serialize() == before,
+        "over-limit project admission preserves the previous state and revision");
+    const auto after_events = journal.read_all();
+    require(after_events && after_events.value().size() == prior_events.value().size(),
+        "rejected catalog appends no journal event");
+}
+
 void schema_v17_migrates_and_current_schema_requires_spatial_field_table() {
     const std::string v1_catalog =
         "CARTOGRAPHER_PRESENTATION_CATALOG 1\nCAMERAS 0\nLIGHTS 0\nEND\n";
     const auto migrated_catalog = project::PresentationCatalog::deserialize(v1_catalog);
     require(migrated_catalog && migrated_catalog.value().reference_planes().empty() &&
             migrated_catalog.value().serialize().find(
-                "CARTOGRAPHER_PRESENTATION_CATALOG 3\n") == 0U,
+                "CARTOGRAPHER_PRESENTATION_CATALOG 5\n") == 0U,
         "schema-v1 presentation catalogs migrate with an explicit empty plane table");
     const std::string v2_without_planes =
         "CARTOGRAPHER_PRESENTATION_CATALOG 2\nCAMERAS 0\nLIGHTS 0\nEND\n";
     require(!project::PresentationCatalog::deserialize(v2_without_planes),
         "schema-v2 catalogs cannot omit their reference-plane table");
+    const auto legacy_camera = project::PresentationCatalog::deserialize(
+        "CARTOGRAPHER_PRESENTATION_CATALOG 2\nCAMERAS 1\n"
+        "CAMERA 1 2 0 0 1 1 10 0.1 100 \"camera\" \"review\" \"\"\n"
+        "LIGHTS 0\nREFERENCE_PLANES 0\nEND\n");
+    require(legacy_camera && legacy_camera.value().cameras().at(scene::ObjectId{1}).exposure_ev == 0 &&
+        legacy_camera.value().cameras().at(scene::ObjectId{1}).tone_mode == render::ToneMapMode::aces_fitted,
+        "legacy camera migrates to neutral exposure and ACES display without changing radiance");
 
     project::ProjectDocument document;
     auto current = document.serialize();
+    const auto v40_header = std::string("CARTOGRAPHER_PROJECT 40");
+    require(current.starts_with(v40_header), "integrated projects use schema v40");
+    auto legacy_project = [&](unsigned version, bool realism) {
+        auto value = current;
+        const auto cut = value.find(realism ? "CONNECTION_PORT_GRAPH " :
+            (version == 34U ? "KINEMATIC_GRAPHS " : "ACCEPTED_AUTORIGS "));
+        require(cut != std::string::npos, "legacy project fixture finds its layout boundary");
+        value.erase(cut);
+        if (realism) {
+            value += "RIG_TEMPLATE_BINDINGS 0\n";
+            if (version == 35U) value += "AGING_LAYERS 0\n";
+        }
+        value += "END\n";
+        value.replace(0, v40_header.size(), "CARTOGRAPHER_PROJECT " + std::to_string(version));
+        return value;
+    };
+    for (const auto version : {34U, 35U}) {
+        require(static_cast<bool>(project::ProjectDocument::deserialize(legacy_project(version, false))),
+            "main project legacy layout migrates");
+        require(static_cast<bool>(project::ProjectDocument::deserialize(legacy_project(version, true))),
+            "realism project legacy layout migrates");
+    }
+    auto mixed_project = legacy_project(35U, false);
+    const auto end = mixed_project.rfind("END\n");
+    mixed_project.insert(end, "RIG_TEMPLATE_BINDINGS 0\nAGING_LAYERS 0\n");
+    require(!project::ProjectDocument::deserialize(mixed_project),
+        "mixed historical project layouts are rejected");
+    auto missing_integrated = current;
+    const auto aging = missing_integrated.rfind("AGING_LAYERS 0\n");
+    require(aging != std::string::npos, "integrated project contains aging table");
+    missing_integrated.erase(aging, std::string("AGING_LAYERS 0\n").size());
+    require(!project::ProjectDocument::deserialize(missing_integrated),
+        "integrated project requires both new tables");
     const std::string curve_table = "CURVE_PATHS 0\n";
     const auto curve_table_start = current.find(curve_table);
     require(curve_table_start != std::string::npos,
@@ -765,6 +927,7 @@ int main() {
     reference_image_near_plane_clipping_preserves_uvs();
     reference_image_source_reads_only_verified_project_blobs();
     project_transaction_binds_presentation_to_scene_and_journal();
+    presentation_size_admission_preserves_project();
     schema_v17_migrates_and_current_schema_requires_spatial_field_table();
     std::cout << "presentation catalog tests passed\n";
     return EXIT_SUCCESS;

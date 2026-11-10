@@ -514,7 +514,6 @@ core::Result<void> MaterialCatalog::insert_texture(TextureSourceRecord texture) 
     const auto identity = texture.id;
     return insert_unique(textures_, identity, std::move(texture), "texture source");
 }
-
 core::Result<void> MaterialCatalog::replace_texture(TextureSourceRecord texture) {
     if (auto result = texture.validate(); !result) return result;
     const auto found = textures_.find(texture.id);

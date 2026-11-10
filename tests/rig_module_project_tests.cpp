@@ -1,3 +1,5 @@
+#include "project_document_access.hpp"
+
 #include <carto/character/rig_module.hpp>
 #include <carto/journal/journal.hpp>
 #include <carto/kinematic/graph.hpp>
@@ -74,7 +76,9 @@ void erase_v33_character_record_tables(std::string& serialized) {
             "CURVE_EDIT_RECEIPTS 0\n",
             "KINEMATIC_GRAPHS 0\n",
             "ACCEPTED_AUTORIGS 0\n",
-            "UNADMITTED_MODE_KEY_DRAFTS 0\n"}) {
+            "UNADMITTED_MODE_KEY_DRAFTS 0\n",
+            "RIG_TEMPLATE_BINDINGS 0\n",
+            "AGING_LAYERS 0\n"}) {
         const auto record = serialized.find(table);
         require(record != std::string::npos,
             "fixture removes a later character record table");
@@ -202,15 +206,15 @@ void rig_module_library_is_transactional_revisioned_and_migrates() {
     erase_v33_character_record_tables(schema_v30);
     if (const auto control_workspace = schema_v30.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
         schema_v30.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
-    schema_v30.replace(0U, std::string("CARTOGRAPHER_PROJECT 39\n").size(),
+    schema_v30.replace(0U, ("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n").size(),
         "CARTOGRAPHER_PROJECT 30\n");
     const auto migrated_v30 = project::ProjectDocument::deserialize(schema_v30);
     require(migrated_v30 && migrated_v30.value().decal_placements().empty() &&
             migrated_v30.value().authoring_standards().empty() &&
-            migrated_v30.value().serialize().find("CARTOGRAPHER_PROJECT 39\n") == 0U &&
+            migrated_v30.value().serialize().find(("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n")) == 0U &&
             migrated_v30.value().serialize().find("DECAL_PLACEMENTS 0\n") !=
                 std::string::npos,
-        "schema v30 migrates to v38 with empty decal, standards, and character record tables");
+        "schema v30 migrates to the current schema with empty decal, standards, and character record tables");
 
     std::string schema_v29 = project::ProjectDocument{}.serialize();
     const auto table = schema_v29.rfind("RIG_MODULE_TEMPLATES 0\n");
@@ -229,7 +233,7 @@ void rig_module_library_is_transactional_revisioned_and_migrates() {
     erase_v33_character_record_tables(schema_v29);
     const auto header_end = schema_v29.find('\n');
     require(header_end != std::string::npos && schema_v29.substr(0U, header_end) ==
-                "CARTOGRAPHER_PROJECT 39",
+                ("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion)),
         "fixture begins at the expected current schema");
     if (const auto control_workspace = schema_v29.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
         schema_v29.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
@@ -238,15 +242,65 @@ void rig_module_library_is_transactional_revisioned_and_migrates() {
     require(migrated && migrated.value().rig_module_templates().empty() &&
             migrated.value().decal_placements().empty() &&
             migrated.value().authoring_standards().empty() &&
-            migrated.value().serialize().find("CARTOGRAPHER_PROJECT 39\n") == 0U &&
+            migrated.value().serialize().find(("CARTOGRAPHER_PROJECT " + std::to_string(carto::project::ProjectDocument::kSchemaVersion) + "\n")) == 0U &&
             migrated.value().serialize().find("RIG_MODULE_TEMPLATES 0\n") !=
                 std::string::npos,
-        "schema v29 migrates to v38 with empty module, decal, standards, and character record tables");
+        "schema v29 migrates to the current schema with empty module, decal, standards, and character record tables");
+}
+
+void shared_rig_hierarchy_edits_preserve_bindings_atomically() {
+    TempDirectory directory;
+    project::ProjectDocument document;
+    require(static_cast<bool>(document.insert_rig_module_template(serialized(module()))),
+        "fixture inserts a shared rig module");
+    const auto& entry = document.rig_module_templates().at("arm.left");
+    const auto identity = core::Transform::identity();
+    require(static_cast<bool>(document.insert_object({{1U}, "root", identity, std::nullopt, std::nullopt})) &&
+            static_cast<bool>(document.insert_object({{2U}, "intermediate", identity, scene::ObjectId{1U}, std::nullopt})) &&
+            static_cast<bool>(document.insert_object({{3U}, "mapped leaf", identity, scene::ObjectId{2U}, std::nullopt})) &&
+            static_cast<bool>(document.insert_object({{4U}, "outside", identity, std::nullopt, std::nullopt})) &&
+            static_cast<bool>(document.insert_object({{5U}, "unmapped leaf", identity, scene::ObjectId{1U}, std::nullopt})) &&
+            static_cast<bool>(document.insert_object({{6U}, "single root", identity, std::nullopt, std::nullopt})),
+        "fixture inserts the binding hierarchy and an unrelated object");
+    require(static_cast<bool>(document.set_rig_template_binding(
+                {{1U}, "arm.left", entry.revision, entry.digest, "test fixture", 1.0,
+                    {{10U, {1U}}, {11U, {3U}}}})) &&
+            static_cast<bool>(document.set_rig_template_binding(
+                {{6U}, "arm.left", entry.revision, entry.digest, "test fixture", 1.0,
+                    {{10U, {6U}}}})),
+        "fixture binds the root and mapped leaf, plus a singleton root");
+
+    const auto before = document.serialize();
+    const auto project_revision = document.revision();
+    const auto scene_revision = document.scene().revision();
+    require(!document.remove_object({3U}) && !document.remove_object({6U}),
+        "mapped leaf and singleton root removal require an explicit unlink");
+    require(!document.set_rig_part_parent({3U}, {4U}) &&
+            !document.set_rig_part_parent({2U}, {4U}),
+        "moving a mapped leaf or its unmapped ancestor outside the root is rejected");
+    require(document.serialize() == before && document.revision() == project_revision &&
+            document.scene().revision() == scene_revision && document.validate(),
+        "rejected edits preserve document bytes, both revisions, and validity");
+
+    require(static_cast<bool>(document.set_rig_part_parent({3U}, {1U})) &&
+            static_cast<bool>(document.remove_object({5U})) && document.validate(),
+        "valid in-root reparent and unrelated leaf removal succeed");
+    const auto path = directory.path() / "shared-rig-integrity.carto";
+    require(static_cast<bool>(document.save_atomic(path)), "valid shared rig saves");
+    const auto reopened = project::ProjectDocument::load(path);
+    require(reopened && reopened.value().validate() &&
+            reopened.value().rig_template_bindings().size() == 2U &&
+            reopened.value().scene().find({3U})->parent == scene::ObjectId{1U},
+        "valid shared rig hierarchy and bindings survive reopen");
+    require(static_cast<bool>(document.erase_rig_template_binding({1U})) &&
+            static_cast<bool>(document.remove_object({3U})) && document.validate(),
+        "mapped leaf may be removed after its binding is explicitly unlinked");
 }
 
 } // namespace
 
 int main() {
     rig_module_library_is_transactional_revisioned_and_migrates();
+    shared_rig_hierarchy_edits_preserve_bindings_atomically();
     return EXIT_SUCCESS;
 }

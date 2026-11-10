@@ -401,6 +401,37 @@ void require_unique_docking_layout_write_paths() {
         "atomic docking temp files must remain beside the destination");
 }
 
+void require_detached_window_magnetic_snap() {
+    auto& platform=ImGui::GetPlatformIO();auto& io=ImGui::GetIO();
+    const auto config=io.ConfigFlags,backend=io.BackendFlags;
+    auto* main=ImGui::GetMainViewport();
+    ImGuiViewport anchor{},moving{};anchor.ID=0xCA470010;moving.ID=0xCA470011;
+    anchor.Pos={500,350};anchor.Size={450,300};anchor.PlatformHandle=&anchor;
+    moving.Pos={965,400};moving.Size={300,200};moving.DpiScale=1;moving.PlatformHandle=&moving;
+    platform.Viewports.clear();platform.Viewports.push_back(main);platform.Viewports.push_back(&anchor);platform.Viewports.push_back(&moving);
+    ImGuiPlatformMonitor monitor{};monitor.WorkPos={0,0};monitor.WorkSize={1920,1080};platform.Monitors.clear();platform.Monitors.push_back(monitor);
+    const auto target=carto::studio::DockingWorkspace::detached_snap_position(moving,platform);
+    require(target.x==958&&target.y==400,"individual native tool aligns beside another owned window with the declared gap");
+    moving.Pos={990,400};auto free=carto::studio::DockingWorkspace::detached_snap_position(moving,platform);
+    require(free.x==990&&free.y==400,"distant windows must remain freely positioned");
+    moving.Pos={965,900};free=carto::studio::DockingWorkspace::detached_snap_position(moving,platform);
+    require(free.x==965&&free.y==900,"nonoverlapping windows must not attract across the screen");
+    moving.Pos={5,400};free=carto::studio::DockingWorkspace::detached_snap_position(moving,platform);
+    require(free.x==0,"detached window snaps to its current monitor work edge");
+    moving.DpiScale=2;moving.Pos={981,400};free=carto::studio::DockingWorkspace::detached_snap_position(moving,platform);
+    require(free.x==966,"native snap tolerance and gap scale consistently with viewport DPI");
+    moving.DpiScale=1;moving.Pos={-1915,400};platform.Monitors[0].WorkPos={-1920,0};
+    free=carto::studio::DockingWorkspace::detached_snap_position(moving,platform);
+    require(free.x==-1920,"secondary monitor negative coordinates must not be clamped into the main window");
+    platform.Monitors[0].WorkPos={0,0};moving.Pos={965,400};
+    platform.Platform_SetWindowPos=&record_platform_window_position;recovered_platform_position_calls=0;
+    io.ConfigFlags|=ImGuiConfigFlags_ViewportsEnable;io.BackendFlags|=ImGuiBackendFlags_PlatformHasViewports|ImGuiBackendFlags_RendererHasViewports;
+    require(!carto::studio::DockingWorkspace::settle_detached_window(main->ID),"magnetic settling never moves the main application window");
+    require(carto::studio::DockingWorkspace::settle_detached_window(moving.ID)&&recovered_platform_position_calls==1&&recovered_platform_viewport==&moving&&anchor.Pos.x==500,"only the selected detached native window is moved through the backend callback");
+    require(!carto::studio::DockingWorkspace::settle_detached_window(moving.ID)&&recovered_platform_position_calls==1,"settled positions must not repeatedly issue native moves");
+    io.ConfigFlags=config;io.BackendFlags=backend;platform.Platform_SetWindowPos=nullptr;platform.Viewports.clear();platform.Monitors.clear();
+}
+
 void require_docking_layout_load_fail_closed() {
     using Presence = carto::studio::DockingWorkspace::LayoutPresence;
     const std::error_code no_error;
@@ -1245,6 +1276,7 @@ int main() {
     require_docking_monitor_recovery();
     require_live_docking_monitor_recovery();
     require_unique_docking_layout_write_paths();
+    require_detached_window_magnetic_snap();
     require_docking_layout_load_fail_closed();
     require_docking_capture_loss_is_distinguished();
     require_docking_mouse_snap();

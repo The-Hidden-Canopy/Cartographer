@@ -1,4 +1,5 @@
 #include "authoring_justification.hpp"
+#include <carto/production/material_binding.hpp>
 #include <carto/application/application.hpp>
 #include <carto/editor/viewport_interaction.hpp>
 #include <carto/project/recovery.hpp>
@@ -714,8 +715,8 @@ core::Result<assets::TextureSourceAdmission> inspect_project_texture_blob(
     const assets::Sha256Digest& digest,
     assets::TextureSourceFormat expected_format,
     std::uint32_t expected_width,
-    std::uint32_t expected_height) {
-    assets::TextureSourceLimits texture_limits;
+    std::uint32_t expected_height,
+    const assets::TextureSourceLimits& texture_limits = {}) {
     std::error_code error;
     const auto requested_root = project_path.parent_path().empty()
         ? std::filesystem::current_path(error)
@@ -2774,6 +2775,22 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return update_material(value);
             } else if constexpr (std::is_same_v<Action, SetMaterialRegionAssignmentAction>) {
                 return set_material_region_assignment(value);
+            } else if constexpr (std::is_same_v<Action, AssignMaterialToMeshAction>) {
+                return assign_material_to_mesh(value);
+            } else if constexpr (std::is_same_v<Action, ImportRigModuleAction>) {
+                return import_rig_module(value);
+            } else if constexpr (std::is_same_v<Action, ImportGltfMaterialLibraryAction>) {
+                return import_gltf_material_library(value);
+            } else if constexpr (std::is_same_v<Action, ApplyObjectAgingAction>) {
+                return apply_object_aging(value);
+            } else if constexpr (std::is_same_v<Action, RemoveObjectAgingAction>) {
+                return remove_object_aging(value);
+            } else if constexpr (std::is_same_v<Action, ApplySharedRigAction>) {
+                return apply_shared_rig(value);
+            } else if constexpr (std::is_same_v<Action, CaptureSharedRigModuleAction>) {
+                return capture_shared_rig(value);
+            } else if constexpr (std::is_same_v<Action, UnlinkSharedRigAction>) {
+                return unlink_shared_rig(value);
             } else if constexpr (std::is_same_v<Action, GenerateUniqueLightmapUvAction>) {
                 return generate_unique_lightmap_uv(value);
             } else if constexpr (std::is_same_v<Action, PackUvIslandsAction>) {
@@ -10524,6 +10541,89 @@ core::Result<DispatchReceipt> ApplicationSession::set_material_region_assignment
         "Set Material Region Assignment");
 }
 
+core::Result<DispatchReceipt> ApplicationSession::assign_material_to_mesh(
+    const AssignMaterialToMeshAction& action) {
+    if(active_source_!=OperationSource::human)return failure(invalid_state("mesh material assignment requires the human authoring boundary"));
+    if(project_generation_!=action.expected_project_generation||document_.revision()!=action.expected_project_revision)
+        return failure({core::ErrorCode::stale_data,"material assignment snapshot is stale"});
+    const auto* object=document_.scene().find(action.object);
+    if(!object||!object->mesh_asset)return failure({core::ErrorCode::not_found,"material assignment target has no mesh"});
+    if(object->locked||!object->visible)return failure(invalid_state("hidden or locked meshes cannot receive material assignments"));
+    for(const auto& instance:document_.scene().objects_sorted())
+        if(instance.mesh_asset==object->mesh_asset&&instance.locked)
+            return failure(invalid_state("material assignment would affect a locked shared-mesh instance"));
+    auto catalog=document_.material_catalog();const auto material=catalog.materials().find(action.material);
+    if(material==catalog.materials().end())return failure({core::ErrorCode::not_found,"selected material is missing"});
+    if(material->second.revision!=action.expected_material_revision)return failure({core::ErrorCode::stale_data,"selected material revision is stale"});
+    if(auto resolved=catalog.resolve_material(action.material,action.variant);!resolved)return failure(resolved.error());
+    const auto mesh_asset=*object->mesh_asset;const auto& mesh=document_.meshes().at(mesh_asset);
+    auto alias=production::authoring_material_slot_layer(mesh);if(!alias)return failure(alias.error());
+    const std::string layer_id=alias.value().value_or("cartographer.material_slot");
+    const auto faces=mesh.faces_sorted();if(faces.empty())return failure(invalid_state("material assignment requires mesh faces"));
+    std::set<geometry::FaceId> targets(action.faces.begin(),action.faces.end());
+    if(targets.size()!=action.faces.size())return failure({core::ErrorCode::invalid_argument,"material assignment face IDs must be unique"});
+    std::set<geometry::FaceId> valid_faces;for(const auto& face:faces)valid_faces.insert(face.id);
+    for(auto id:targets)if(!valid_faces.contains(id))
+        return failure({core::ErrorCode::stale_data,"material assignment face is not in the target mesh"});
+    std::vector<attributes::AttributeValue> values(faces.size(),std::uint32_t{1});
+    const auto* existing=mesh.attributes().find(layer_id);
+    if(existing) {
+        if(existing->descriptor.domain!=attributes::AttributeDomain::face||existing->descriptor.type!=attributes::AttributeType::uint32||existing->values.size()!=faces.size())
+            return failure({core::ErrorCode::validation_failed,"material slots must be a complete face-domain uint32 table"});
+        values=existing->values;
+    }
+    std::uint32_t highest=0;
+    for(const auto& v:values) {
+        const auto* slot=std::get_if<std::uint32_t>(&v);
+        if(!slot||!*slot)return failure({core::ErrorCode::validation_failed,"material slot IDs must be positive uint32 values"});
+        highest=std::max(highest,*slot);
+    }
+    std::optional<std::uint32_t> reuse;
+    for(const auto& [key,binding]:catalog.assignments())if(key.mesh_asset==mesh_asset) {
+        highest=std::max(highest,key.region_id);
+        if(binding.material==action.material&&binding.variant==action.variant)reuse=key.region_id;
+    }
+    if(!reuse&&highest==std::numeric_limits<std::uint32_t>::max())return failure(invalid_state("material slot IDs exhausted"));
+    const std::uint32_t slot=reuse.value_or(!existing&&targets.empty()?1U:highest+1U);
+    bool changed=!existing;
+    for(std::size_t i=0;i<faces.size();++i)if(targets.empty()||targets.contains(faces[i].id)) {
+        changed=changed||std::get<std::uint32_t>(values[i])!=slot;values[i]=slot;
+    }
+    if(!reuse) {
+        if(auto result=catalog.insert_assignment({{mesh_asset,slot},action.material,action.variant});!result)return failure(result.error());
+        changed=true;
+    }
+    if(!changed)return accepted("Assign Material (No Change)",document_.revision());
+    auto attrs=mesh.attributes();
+    if(existing)if(auto result=attrs.remove_layer(layer_id);!result)return failure(result.error());
+    if(auto result=attrs.set_domain_count(attributes::AttributeDomain::face,faces.size());!result)return failure(result.error());
+    if(auto result=attrs.add_layer({{layer_id,attributes::AttributeDomain::face,attributes::AttributeType::uint32},std::move(values)});!result)return failure(result.error());
+    auto updated=mesh;if(auto result=updated.set_attribute_payload(std::move(attrs),mesh.uv_sets());!result)return failure(result.error());
+    std::set<std::uint32_t> remaining_slots;
+    for(const auto& value:updated.attributes().find(layer_id)->values)remaining_slots.insert(std::get<std::uint32_t>(value));
+    std::vector<project::MaterialRegionKey> obsolete;
+    for(const auto& [key,binding]:catalog.assignments()) {
+        static_cast<void>(binding);
+        if(key.mesh_asset==mesh_asset&&!remaining_slots.contains(key.region_id))obsolete.push_back(key);
+    }
+    for(const auto& key:obsolete)if(auto result=catalog.erase_assignment(key);!result)return failure(result.error());
+    auto candidate=document_;
+    // Stage without this asset's old bindings so each private mutation retains
+    // its own validation. Only the final whole-document command is published.
+    auto interim=document_.material_catalog();std::vector<project::MaterialRegionKey> previous_keys;
+    for(const auto& [key,binding]:interim.assignments()) {
+        static_cast<void>(binding);if(key.mesh_asset==mesh_asset)previous_keys.push_back(key);
+    }
+    for(const auto& key:previous_keys)if(auto result=interim.erase_assignment(key);!result)return failure(result.error());
+    if(auto result=candidate.set_material_catalog(std::move(interim));!result)return failure(result.error());
+    if(auto result=candidate.replace_mesh(mesh_asset,std::move(updated));!result)return failure(result.error());
+    if(auto result=candidate.set_material_catalog(std::move(catalog));!result)return failure(result.error());
+    if(auto result=candidate.validate();!result)return failure(result.error());
+    editor::ProjectCommandAdmission admission;
+    return execute_command(std::make_unique<editor::ReplaceProjectDocumentCommand>(admission,document_,std::move(candidate),"Assign Material to Mesh"),
+        "Assign Material to Mesh",AffectedSet{{action.object},{},{},{}});
+}
+
 core::Result<DispatchReceipt> ApplicationSession::generate_unique_lightmap_uv(
     const GenerateUniqueLightmapUvAction& action) {
     if (active_source_ != OperationSource::human &&
@@ -11780,6 +11880,27 @@ core::Result<DispatchReceipt> ApplicationSession::set_presentation_catalog(
             "scene presentation edit contains no changes"));
     }
 
+    if (after.environment()) {
+        const auto& next = *after.environment();
+        if (before.environment() && before.environment()->identity == next.identity) {
+            const auto& previous = *before.environment();
+            auto normalized = next;
+            normalized.revision = previous.revision;
+            project::PresentationCatalog a, b;
+            static_cast<void>(a.set_environment(previous));
+            static_cast<void>(b.set_environment(std::move(normalized)));
+            const bool changed = a.serialize() != b.serialize();
+            if ((changed && previous.revision.exhausted()) ||
+                next.revision != (changed ? previous.revision.next() : previous.revision)) {
+                return failure(core::Diagnostic(core::ErrorCode::stale_data,
+                    "environment revision must advance exactly once when its source changes"));
+            }
+        } else if (next.revision != core::Revision{1U}) {
+            return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+                "new environment sources must begin at revision one"));
+        }
+    }
+
     const auto camera_record = [](project::AuthoredCamera camera) {
         project::PresentationCatalog single;
         if (!single.insert_camera(std::move(camera))) return std::string{};
@@ -12404,6 +12525,83 @@ void ApplicationSession::reset_editor_state() noexcept {
     last_tool_action_.reset();
     last_tool_context_.reset();
     native_operation_trace_.clear();
+}
+
+core::Result<project::ProjectDocument> ApplicationSession::authoring_viewport_source(
+    core::Revision expected_revision) const {
+    if (document_.revision() != expected_revision)
+        return core::Result<project::ProjectDocument>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data, "GPU viewport snapshot revision is stale"));
+    return core::Result<project::ProjectDocument>::success(project::ProjectDocument(document_));
+}
+
+core::Result<production::AuthoringViewportRequest> ApplicationSession::prepare_authoring_viewport_request(
+    const production::AuthoringViewportRequest& request, core::Revision expected_revision) const {
+    if (document_.revision() != expected_revision) {
+        return core::Result<production::AuthoringViewportRequest>::failure(
+            core::Diagnostic(core::ErrorCode::stale_data,
+                             "viewport request does not match the current project revision"));
+    }
+    if (request.width == 0U || request.height == 0U)
+        return core::Result<production::AuthoringViewportRequest>::success(request);
+    auto resolved_request = request;
+    if (!resolved_request.textures) {
+        std::set<assets::TextureAssetId> used;
+        const auto &catalog = document_.material_catalog();
+        for (const auto &object : document_.scene().objects_sorted()) {
+            if (!object.visible || !object.mesh_asset)
+                continue;
+            for (const auto &[key, assignment] : catalog.assignments())
+                if (key.mesh_asset == *object.mesh_asset) {
+                    auto material =
+                        catalog.resolve_material(assignment.material, assignment.variant);
+                    if (!material)
+                        return core::Result<production::AuthoringViewportRequest>::failure(
+                            material.error());
+                    const auto &m = material.value();
+                    for (const auto *ref : {&m.base_color, &m.metallic_roughness, &m.normal,
+                                            &m.occlusion, &m.emissive})
+                        if (*ref)
+                            used.insert(ref->asset);
+                }
+        }
+        if (!used.empty()) {
+            using Result = core::Result<production::AuthoringViewportRequest>;
+            if (!project_path_)
+                return Result::failure({core::ErrorCode::invalid_state,
+                                        "save the project before loading material texture pixels"});
+            auto library = std::make_shared<production::AuthoringTextureLibrary>();
+            const auto texture_limits = production::authoring_texture_limits();
+            assets::BlobStore store(project_path_->parent_path() / ".carto-assets" / "source-blobs",
+                                    {texture_limits.max_source_bytes, 256U});
+            for (auto id : used) {
+                const auto source = catalog.textures().find(id);
+                if (source == catalog.textures().end())
+                    return Result::failure(
+                        {core::ErrorCode::not_found, "material texture source is missing"});
+                const auto &texture = source->second;
+                auto inspected = inspect_project_texture_blob(
+                    *project_path_, texture.content_digest, texture.format, texture.width,
+                    texture.height, texture_limits);
+                if (!inspected)
+                    return Result::failure(inspected.error());
+                auto encoded = store.read(texture.content_digest);
+                if (!encoded)
+                    return Result::failure(encoded.error());
+                if (auto admitted = library->admit(texture, encoded.value()); !admitted)
+                    return Result::failure(admitted.error());
+            }
+            resolved_request.textures = std::move(library);
+        }
+    }
+    return core::Result<production::AuthoringViewportRequest>::success(std::move(resolved_request));
+}
+
+core::Result<production::AuthoringViewportImage> ApplicationSession::render_authoring_viewport(
+    const production::AuthoringViewportRequest& request, core::Revision expected_revision) const {
+    auto prepared=prepare_authoring_viewport_request(request,expected_revision);
+    if(!prepared) return core::Result<production::AuthoringViewportImage>::failure(prepared.error());
+    return production::render_authoring_viewport(document_,prepared.value());
 }
 
 ApplicationSnapshot ApplicationSession::snapshot() const {

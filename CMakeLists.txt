@@ -19,7 +19,10 @@ set(CARTO_GLSLC_EXECUTABLE "" CACHE FILEPATH
 option(CARTO_ENABLE_D3D12 "Enable the optional Windows D3D12 render backend" OFF)
 option(CARTO_BUILD_D3D12_DESKTOP
     "Build the optional native Win32/D3D12 presentation shell" OFF)
-option(CARTO_BUILD_DESKTOP "Build the optional Dear ImGui/Vulkan desktop shell" OFF)
+option(CARTO_BUILD_DESKTOP "Build the optional Dear ImGui desktop shell" OFF)
+option(CARTO_DESKTOP_D3D12_UI "Use the same-device D3D12 workbench presentation route" OFF)
+option(CARTO_DESKTOP_D3D12_COMPILE_CHECK "Compile and link the gated D3D12 desktop without enabling it to run" OFF)
+option(CARTO_DESKTOP_D3D12_DEBUG "Enable D3D12 debug validation in the native workbench" OFF)
 set(CARTO_IMGUI_ROOT "" CACHE PATH "Path to a pinned Dear ImGui source tree")
 option(CARTO_USE_BUNDLED_IMGUI
     "Use the pinned public Dear ImGui source included in third_party/imgui" ON)
@@ -205,8 +208,18 @@ if(CARTO_BUILD_DESKTOP)
     if(NOT WIN32)
         message(FATAL_ERROR "CARTO_BUILD_DESKTOP=ON requires the Windows platform")
     endif()
-    if(NOT CARTO_ENABLE_VULKAN)
-        message(FATAL_ERROR "CARTO_BUILD_DESKTOP=ON requires CARTO_ENABLE_VULKAN=ON")
+    if(CARTO_DESKTOP_D3D12_UI)
+        if(NOT CARTO_ENABLE_D3D12)
+            message(FATAL_ERROR "CARTO_DESKTOP_D3D12_UI requires CARTO_ENABLE_D3D12=ON")
+        endif()
+        if(NOT CARTO_DESKTOP_D3D12_COMPILE_CHECK)
+            message(FATAL_ERROR
+                "CARTO_DESKTOP_D3D12_UI is disabled pending native lifecycle and visual validation")
+        endif()
+    elseif(CARTO_DESKTOP_D3D12_COMPILE_CHECK)
+        message(FATAL_ERROR "CARTO_DESKTOP_D3D12_COMPILE_CHECK requires CARTO_DESKTOP_D3D12_UI=ON")
+    elseif(NOT CARTO_ENABLE_VULKAN)
+        message(FATAL_ERROR "The Vulkan desktop route requires CARTO_ENABLE_VULKAN=ON")
     endif()
     set(_carto_imgui_required_files
         imgui.h
@@ -216,9 +229,13 @@ if(CARTO_BUILD_DESKTOP)
         imgui_widgets.cpp
         backends/imgui_impl_win32.h
         backends/imgui_impl_win32.cpp
-        backends/imgui_impl_vulkan.h
-        backends/imgui_impl_vulkan.cpp
     )
+    if(CARTO_DESKTOP_D3D12_UI)
+        list(APPEND _carto_imgui_required_files backends/imgui_impl_dx12.h backends/imgui_impl_dx12.cpp
+            backends/carto_dx12_frame_admission.hpp)
+    else()
+        list(APPEND _carto_imgui_required_files backends/imgui_impl_vulkan.h backends/imgui_impl_vulkan.cpp)
+    endif()
     set(_carto_imgui_missing_files)
     foreach(_carto_imgui_required_file IN LISTS _carto_imgui_required_files)
         if(NOT EXISTS "${CARTO_IMGUI_ROOT}/${_carto_imgui_required_file}")

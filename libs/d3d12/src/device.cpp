@@ -1,4 +1,5 @@
 #include <carto/d3d12/device.hpp>
+#include <carto/d3d12/bounded_fence_wait.hpp>
 #include <carto/assets/blob_store.hpp>
 
 #ifndef NOMINMAX
@@ -12,15 +13,19 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <mutex>
+#include <new>
 #include <optional>
-#include <sstream>
 #include <span>
+#include <sstream>
 #include <type_traits>
 #include <utility>
 
@@ -468,6 +473,107 @@ core::Result<device::ShaderBinary> compile_hlsl(const ShaderSource& source) {
 #endif
 }
 
+core::Result<std::string> dxc_runtime_fingerprint() {
+#if !CARTO_D3D12_HAS_DXC
+    return core::Result<std::string>::failure(unsupported("DXC headers unavailable"));
+#else
+    DxcModuleGuard guard{load_dxc_module()};
+    std::array<wchar_t, 32768> name{};
+    const auto length = guard.module ? GetModuleFileNameW(guard.module, name.data(),
+                                                          static_cast<DWORD>(name.size()))
+                                     : 0;
+    if (!length || length >= name.size())
+        return core::Result<std::string>::failure(unsupported("DXC runtime identity unavailable"));
+    const std::filesystem::path compiler(std::wstring(name.data(), length));
+    // Cache only the compiler/validator pair from the selected runtime folder.
+    // Missing validator identity disables persistent caching, not compilation.
+    std::string combined = "cartographer-dxc-runtime-v1";
+    static std::mutex mutex;
+    static std::map<
+        std::filesystem::path,
+        std::pair<std::pair<std::uintmax_t, std::filesystem::file_time_type>, std::string>>
+        known;
+    std::lock_guard lock(mutex);
+    for (const auto &path : {compiler, compiler.parent_path() / L"dxil.dll"}) {
+        std::error_code error;
+        const auto size = std::filesystem::file_size(path, error);
+        if (error || !size || size > 128U * 1024U * 1024U)
+            return core::Result<std::string>::failure(
+                unsupported("DXC compiler/validator identity exceeds bounds or is unavailable"));
+        const auto time = std::filesystem::last_write_time(path, error);
+        if (error)
+            return core::Result<std::string>::failure(
+                unsupported("DXC runtime timestamp unavailable"));
+        const auto stamp = std::pair{size, time};
+        auto found = known.find(path);
+        if (found == known.end() || found->second.first != stamp) {
+            std::ifstream file(path, std::ios::binary);
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+            if (!file.read(reinterpret_cast<char *>(bytes.data()),
+                           static_cast<std::streamsize>(size)))
+                return core::Result<std::string>::failure(
+                    unsupported("DXC runtime fingerprint read failed"));
+            found =
+                known.insert_or_assign(path, std::pair{stamp, assets::sha256(bytes).hex()}).first;
+        }
+        combined += found->second.second;
+    }
+    return core::Result<std::string>::success(
+        assets::sha256(
+            std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t *>(combined.data()),
+                                          combined.size()})
+            .hex());
+#endif
+}
+core::Result<void> validate_dxil(std::span<const std::uint8_t> bytes) {
+#if !CARTO_D3D12_HAS_DXC
+    static_cast<void>(bytes);
+    return core::Result<void>::failure(unsupported("DXC headers unavailable"));
+#else
+    if (bytes.empty() || bytes.size() > 16U * 1024U * 1024U)
+        return core::Result<void>::failure(invalid("DXIL validation byte budget exceeded"));
+    DxcModuleGuard guard{load_dxc_module()};
+    const auto create = guard.module ? reinterpret_cast<DxcCreateInstanceProc>(
+                                           GetProcAddress(guard.module, "DxcCreateInstance"))
+                                     : nullptr;
+    if (!create)
+        return core::Result<void>::failure(unsupported("DXC validation runtime unavailable"));
+    std::array<wchar_t, 32768> module_name{};
+    const auto length = GetModuleFileNameW(guard.module, module_name.data(),
+                                           static_cast<DWORD>(module_name.size()));
+    const auto validator_path =
+        std::filesystem::path(std::wstring(module_name.data(), length)).parent_path() / L"dxil.dll";
+    DxcModuleGuard validator_guard{
+        length && length < module_name.size()
+            ? LoadLibraryExW(validator_path.c_str(), nullptr,
+                             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)
+            : nullptr};
+    const auto validator_create =
+        validator_guard.module ? reinterpret_cast<DxcCreateInstanceProc>(
+                                     GetProcAddress(validator_guard.module, "DxcCreateInstance"))
+                               : nullptr;
+    ComPtr<IDxcUtils> utils;
+    ComPtr<IDxcValidator> validator;
+    constexpr GUID validator_id = {
+        0xa6e82bd2, 0x1fd7, 0x4826, {0x98, 0x11, 0x28, 0x57, 0xe7, 0x97, 0xf4, 0x9a}};
+    if (FAILED(create(CLSID_DxcUtils, kIidDxcUtils,
+                      reinterpret_cast<void **>(utils.GetAddressOf()))) ||
+        !validator_create ||
+        FAILED(validator_create(CLSID_DxcValidator, validator_id,
+                                reinterpret_cast<void **>(validator.GetAddressOf()))))
+        return core::Result<void>::failure(unsupported("DXC validator creation failed"));
+    ComPtr<IDxcBlobEncoding> blob;
+    if (FAILED(utils->CreateBlob(bytes.data(), static_cast<UINT32>(bytes.size()), 0, &blob)))
+        return core::Result<void>::failure(validation("DXIL cache blob creation failed"));
+    ComPtr<IDxcOperationResult> result;
+    HRESULT status = E_FAIL;
+    if (FAILED(validator->Validate(blob.Get(), 0, &result)) || !result ||
+        FAILED(result->GetStatus(&status)) || FAILED(status))
+        return core::Result<void>::failure(validation("DXIL cache validator rejected binary"));
+    return core::Result<void>::success();
+#endif
+}
+
 struct D3D12Device::Impl {
     struct DescriptorLease {
         std::vector<UINT>* free_indices = nullptr;
@@ -605,6 +711,7 @@ struct D3D12Device::Impl {
     gpu::SubmissionSerial last_submitted = 0U;
     mutable gpu::SubmissionSerial completed = 0U;
     mutable std::map<gpu::SubmissionSerial, gpu::QueueType> pending;
+    mutable detail::UnsignaledExecution unsignaled_execution;
 
     mutable gpu::DeferredDestructionQueue deferred_destruction;
     mutable std::vector<std::string> debug_receipts;
@@ -670,6 +777,11 @@ struct D3D12Device::Impl {
 };
 
 core::Result<std::unique_ptr<D3D12Device>> D3D12Device::create(D3D12DeviceOptions options) {
+    if (options.fence_wait_timeout <= std::chrono::milliseconds::zero() ||
+        options.fence_wait_timeout > std::chrono::minutes(10)) {
+        return core::Result<std::unique_ptr<D3D12Device>>::failure(Diagnostic(
+            ErrorCode::invalid_argument, "D3D12 fence wait timeout must be between 1 ms and 10 minutes"));
+    }
     auto impl = std::make_unique<Impl>();
     impl->options = std::move(options);
 
@@ -897,7 +1009,21 @@ D3D12Device::~D3D12Device() {
     // reference them. Device removal is already terminal, so there is no
     // meaningful fence wait in that case.
     if (impl_ != nullptr && !impl_->device_lost) {
-        static_cast<void>(wait_idle());
+        try {
+            if (impl_->unsignaled_execution.active()) {
+                static_cast<void>(resolve_unsignaled_execution());
+            }
+            if (impl_->device_lost || wait_idle()) return;
+        } catch (...) {
+            if (impl_->device_lost) return;
+        }
+        if (impl_->device_lost) return;
+        if (impl_ != nullptr) {
+            // No verified retirement boundary: intentionally preserve the
+            // entire native owner until process teardown rather than release
+            // resources or allocators that the GPU may still reference.
+            static_cast<void>(impl_.release());
+        }
     }
 }
 
@@ -973,9 +1099,10 @@ core::Result<gpu::TextureHandle> D3D12Device::create_texture(const gpu::TextureD
     std::shared_ptr<Impl::DescriptorLease> rtv_lease;
     std::shared_ptr<Impl::DescriptorLease> dsv_lease;
     if (gpu::has_usage(descriptor.usage, gpu::TextureUsage::sampled)) {
-        if (gpu::is_depth_format(descriptor.format)) {
-            return core::Result<gpu::TextureHandle>::failure(unsupported(
-                "D3D12 sampled textures currently require a color format"));
+        if (gpu::is_depth_format(descriptor.format) &&
+            descriptor.format != gpu::Format::depth32_float) {
+            return core::Result<gpu::TextureHandle>::failure(
+                unsupported("D3D12 sampled depth supports only depth32_float"));
         }
         auto lease = impl_->acquire_descriptor(
             impl_->free_srv, impl_->next_srv, Impl::descriptor_capacity, "SRV");
@@ -1025,7 +1152,10 @@ core::Result<gpu::TextureHandle> D3D12Device::create_texture(const gpu::TextureD
     resource.Height = descriptor.height;
     resource.DepthOrArraySize = static_cast<UINT16>(descriptor.layers);
     resource.MipLevels = static_cast<UINT16>(descriptor.mip_levels);
-    resource.Format = native_format;
+    resource.Format = descriptor.format == gpu::Format::depth32_float &&
+                              gpu::has_usage(descriptor.usage, gpu::TextureUsage::sampled)
+                          ? DXGI_FORMAT_R32_TYPELESS
+                          : native_format;
     resource.SampleDesc.Count = 1U;
     resource.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     resource.Flags = flags;
@@ -1068,7 +1198,8 @@ core::Result<gpu::TextureHandle> D3D12Device::create_texture(const gpu::TextureD
         value.srv_gpu.ptr = gpu_start.ptr +
             static_cast<UINT64>(value.srv_lease->index) * impl_->srv_increment;
         D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-        view.Format = native_format;
+        view.Format =
+            descriptor.format == gpu::Format::depth32_float ? DXGI_FORMAT_R32_FLOAT : native_format;
         view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         view.Texture2D.MostDetailedMip = 0U;
@@ -1102,7 +1233,10 @@ core::Result<gpu::TextureHandle> D3D12Device::create_texture(const gpu::TextureD
         const auto start = impl_->dsv_heap->GetCPUDescriptorHandleForHeapStart();
         value.dsv.ptr = start.ptr +
             static_cast<SIZE_T>(value.dsv_lease->index) * impl_->dsv_increment;
-        impl_->device->CreateDepthStencilView(value.resource.Get(), nullptr, value.dsv);
+        D3D12_DEPTH_STENCIL_VIEW_DESC view{};
+        view.Format = native_format;
+        view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        impl_->device->CreateDepthStencilView(value.resource.Get(), &view, value.dsv);
         value.has_dsv = true;
     }
     auto handle = impl_->textures.insert(std::move(value));
@@ -1283,7 +1417,20 @@ core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
     if (impl_->device_lost) {
         return core::Result<gpu::PipelineHandle>::failure(device_lost_failure());
     }
-    if (auto result = gpu::validate(descriptor); !result) {
+    // Opaque handles cannot establish compute/graphics intent. Resolve actual
+    // registry metadata before applying the shared stage-aware contract.
+    if (descriptor.shaders.size() > 3U) {
+        return core::Result<gpu::PipelineHandle>::failure(validation(
+            "D3D12 pipeline shader count exceeds the supported stage bound"));
+    }
+    std::vector<gpu::ShaderStage> resolved_stages;
+    resolved_stages.reserve(descriptor.shaders.size());
+    for (const auto handle : descriptor.shaders) {
+        const auto shader = impl_->shaders.resolve(handle);
+        if (!shader) return core::Result<gpu::PipelineHandle>::failure(shader.error());
+        resolved_stages.push_back(shader.value()->descriptor.stage);
+    }
+    if (auto result = gpu::validate(descriptor, resolved_stages); !result) {
         return core::Result<gpu::PipelineHandle>::failure(result.error());
     }
     if (descriptor.sample_count != 1U) {
@@ -1295,11 +1442,8 @@ core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
             "D3D12 graphics resource tables support at most nine sampled textures"));
     }
     const bool has_multi_sampled_bindings = descriptor.sampled_texture_count != 0U;
-    const bool has_compute_shader = std::any_of(
-        descriptor.shaders.begin(), descriptor.shaders.end(), [this](gpu::ShaderHandle handle) {
-            const auto shader = impl_->shaders.resolve(handle);
-            return shader && shader.value()->descriptor.stage == gpu::ShaderStage::compute;
-        });
+    const bool has_compute_shader = resolved_stages.size() == 1U &&
+        resolved_stages.front() == gpu::ShaderStage::compute;
     if (descriptor.sampled_sampler_count > 7U) {
         return core::Result<gpu::PipelineHandle>::failure(unsupported(
             "D3D12 graphics resource tables support at most seven sampled samplers"));
@@ -1372,9 +1516,9 @@ core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
             return core::Result<gpu::PipelineHandle>::failure(validation(
                 "D3D12 compute resource bindings must be staged for compute"));
         }
-        if (descriptor.sampled_texture_count > 3U) {
-            return core::Result<gpu::PipelineHandle>::failure(unsupported(
-                "D3D12 compute pipelines support at most three sampled textures"));
+        if (descriptor.sampled_texture_count > 7U) {
+            return core::Result<gpu::PipelineHandle>::failure(
+                unsupported("D3D12 compute pipelines support at most seven sampled textures"));
         }
         for (const auto& binding : descriptor.descriptor_bindings) {
             if (!gpu::has_stage(binding.stages, gpu::ShaderStage::compute)) {
@@ -1395,8 +1539,8 @@ core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
         Impl::PipelineResource value{};
         value.descriptor = descriptor;
         value.compute = true;
-        std::array<D3D12_ROOT_PARAMETER, 5U> root_parameters{};
-        std::array<D3D12_DESCRIPTOR_RANGE, 4U> descriptor_ranges{};
+        std::array<D3D12_ROOT_PARAMETER, 9U> root_parameters{};
+        std::array<D3D12_DESCRIPTOR_RANGE, 8U> descriptor_ranges{};
         UINT root_parameter_count = 0U;
         D3D12_ROOT_SIGNATURE_DESC root_descriptor{};
         if (descriptor.push_constant_bytes != 0U) {
@@ -1726,6 +1870,8 @@ core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
 }
 
 core::Result<void> D3D12Device::destroy_buffer(gpu::BufferHandle handle) {
+    if (impl_->unsignaled_execution.active() && !impl_->device_lost)
+        return core::Result<void>::failure(Diagnostic(ErrorCode::invalid_state, "D3D12 execution is quarantined until its queue marker is confirmed"));
     static_cast<void>(completed_serial());
     auto value = impl_->buffers.resolve(handle);
     if (!value) return core::Result<void>::failure(value.error());
@@ -1742,6 +1888,8 @@ core::Result<void> D3D12Device::destroy_buffer(gpu::BufferHandle handle) {
 }
 
 core::Result<void> D3D12Device::destroy_texture(gpu::TextureHandle handle) {
+    if (impl_->unsignaled_execution.active() && !impl_->device_lost)
+        return core::Result<void>::failure(Diagnostic(ErrorCode::invalid_state, "D3D12 execution is quarantined until its queue marker is confirmed"));
     static_cast<void>(completed_serial());
     auto value = impl_->textures.resolve(handle);
     if (!value) return core::Result<void>::failure(value.error());
@@ -1758,6 +1906,8 @@ core::Result<void> D3D12Device::destroy_texture(gpu::TextureHandle handle) {
 }
 
 core::Result<void> D3D12Device::destroy_sampler(gpu::SamplerHandle handle) {
+    if (impl_->unsignaled_execution.active() && !impl_->device_lost)
+        return core::Result<void>::failure(Diagnostic(ErrorCode::invalid_state, "D3D12 execution is quarantined until its queue marker is confirmed"));
     static_cast<void>(completed_serial());
     auto value = impl_->samplers.resolve(handle);
     if (!value) return core::Result<void>::failure(value.error());
@@ -1772,6 +1922,8 @@ core::Result<void> D3D12Device::destroy_sampler(gpu::SamplerHandle handle) {
 }
 
 core::Result<void> D3D12Device::destroy_shader(gpu::ShaderHandle handle) {
+    if (impl_->unsignaled_execution.active() && !impl_->device_lost)
+        return core::Result<void>::failure(Diagnostic(ErrorCode::invalid_state, "D3D12 execution is quarantined until its queue marker is confirmed"));
     static_cast<void>(completed_serial());
     auto value = impl_->shaders.resolve(handle);
     if (!value) return core::Result<void>::failure(value.error());
@@ -1786,6 +1938,8 @@ core::Result<void> D3D12Device::destroy_shader(gpu::ShaderHandle handle) {
 }
 
 core::Result<void> D3D12Device::destroy_pipeline(gpu::PipelineHandle handle) {
+    if (impl_->unsignaled_execution.active() && !impl_->device_lost)
+        return core::Result<void>::failure(Diagnostic(ErrorCode::invalid_state, "D3D12 execution is quarantined until its queue marker is confirmed"));
     static_cast<void>(completed_serial());
     auto value = impl_->pipelines.resolve(handle);
     if (!value) return core::Result<void>::failure(value.error());
@@ -1804,6 +1958,8 @@ core::Result<void> D3D12Device::write_buffer(
     std::uint64_t offset,
     std::span<const std::uint8_t> bytes) {
     if (impl_->device_lost) return core::Result<void>::failure(device_lost_failure());
+    if (impl_->unsignaled_execution.active())
+        return core::Result<void>::failure(Diagnostic(ErrorCode::invalid_state, "D3D12 execution remains quarantined"));
     auto result = impl_->buffers.resolve(handle);
     if (!result) return core::Result<void>::failure(result.error());
     if (result.value()->descriptor.memory != gpu::MemoryClass::upload) {
@@ -1828,9 +1984,23 @@ core::Result<std::vector<std::uint8_t>> D3D12Device::read_buffer(
     gpu::BufferHandle handle,
     std::uint64_t offset,
     std::uint64_t bytes) const {
+    ReadbackHostTiming timing;
+    return read_buffer_timed(handle, offset, bytes, timing);
+}
+
+core::Result<std::vector<std::uint8_t>> D3D12Device::read_buffer_timed(
+    gpu::BufferHandle handle, std::uint64_t offset, std::uint64_t bytes,
+    ReadbackHostTiming& timing) const {
+    using ReadClock = std::chrono::steady_clock;
+    const auto ms = [](ReadClock::time_point start) {
+        return std::chrono::duration<double, std::milli>(ReadClock::now()-start).count();
+    };
+    timing = {};
     if (impl_->device_lost) {
         return core::Result<std::vector<std::uint8_t>>::failure(device_lost_failure());
     }
+    if (impl_->unsignaled_execution.active())
+        return core::Result<std::vector<std::uint8_t>>::failure(Diagnostic(ErrorCode::invalid_state, "D3D12 execution remains quarantined"));
     auto result = impl_->buffers.resolve(handle);
     if (!result) return core::Result<std::vector<std::uint8_t>>::failure(result.error());
     if (result.value()->descriptor.memory != gpu::MemoryClass::readback) {
@@ -1845,17 +2015,65 @@ core::Result<std::vector<std::uint8_t>> D3D12Device::read_buffer(
     }
     void* mapped = nullptr;
     const D3D12_RANGE read_range{offset, offset + bytes};
+    const auto map_started = ReadClock::now();
     const HRESULT status = result.value()->resource->Map(0U, &read_range, &mapped);
+    timing.map_ms = ms(map_started);
     if (FAILED(status)) {
         return core::Result<std::vector<std::uint8_t>>::failure(
             native_failure("Map(readback)", status));
     }
+    const auto allocation_started = ReadClock::now();
     std::vector<std::uint8_t> output(static_cast<std::size_t>(bytes));
+    timing.allocation_ms = ms(allocation_started);
+    const auto copy_started = ReadClock::now();
     std::memcpy(output.data(), static_cast<const std::uint8_t*>(mapped) + offset, output.size());
+    timing.copy_ms = ms(copy_started);
     // This is a CPU read from a READBACK heap; an empty written range tells
     // D3D12 that the CPU did not modify the resource while it was mapped.
-    result.value()->resource->Unmap(0U, nullptr);
+    const auto unmap_started = ReadClock::now();
+    const D3D12_RANGE written{0, 0};
+    result.value()->resource->Unmap(0U, &written);
+    timing.unmap_ms = ms(unmap_started);
     return core::Result<std::vector<std::uint8_t>>::success(std::move(output));
+}
+
+core::Result<void> D3D12Device::visit_readback(
+    gpu::BufferHandle handle, std::uint64_t offset, std::uint64_t bytes,
+    const std::function<core::Result<void>(std::span<const std::uint8_t>)>& visitor,
+    ReadbackHostTiming& timing) const {
+    using Result = core::Result<void>;
+    using ReadClock = std::chrono::steady_clock;
+    const auto ms = [](ReadClock::time_point start) {
+        return std::chrono::duration<double, std::milli>(ReadClock::now()-start).count();
+    };
+    timing = {};
+    if (impl_->device_lost) return Result::failure(device_lost_failure());
+    if (impl_->unsignaled_execution.active())
+        return Result::failure(Diagnostic(ErrorCode::invalid_state, "D3D12 execution remains quarantined"));
+    auto resource = impl_->buffers.resolve(handle);
+    if (!resource) return Result::failure(resource.error());
+    if (resource.value()->descriptor.memory != gpu::MemoryClass::readback || !visitor ||
+        offset > resource.value()->descriptor.bytes ||
+        bytes > resource.value()->descriptor.bytes-offset ||
+        bytes > std::numeric_limits<std::size_t>::max())
+        return Result::failure(invalid("D3D12 mapped readback range/visitor is invalid"));
+    void* mapped = nullptr;
+    const D3D12_RANGE range{offset, offset+bytes};
+    const auto map_started = ReadClock::now();
+    const HRESULT status = resource.value()->resource->Map(0U, &range, &mapped);
+    timing.map_ms = ms(map_started);
+    if (FAILED(status)) return Result::failure(native_failure("Map(readback visitor)", status));
+    struct Unmap {
+        ID3D12Resource* resource;
+        ReadbackHostTiming& timing;
+        ~Unmap() {
+            const auto start = ReadClock::now();
+            const D3D12_RANGE written{0, 0};
+            resource->Unmap(0U, &written);
+            timing.unmap_ms = std::chrono::duration<double, std::milli>(ReadClock::now()-start).count();
+        }
+    } unmap{resource.value()->resource.Get(), timing};
+    return visitor({static_cast<const std::uint8_t*>(mapped)+offset, static_cast<std::size_t>(bytes)});
 }
 
 core::Result<std::vector<float>> D3D12Device::read_texture_float32(
@@ -1865,6 +2083,8 @@ core::Result<std::vector<float>> D3D12Device::read_texture_float32(
     if (impl_->device_lost) {
         return core::Result<std::vector<float>>::failure(device_lost_failure());
     }
+    if (impl_->unsignaled_execution.active())
+        return core::Result<std::vector<float>>::failure(Diagnostic(ErrorCode::invalid_state, "D3D12 execution remains quarantined"));
     auto texture = impl_->textures.resolve(handle);
     if (!texture) {
         return core::Result<std::vector<float>>::failure(texture.error());
@@ -1980,49 +2200,188 @@ core::Result<void> D3D12Device::wait_idle() {
             ErrorCode::invalid_state,
             "D3D12 device is lost; cannot wait for queue idle"));
     }
-    while (!impl_->pending.empty()) {
-        const gpu::SubmissionSerial serial = impl_->pending.begin()->first;
+    if (impl_->unsignaled_execution.active() && !impl_->unsignaled_execution.marker_confirmed()) {
+        return core::Result<void>::failure(Diagnostic(ErrorCode::invalid_state,
+            "D3D12 executed work has no confirmed queue marker"));
+    }
+    if (!impl_->pending.empty()) {
+        const gpu::SubmissionSerial serial = impl_->pending.rbegin()->first;
         if (auto result = wait(serial); !result) return result;
     }
     static_cast<void>(completed_serial());
     return core::Result<void>::success();
 }
 
+core::Result<void> D3D12Device::resolve_unsignaled_execution() {
+    if (impl_->device_lost) return core::Result<void>::failure(device_lost_failure());
+    auto& state = impl_->unsignaled_execution;
+    if (!state.active() || state.marker_confirmed()) return core::Result<void>::success();
+    if (impl_->next_serial >= std::numeric_limits<gpu::SubmissionSerial>::max() - 1U)
+        return core::Result<void>::failure(Diagnostic(ErrorCode::invalid_state,
+            "D3D12 cannot allocate a recovery fence serial"));
+    const auto previous = state.serial();
+    const auto queue_type = state.queue();
+    auto& queue = impl_->queues.at(queue_type);
+    const auto serial = ++impl_->next_serial;
+    try {
+        if (!impl_->pending.emplace(serial, queue_type).second)
+            return core::Result<void>::failure(Diagnostic(ErrorCode::invalid_state,
+                "D3D12 recovery serial is already tracked"));
+    } catch (const std::bad_alloc&) {
+        return core::Result<void>::failure(out_of_memory("D3D12 recovery tracking allocation failed"));
+    }
+    const HRESULT status = queue.queue->Signal(queue.fence.Get(), serial);
+    if (FAILED(status)) {
+        impl_->pending.erase(serial);
+        if (is_device_removed_hresult(status)) impl_->record_device_lost("D3D12 recovery Signal", status);
+        return core::Result<void>::failure(native_failure("D3D12 recovery Signal", status));
+    }
+    // Both records were reserved before Signal. These operations do not
+    // allocate, so the confirmed marker cannot lose its ownership receipt.
+    if (!state.recovered(serial, queue_type)) {
+        // Both entries remain tracked and the guard stays armed. The signal
+        // was submitted, but no ownership may be released on this path.
+        return core::Result<void>::failure(Diagnostic(ErrorCode::invalid_state,
+            "D3D12 recovery tracking rejected its confirmed marker"));
+    }
+    queue.command_contexts[state.context()].last_submitted = serial;
+    impl_->pending.erase(previous);
+    return core::Result<void>::success();
+}
+
 core::Result<gpu::SubmissionSerial> D3D12Device::submit(
     const device_ir::DeviceCommandStream& stream,
     gpu::QueueType queue) {
+    SubmissionHostTiming timing;
+    return submit_timed(stream, timing, queue);
+}
+core::Result<std::optional<gpu::SubmissionSerial>> D3D12Device::try_submit(
+    const device_ir::DeviceCommandStream& stream, gpu::QueueType queue) {
+    using Result = core::Result<std::optional<gpu::SubmissionSerial>>;
+    if (impl_->device_lost) return Result::failure(device_lost_failure());
+    if (impl_->unsignaled_execution.active()) {
+        static_cast<void>(completed_serial());
+        if (impl_->device_lost) return Result::failure(device_lost_failure());
+        if (impl_->unsignaled_execution.active())
+            return Result::failure(Diagnostic(ErrorCode::invalid_state,
+                "D3D12 execution remains quarantined pending queue retirement"));
+    }
+    const auto found = impl_->queues.find(queue);
+    if (found == impl_->queues.end())
+        return Result::failure(unsupported("D3D12 device does not expose the requested queue"));
+    auto& resource = found->second;
+    const auto& context = resource.command_contexts[resource.next_command_context];
+    const auto completed = resource.fence->GetCompletedValue();
+    const auto admission = detail::context_fence_admission(context.last_submitted, completed);
+    if (admission == detail::ContextFenceAdmission::invalid_completion) {
+        const HRESULT reason = impl_->device->GetDeviceRemovedReason();
+        if (FAILED(reason) && is_device_removed_hresult(reason)) {
+            impl_->record_device_lost("D3D12 command-context fence", reason);
+            return Result::failure(device_lost_failure());
+        }
+        return Result::failure(Diagnostic(ErrorCode::invalid_state,
+            "D3D12 command-context fence returned an invalid completion value"));
+    }
+    if (admission == detail::ContextFenceAdmission::pending)
+        return Result::success(std::nullopt);
+    // External serialization keeps this exact ring slot stable between the
+    // check and submit(). Fence completion is monotonic unless the device is
+    // removed; submit_timed checks the sentinel again before any wait/reset.
+    auto submitted = submit(stream, queue);
+    if (!submitted) return Result::failure(submitted.error());
+    return Result::success(submitted.value());
+}
+core::Result<gpu::SubmissionSerial> D3D12Device::submit_timed(
+    const device_ir::DeviceCommandStream& stream, SubmissionHostTiming& timing,
+    gpu::QueueType queue) {
+    const auto started = std::chrono::steady_clock::now();
+    const auto since_start = [&] {
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now()-started).count();
+    };
+    timing = {};
     if (impl_->device_lost) {
         return core::Result<gpu::SubmissionSerial>::failure(Diagnostic(
             ErrorCode::invalid_state,
             "D3D12 device is lost; call recover() to create a fresh device"));
     }
+    if (impl_->unsignaled_execution.active()) {
+        static_cast<void>(completed_serial());
+        if (impl_->unsignaled_execution.active())
+            return core::Result<gpu::SubmissionSerial>::failure(Diagnostic(ErrorCode::invalid_state,
+                "D3D12 execution remains quarantined pending queue retirement"));
+    }
     if (auto result = stream.validate(); !result) {
         return core::Result<gpu::SubmissionSerial>::failure(result.error());
     }
     const auto queue_it = impl_->queues.find(queue);
+    timing.validated = since_start();
     if (queue_it == impl_->queues.end()) {
         return core::Result<gpu::SubmissionSerial>::failure(unsupported(
             "D3D12 device does not expose the requested queue"));
     }
-    if (impl_->next_serial == std::numeric_limits<gpu::SubmissionSerial>::max()) {
+    // Leave one usable serial for a later recovery marker; UINT64_MAX is the
+    // D3D12 device-removed completion sentinel, not a usable marker.
+    if (impl_->next_serial >= std::numeric_limits<gpu::SubmissionSerial>::max() - 2U) {
         return core::Result<gpu::SubmissionSerial>::failure(Diagnostic(
             ErrorCode::invalid_state, "D3D12 submission serial exhausted"));
     }
 
     auto& queue_resource = queue_it->second;
-    auto& command_context = queue_resource.command_contexts[
-        queue_resource.next_command_context];
+    const auto context_index = queue_resource.next_command_context;
+    auto& command_context = queue_resource.command_contexts[context_index];
+    if (command_context.last_submitted != 0U) {
+        const auto completed = queue_resource.fence->GetCompletedValue();
+        const auto admission = detail::context_fence_admission(command_context.last_submitted, completed);
+        if (admission == detail::ContextFenceAdmission::invalid_completion) {
+            const HRESULT reason = impl_->device->GetDeviceRemovedReason();
+            if (FAILED(reason) && is_device_removed_hresult(reason)) {
+                impl_->record_device_lost("D3D12 command-context fence", reason);
+                return core::Result<gpu::SubmissionSerial>::failure(device_lost_failure());
+            }
+            return core::Result<gpu::SubmissionSerial>::failure(Diagnostic(
+                ErrorCode::invalid_state, "D3D12 command-context fence returned an invalid completion value"));
+        }
+        if (admission == detail::ContextFenceAdmission::pending) {
+            const auto before_wait = since_start();
+            const auto waited = detail::bounded_fence_wait(command_context.last_submitted,
+                std::chrono::steady_clock::now() + impl_->options.fence_wait_timeout,
+                [&] { return queue_resource.fence->GetCompletedValue(); },
+                [&](std::uint64_t value) { return SUCCEEDED(queue_resource.fence->SetEventOnCompletion(value, queue_resource.event)); },
+                [&](std::uint32_t milliseconds) {
+                    const auto result = WaitForSingleObject(queue_resource.event, milliseconds);
+                    return result == WAIT_OBJECT_0 ? detail::FenceEventOutcome::signaled :
+                        result == WAIT_TIMEOUT ? detail::FenceEventOutcome::timeout : detail::FenceEventOutcome::failed;
+                }, [] { return std::chrono::steady_clock::now(); });
+            timing.context_wait_ms = since_start()-before_wait;
+            if (waited != detail::FenceWaitOutcome::complete) {
+                const HRESULT reason = impl_->device->GetDeviceRemovedReason();
+                if (FAILED(reason) && is_device_removed_hresult(reason)) {
+                    impl_->record_device_lost("D3D12 command-context fence", reason);
+                    return core::Result<gpu::SubmissionSerial>::failure(device_lost_failure());
+                }
+                return core::Result<gpu::SubmissionSerial>::failure(
+                    Diagnostic(ErrorCode::invalid_state, waited == detail::FenceWaitOutcome::timeout
+                        ? "D3D12 command-context wait timed out; context remains in use"
+                        : "D3D12 command-context wait did not prove retirement"));
+            }
+            const auto observed = queue_resource.fence->GetCompletedValue();
+            const auto after_wait = detail::context_fence_admission(command_context.last_submitted, observed);
+            if (after_wait != detail::ContextFenceAdmission::ready) {
+                if (after_wait == detail::ContextFenceAdmission::invalid_completion) {
+                    const HRESULT reason = impl_->device->GetDeviceRemovedReason();
+                    if (FAILED(reason) && is_device_removed_hresult(reason)) {
+                        impl_->record_device_lost("D3D12 command-context fence", reason);
+                        return core::Result<gpu::SubmissionSerial>::failure(device_lost_failure());
+                    }
+                }
+                return core::Result<gpu::SubmissionSerial>::failure(Diagnostic(
+                    ErrorCode::invalid_state, "D3D12 command-context wait did not prove retirement"));
+            }
+        }
+    }
     queue_resource.next_command_context =
         (queue_resource.next_command_context + 1U) % queue_resource.command_contexts.size();
-    if (command_context.last_submitted != 0U &&
-        queue_resource.fence->GetCompletedValue() < command_context.last_submitted) {
-        if (FAILED(queue_resource.fence->SetEventOnCompletion(
-                command_context.last_submitted, queue_resource.event))) {
-            return core::Result<gpu::SubmissionSerial>::failure(Diagnostic(
-                ErrorCode::invalid_state, "D3D12 fence wait registration failed"));
-        }
-        WaitForSingleObject(queue_resource.event, INFINITE);
-    }
     queue_resource.allocator = command_context.allocator;
     queue_resource.command_list = command_context.command_list;
     if (FAILED(queue_resource.allocator->Reset()) ||
@@ -2031,6 +2390,7 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
             ErrorCode::invalid_state, "D3D12 command allocator/list reset failed"));
     }
 
+    timing.context_ready = since_start();
     const auto semantic_state_snapshot = impl_->resource_states;
     std::map<device_ir::ResourceHandle, D3D12_RESOURCE_STATES> native_state_snapshot;
     auto remember_native_state = [this, &native_state_snapshot](
@@ -2091,9 +2451,11 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
         return core::Result<void>::success();
     };
     auto require_compute = [queue]() -> core::Result<void> {
-        if (queue != gpu::QueueType::compute) {
+        // D3D12 DIRECT lists support dispatch as well as draw. This keeps
+        // raster -> temporal -> display on one explicitly ordered queue.
+        if (queue != gpu::QueueType::compute && queue != gpu::QueueType::graphics) {
             return core::Result<void>::failure(unsupported(
-                "D3D12 compute commands require the compute queue"));
+                "D3D12 compute commands require the graphics or compute queue"));
         }
         return core::Result<void>::success();
     };
@@ -2749,12 +3111,16 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                     return core::Result<void>::success();
                 } else if constexpr (std::is_same_v<T, device_ir::CmdDraw>) {
                     if (auto result = require_graphics(); !result) return result;
-                    if (!bound_pipeline.has_value() || !vertex_buffer_bound) {
+                    if (!bound_pipeline.has_value()) {
                         return core::Result<void>::failure(validation(
-                            "D3D12 draw requires a bound pipeline and vertex buffer"));
+                            "D3D12 draw requires a bound pipeline"));
                     }
                     auto pipeline = impl_->pipelines.resolve(*bound_pipeline);
                     if (!pipeline) return core::Result<void>::failure(pipeline.error());
+                    if (pipeline.value()->descriptor.vertex_stride_bytes != 0U && !vertex_buffer_bound) {
+                        return core::Result<void>::failure(validation(
+                            "D3D12 vertex-input draw requires a bound vertex buffer"));
+                    }
                     if (pipeline.value()->compute) {
                         return core::Result<void>::failure(validation(
                             "D3D12 draw cannot use a compute pipeline"));
@@ -2906,6 +3272,25 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
             native_failure("ID3D12GraphicsCommandList::Close", close_status));
     }
     ID3D12CommandList* command_lists[] = {queue_resource.command_list.Get()};
+    timing.encoded = since_start();
+    const gpu::SubmissionSerial serial = ++impl_->next_serial;
+    try {
+        if (!impl_->pending.emplace(serial, queue).second) {
+            rollback_preexecution_state();
+            return core::Result<gpu::SubmissionSerial>::failure(Diagnostic(
+                ErrorCode::invalid_state, "D3D12 submission serial is already tracked"));
+        }
+    } catch (const std::bad_alloc&) {
+        rollback_preexecution_state();
+        return core::Result<gpu::SubmissionSerial>::failure(
+            out_of_memory("D3D12 submission tracking allocation failed"));
+    }
+    if (!impl_->unsignaled_execution.arm(serial, queue, context_index)) {
+        impl_->pending.erase(serial);
+        rollback_preexecution_state();
+        return core::Result<gpu::SubmissionSerial>::failure(Diagnostic(
+            ErrorCode::invalid_state, "D3D12 execution tracking is already armed"));
+    }
     queue_resource.queue->ExecuteCommandLists(1U, command_lists);
     const HRESULT removed_reason = impl_->device->GetDeviceRemovedReason();
     if (FAILED(removed_reason) && is_device_removed_hresult(removed_reason)) {
@@ -2913,7 +3298,6 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
         return core::Result<gpu::SubmissionSerial>::failure(
             native_failure("ID3D12Device::GetDeviceRemovedReason", removed_reason));
     }
-    const gpu::SubmissionSerial serial = ++impl_->next_serial;
     const HRESULT signal_status = queue_resource.queue->Signal(queue_resource.fence.Get(), serial);
     if (FAILED(signal_status)) {
         if (is_device_removed_hresult(signal_status)) {
@@ -2922,10 +3306,11 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
         return core::Result<gpu::SubmissionSerial>::failure(
             native_failure("ID3D12CommandQueue::Signal", signal_status));
     }
-    impl_->capture_debug_messages();
     command_context.last_submitted = serial;
-    impl_->pending.emplace(serial, queue);
     impl_->last_submitted = serial;
+    impl_->unsignaled_execution.original_signal_confirmed();
+    impl_->capture_debug_messages();
+    timing.returned = since_start();
     return core::Result<gpu::SubmissionSerial>::success(serial);
 }
 
@@ -2934,6 +3319,9 @@ gpu::SubmissionSerial D3D12Device::last_submitted_serial() const noexcept {
 }
 
 gpu::SubmissionSerial D3D12Device::completed_serial() const noexcept {
+  try {
+    if (impl_->unsignaled_execution.active() && !impl_->unsignaled_execution.marker_confirmed())
+        return impl_->completed;
     auto current = impl_->pending.begin();
     while (current != impl_->pending.end()) {
         const auto& queue = impl_->queues.at(current->second);
@@ -2949,17 +3337,28 @@ gpu::SubmissionSerial D3D12Device::completed_serial() const noexcept {
         impl_->completed = current->first;
         current = impl_->pending.erase(current);
     }
+    static_cast<void>(impl_->unsignaled_execution.observe_completion(impl_->completed));
     static_cast<void>(impl_->deferred_destruction.collect(impl_->completed));
     impl_->capture_debug_messages();
     return impl_->completed;
+  } catch (...) {
+    // Diagnostics and bookkeeping must not terminate the process during a
+    // fence poll. Report only the last completion already recorded; unknown
+    // work remains owned by the device.
+    return impl_->completed;
+  }
 }
 
 core::Result<void> D3D12Device::wait(gpu::SubmissionSerial serial) {
     if (impl_->device_lost) return core::Result<void>::failure(device_lost_failure());
+    if (impl_->unsignaled_execution.active() && !impl_->unsignaled_execution.marker_confirmed())
+        return core::Result<void>::failure(Diagnostic(ErrorCode::invalid_state,
+            "D3D12 executed work has no confirmed queue marker"));
     if (serial == 0U || serial > impl_->next_serial) {
         return core::Result<void>::failure(Diagnostic(
             ErrorCode::invalid_state, "D3D12 wait requested an unknown submission serial"));
     }
+    const auto deadline = std::chrono::steady_clock::now() + impl_->options.fence_wait_timeout;
     while (completed_serial() < serial) {
         if (impl_->pending.empty()) {
             return core::Result<void>::failure(Diagnostic(
@@ -2967,18 +3366,24 @@ core::Result<void> D3D12Device::wait(gpu::SubmissionSerial serial) {
         }
         const auto pending = impl_->pending.begin();
         auto& queue = impl_->queues.at(pending->second);
-        if (FAILED(queue.fence->SetEventOnCompletion(pending->first, queue.event))) {
+        const auto waited = detail::bounded_fence_wait(pending->first, deadline,
+            [&] { return queue.fence->GetCompletedValue(); },
+            [&](std::uint64_t value) { return SUCCEEDED(queue.fence->SetEventOnCompletion(value, queue.event)); },
+            [&](std::uint32_t milliseconds) {
+                const auto result = WaitForSingleObject(queue.event, milliseconds);
+                return result == WAIT_OBJECT_0 ? detail::FenceEventOutcome::signaled :
+                    result == WAIT_TIMEOUT ? detail::FenceEventOutcome::timeout : detail::FenceEventOutcome::failed;
+            }, [] { return std::chrono::steady_clock::now(); });
+        if (waited != detail::FenceWaitOutcome::complete) {
             const HRESULT reason = impl_->device->GetDeviceRemovedReason();
             if (FAILED(reason) && is_device_removed_hresult(reason)) {
                 impl_->record_device_lost("ID3D12Device::GetDeviceRemovedReason", reason);
+                return core::Result<void>::failure(device_lost_failure());
             }
             return core::Result<void>::failure(Diagnostic(
-                ErrorCode::invalid_state, "D3D12 wait registration failed"));
-        }
-        const DWORD wait_status = WaitForSingleObject(queue.event, INFINITE);
-        if (wait_status != WAIT_OBJECT_0) {
-            return core::Result<void>::failure(Diagnostic(
-                ErrorCode::invalid_state, "D3D12 wait event did not signal"));
+                ErrorCode::invalid_state, waited == detail::FenceWaitOutcome::timeout
+                    ? "D3D12 wait timed out; submitted resources remain in use"
+                    : "D3D12 wait did not prove submission retirement"));
         }
     }
     return core::Result<void>::success();
@@ -2987,6 +3392,25 @@ core::Result<void> D3D12Device::wait(gpu::SubmissionSerial serial) {
 std::uint64_t D3D12Device::timestamp_frequency(gpu::QueueType queue) const noexcept {
     const auto current = impl_->queues.find(queue);
     return current == impl_->queues.end() ? 0U : current->second.timestamp_frequency;
+}
+
+core::Result<QueueClockCalibration> D3D12Device::clock_calibration() const {
+    using Result = core::Result<QueueClockCalibration>;
+    if (impl_->device_lost) return Result::failure(device_lost_failure());
+    LARGE_INTEGER before{}, frequency{};
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&before);
+    const auto host_before = std::chrono::steady_clock::now();
+    UINT64 gpu_tick = 0, cpu_tick = 0;
+    const auto& queue = impl_->queues.at(gpu::QueueType::graphics);
+    const HRESULT status = queue.queue->GetClockCalibration(&gpu_tick, &cpu_tick);
+    const auto host_after = std::chrono::steady_clock::now();
+    if (FAILED(status)) return Result::failure(native_failure("GetClockCalibration", status));
+    const auto offset = std::chrono::duration<long double>(
+        (static_cast<long double>(cpu_tick)-before.QuadPart)/frequency.QuadPart);
+    return Result::success({gpu_tick,
+        host_before + std::chrono::duration_cast<std::chrono::steady_clock::duration>(offset),
+        std::chrono::duration<double, std::milli>(host_after-host_before).count()});
 }
 
 const std::vector<std::string>& D3D12Device::debug_receipts() const noexcept {
@@ -3013,6 +3437,15 @@ void* D3D12Device::native_device_handle() const noexcept {
 void* D3D12Device::native_graphics_queue_handle() const noexcept {
     const auto queue = impl_->queues.find(gpu::QueueType::graphics);
     return queue == impl_->queues.end() ? nullptr : queue->second.queue.Get();
+}
+
+core::Result<void*> D3D12Device::native_texture_handle(gpu::TextureHandle texture) const {
+    if (impl_->device_lost) return core::Result<void*>::failure(device_lost_failure());
+    if (impl_->unsignaled_execution.active())
+        return core::Result<void*>::failure(Diagnostic(ErrorCode::invalid_state, "D3D12 execution remains quarantined"));
+    const auto resource = impl_->textures.resolve(texture);
+    if (!resource) return core::Result<void*>::failure(resource.error());
+    return core::Result<void*>::success(resource.value()->resource.Get());
 }
 
 core::Result<std::unique_ptr<D3D12Device>> D3D12Device::recover() const {

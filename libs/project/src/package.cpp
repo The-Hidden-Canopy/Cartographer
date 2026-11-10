@@ -1,5 +1,6 @@
 #include <carto/project/package.hpp>
 #include <carto/core/json.hpp>
+#include <carto/core/filesystem.hpp>
 #include <carto/project/file_lock.hpp>
 #include <carto/project/project.hpp>
 #include <carto/project/sqlite_authoring_database.hpp>
@@ -14,6 +15,11 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 namespace carto::project {
 
@@ -41,6 +47,14 @@ core::Diagnostic validation(std::string message) {
 
 core::Diagnostic version_mismatch(std::string message) {
     return core::Diagnostic(core::ErrorCode::version_mismatch, std::move(message));
+}
+
+core::Result<std::filesystem::path> native_package_path(const std::filesystem::path& path) {
+    std::error_code error;
+    auto absolute = core::native_io_path(path, error);
+    if (error) return core::Result<std::filesystem::path>::failure(
+        io_error("unable to resolve package path"));
+    return core::Result<std::filesystem::path>::success(std::move(absolute));
 }
 
 bool safe_identifier(std::string_view value) {
@@ -114,14 +128,15 @@ core::Result<void> ProjectPackage::create_layout() const {
         "blobs/sha256", "assets", "previews", "exports", "autosave", "recovery", "cache", "logs",
     };
     std::error_code error;
-    std::filesystem::create_directories(root_, error);
+    core::create_directories(root_, error);
     if (error) {
         return core::Result<void>::failure(io_error("unable to create package root"));
     }
     for (const auto directory : directories) {
-        std::filesystem::create_directories(root_ / directory, error);
+        core::create_directories(root_ / directory, error);
         if (error) {
-            return core::Result<void>::failure(io_error("unable to create package directory"));
+            return core::Result<void>::failure(io_error("unable to create package directory " +
+                std::string(directory) + ": " + error.message()));
         }
     }
     return core::Result<void>::success();
@@ -147,7 +162,8 @@ core::Result<void> ProjectPackage::write_manifest() const {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto thread = std::hash<std::thread::id>{}(std::this_thread::get_id());
     const auto counter = g_package_temp_counter.fetch_add(1U, std::memory_order_relaxed);
-    const auto temporary = manifest_path().string() + ".tmp-" +
+    auto temporary = manifest_path();
+    temporary += ".tmp-" +
         std::to_string(static_cast<unsigned long long>(stamp)) + "-" +
         std::to_string(static_cast<unsigned long long>(thread)) + "-" +
         std::to_string(static_cast<unsigned long long>(counter));
@@ -182,29 +198,32 @@ core::Result<ProjectPackage> ProjectPackage::create(
         return core::Result<ProjectPackage>::failure(
             invalid("package root must name a directory"));
     }
-    const auto parent = root.parent_path();
+    const auto native_root = native_package_path(root);
+    if (!native_root) return core::Result<ProjectPackage>::failure(native_root.error());
+    const auto& package_root = native_root.value();
+    const auto parent = package_root.parent_path();
     if (!parent.empty()) {
         std::error_code parent_error;
-        std::filesystem::create_directories(parent, parent_error);
+        core::create_directories(parent, parent_error);
         if (parent_error) {
             return core::Result<ProjectPackage>::failure(
                 io_error("unable to create package parent directory"));
         }
     }
-    FileLock file_lock(root);
+    FileLock file_lock(package_root);
     if (auto result = file_lock.acquire(); !result) {
         return core::Result<ProjectPackage>::failure(result.error());
     }
     std::error_code error;
-    const bool root_exists = std::filesystem::exists(root, error);
+    const bool root_exists = std::filesystem::exists(package_root, error);
     if (error) {
         return core::Result<ProjectPackage>::failure(io_error("unable to inspect package root"));
     }
     if (root_exists) {
-        if (!std::filesystem::is_directory(root, error) || error) {
+        if (!std::filesystem::is_directory(package_root, error) || error) {
             return core::Result<ProjectPackage>::failure(io_error("package root is not a directory"));
         }
-        const bool root_is_empty = std::filesystem::is_empty(root, error);
+        const bool root_is_empty = std::filesystem::is_empty(package_root, error);
         if (error) {
             return core::Result<ProjectPackage>::failure(io_error("unable to inspect package root contents"));
         }
@@ -213,7 +232,7 @@ core::Result<ProjectPackage> ProjectPackage::create(
                 invalid("refusing to create a package in a non-empty directory"));
         }
     }
-    ProjectPackage package(root, std::move(manifest));
+    ProjectPackage package(package_root, std::move(manifest));
     if (auto result = package.create_layout(); !result) {
         return core::Result<ProjectPackage>::failure(result.error());
     }
@@ -334,8 +353,12 @@ core::Result<PackageManifest> ProjectPackage::read_manifest(const std::filesyste
 }
 
 core::Result<ProjectPackage> ProjectPackage::open(const std::filesystem::path& root) {
+    if (root.empty()) return core::Result<ProjectPackage>::failure(invalid("package root is empty"));
+    const auto native_root = native_package_path(root);
+    if (!native_root) return core::Result<ProjectPackage>::failure(native_root.error());
+    const auto& package_root = native_root.value();
     std::error_code error;
-    const bool root_is_directory = std::filesystem::is_directory(root, error);
+    const bool root_is_directory = std::filesystem::is_directory(package_root, error);
     if (error) {
         return core::Result<ProjectPackage>::failure(io_error("unable to inspect package root"));
     }
@@ -343,11 +366,11 @@ core::Result<ProjectPackage> ProjectPackage::open(const std::filesystem::path& r
         return core::Result<ProjectPackage>::failure(
             core::Diagnostic(core::ErrorCode::not_found, "package root does not exist"));
     }
-    const auto manifest = read_manifest(root / "manifest.json");
+    const auto manifest = read_manifest(package_root / "manifest.json");
     if (!manifest) {
         return core::Result<ProjectPackage>::failure(manifest.error());
     }
-    ProjectPackage package(root, manifest.value());
+    ProjectPackage package(package_root, manifest.value());
     if (auto result = package.validate(); !result) {
         return core::Result<ProjectPackage>::failure(result.error());
     }
@@ -362,12 +385,14 @@ core::Result<ProjectPackage> ProjectPackage::migrate_flat_project(
         return core::Result<ProjectPackage>::failure(invalid(
             "flat project migration requires named source and destination paths"));
     }
+    const auto source_path = native_package_path(source_document);
+    if (!source_path) return core::Result<ProjectPackage>::failure(source_path.error());
     std::error_code error;
-    if (!std::filesystem::is_regular_file(source_document, error) || error) {
+    if (!std::filesystem::is_regular_file(source_path.value(), error) || error) {
         return core::Result<ProjectPackage>::failure(io_error(
             "flat project migration source is not a regular file"));
     }
-    const auto source_size = std::filesystem::file_size(source_document, error);
+    const auto source_size = std::filesystem::file_size(source_path.value(), error);
     if (error) return core::Result<ProjectPackage>::failure(io_error(
         "unable to inspect flat project migration source size"));
     if (source_size > kMaxFlatProjectBytes ||
@@ -377,7 +402,7 @@ core::Result<ProjectPackage> ProjectPackage::migrate_flat_project(
     }
     std::string serialized(static_cast<std::size_t>(source_size), '\0');
     {
-        std::ifstream input(source_document, std::ios::binary);
+        std::ifstream input(source_path.value(), std::ios::binary);
         if (!input) return core::Result<ProjectPackage>::failure(io_error(
             "unable to open flat project migration source"));
         input.read(serialized.data(), static_cast<std::streamsize>(serialized.size()));
@@ -392,11 +417,15 @@ core::Result<ProjectPackage> ProjectPackage::migrate_flat_project(
     const auto source_digest = assets::sha256(std::span<const std::uint8_t>(
         reinterpret_cast<const std::uint8_t*>(serialized.data()), serialized.size()));
 
-    auto destination = std::filesystem::absolute(destination_root, error);
-    if (error) return core::Result<ProjectPackage>::failure(io_error(
-        "unable to resolve package destination"));
+    const auto native_destination = native_package_path(destination_root);
+    if (!native_destination) return core::Result<ProjectPackage>::failure(native_destination.error());
+    auto destination = native_destination.value();
+#ifndef _WIN32
+    destination = std::filesystem::absolute(destination, error);
+    if (error) return core::Result<ProjectPackage>::failure(io_error("unable to resolve package destination"));
+#endif
     const auto parent = destination.parent_path();
-    std::filesystem::create_directories(parent, error);
+    core::create_directories(parent, error);
     if (error) return core::Result<ProjectPackage>::failure(io_error(
         "unable to create package destination parent"));
     if (std::filesystem::exists(destination, error) || error) {
@@ -434,9 +463,54 @@ core::Result<ProjectPackage> ProjectPackage::migrate_flat_project(
     if (!created) return core::Result<ProjectPackage>::failure(created.error());
     auto package = std::move(created.value());
 
+    const auto source_parent = source_path.value().parent_path().empty()
+        ? std::filesystem::current_path() : source_path.value().parent_path();
+    const assets::BlobStore captured_sources(source_parent / ".carto-assets" / "source-blobs");
+    assets::BlobStore migrated_sources(staging / ".carto-assets" / "source-blobs");
+    const auto copy_captured = [&](const assets::Sha256Digest& digest,
+                                   const std::string& context) -> core::Result<void> {
+        const auto bytes = captured_sources.read(digest);
+        if (!bytes) return core::Result<void>::failure(bytes.error().with_context(context));
+        const auto stored = migrated_sources.put(bytes.value(), "application/octet-stream");
+        if (!stored || stored.value().digest != digest) {
+            return core::Result<void>::failure(stored
+                ? validation("migrated source digest changed") : stored.error());
+        }
+        return core::Result<void>::success();
+    };
+    for (const auto& [identity, source] : document.value().source_asset_registry().records()) {
+        if (source.importer_identity != "carto.import.gltf-scene") continue;
+        const auto expected_path = captured_sources.path_for(source.source_digest)
+            .lexically_relative(source_parent).generic_string();
+        if (source.relative_source_path != expected_path) {
+            return core::Result<ProjectPackage>::failure(validation(
+                "glTF scene source path is not the captured source location").with_context(identity));
+        }
+        if (auto copied = copy_captured(source.source_digest, "flat project captured source " + identity); !copied)
+            return core::Result<ProjectPackage>::failure(copied.error());
+        for (const auto& product : source.document_products) {
+            if (product.kind != assets::SourceDocumentProductKind::texture) continue;
+            const auto& textures = document.value().material_catalog().textures();
+            const auto texture = textures.find(product.product_id);
+            if (texture == textures.end() || texture->second.relative_locator !=
+                    captured_sources.path_for(texture->second.content_digest)
+                        .lexically_relative(source_parent).generic_string()) {
+                return core::Result<ProjectPackage>::failure(validation(
+                    "glTF scene texture is not in the captured source location").with_context(identity));
+            }
+        }
+    }
+    for (const auto& [id, texture] : document.value().material_catalog().textures()) {
+        const auto expected_path = captured_sources.path_for(texture.content_digest)
+            .lexically_relative(source_parent).generic_string();
+        if (texture.relative_locator == expected_path) {
+            if (auto copied = copy_captured(texture.content_digest,
+                    "flat project captured texture " + std::to_string(id)); !copied)
+                return core::Result<ProjectPackage>::failure(copied.error());
+        }
+    }
+
     if (document.value().evaluation_graph_digest().has_value()) {
-        const auto source_parent = source_document.parent_path().empty()
-            ? std::filesystem::current_path() : source_document.parent_path();
         const assets::BlobStore source_blobs(source_parent / "blobs");
         const auto graph_bytes = source_blobs.read(
             *document.value().evaluation_graph_digest());
@@ -468,7 +542,7 @@ core::Result<ProjectPackage> ProjectPackage::migrate_flat_project(
         return core::Result<ProjectPackage>::failure(closed.error());
     }
     if (auto valid = package.validate(); !valid) {
-        return core::Result<ProjectPackage>::failure(valid.error());
+        return core::Result<ProjectPackage>::failure(valid.error().with_context("staged package migration"));
     }
     FileLock publication_lock(destination);
     if (auto locked = publication_lock.acquire(); !locked) {
@@ -483,11 +557,18 @@ core::Result<ProjectPackage> ProjectPackage::migrate_flat_project(
     std::filesystem::remove(staging_lock, error);
     if (error) return core::Result<ProjectPackage>::failure(io_error(
         "unable to remove temporary package migration lock"));
+#ifdef _WIN32
+    if (!MoveFileW(staging.c_str(), destination.c_str())) {
+        return core::Result<ProjectPackage>::failure(io_error(
+            "unable to publish migrated project package without replacing an existing destination"));
+    }
+#else
     std::filesystem::rename(staging, destination, error);
     if (error) return core::Result<ProjectPackage>::failure(io_error(
         "unable to publish migrated project package"));
+#endif
     staging_guard.release();
-    return ProjectPackage::open(destination);
+    return core::Result<ProjectPackage>::success(ProjectPackage(destination, std::move(package.manifest_)));
 }
 
 core::Result<void> ProjectPackage::validate() const {
@@ -509,7 +590,9 @@ core::Result<void> ProjectPackage::validate() const {
         return core::Result<void>::failure(validation("package root is not a directory"));
     }
     for (const auto directory : directories) {
-        if (!std::filesystem::is_directory(root_ / directory, error) || error) {
+        auto directory_path = root_ / directory;
+        directory_path.make_preferred();
+        if (!std::filesystem::is_directory(directory_path, error) || error) {
             return core::Result<void>::failure(
                 validation("package layout is incomplete: " + std::string(directory)));
         }

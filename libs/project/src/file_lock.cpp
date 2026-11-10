@@ -75,7 +75,8 @@ core::Result<void> FileLock::acquire() {
         return core::Result<void>::failure(invalid("file lock is already acquired"));
     }
 
-    const std::filesystem::path lock_path = target_.string() + ".lock";
+    auto lock_path = target_;
+    lock_path += ".lock";
     const auto parent = lock_path.parent_path();
     if (!parent.empty()) {
         std::error_code error;

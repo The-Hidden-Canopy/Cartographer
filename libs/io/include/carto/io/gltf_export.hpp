@@ -6,11 +6,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace carto::project {
 class ProjectDocument;
+}
+
+namespace carto::production {
+class AuthoringTextureLibrary;
 }
 
 namespace carto::io {
@@ -30,7 +35,19 @@ struct GltfExportReport {
     std::size_t triangles = 0U;
     std::size_t index_bytes = 0U;
     bool used_uint32_indices = false;
+    std::size_t materials = 0, textures = 0, images = 0;
+    std::uint64_t embedded_image_bytes = 0;
     std::vector<std::string> warnings;
+};
+
+// Disposable source pixels or a saved-project location for the existing
+// digest-addressed asset store. No arbitrary source locator is dereferenced.
+struct GltfExportOptions {
+    std::filesystem::path project_path;
+    std::shared_ptr<const production::AuthoringTextureLibrary> textures;
+    // Opt-in approximation only; zero preserves strict analytic projection.
+    // Powers of two 4..256, one [0,1] UV tile, <=1M total sampled texels.
+    std::uint32_t graph_bake_resolution = 0;
 };
 
 // Emits a deterministic, single-file glTF 2.0 artifact. The artifact keeps
@@ -41,26 +58,27 @@ struct GltfExportReport {
 // smallest supported unsigned index width for each mesh. Corner-domain UV seams
 // and custom normal discontinuities use the same production render-mesh stream
 // as the authoring viewport, without mutating the project.
-// The CONDITION face-domain `condition.material_region` table is retained in
-// the first primitive extras; consumers realize materials themselves. Authored
-// tangent/color layers,
-// multiple/inactive UV sets, and rig/deformation records are refused until this
-// profile can preserve them. Material catalogs and slots are accepted only for
-// 1..32 explicitly assigned, texture-free opaque
-// base-color/metallic/roughness materials when every face has an explicitly
-// assigned nonzero region. glTF primitives carry material, region, and source
-// triangle-face identity; the source digest covers canonical project
-// serialization. Lighting and back-face shading are not claimed identical.
-// Textures, graphs, variants, non-default lighting controls, unassigned faces,
-// and more than 128 regions on a mesh continue to fail closed.
+// The CONDITION face-domain `condition.material_region` table and source
+// face identity are retained in extras. Visual assignments follow the
+// viewport's material-region alias and resolved catalog variants. Unsupported
+// appearance features fail before replacing a prior good artifact. Consumer
+// lighting and back-face shading may differ from the authoring viewport.
 [[nodiscard]] core::Result<GltfExportReport> export_gltf(
     const project::ProjectDocument& document,
     const std::filesystem::path& path);
 
 // Emits the same bounded Cartographer profile in a GLB 2.0 container. JSON
 // and BIN chunk padding is canonical, and export remains a derived artifact.
-[[nodiscard]] core::Result<GltfExportReport> export_glb(
-    const project::ProjectDocument& document,
-    const std::filesystem::path& path);
+[[nodiscard]] core::Result<GltfExportReport> export_glb(const project::ProjectDocument &document,
+                                                        const std::filesystem::path &path);
+
+// Constant graphs project directly. Texture/UV-dependent graphs fail unless
+// an explicit bounded bake is requested; the receipt labels its approximation.
+[[nodiscard]] core::Result<GltfExportReport> export_gltf(const project::ProjectDocument &,
+                                                         const std::filesystem::path &,
+                                                         const GltfExportOptions &);
+[[nodiscard]] core::Result<GltfExportReport> export_glb(const project::ProjectDocument &,
+                                                        const std::filesystem::path &,
+                                                        const GltfExportOptions &);
 
 } // namespace carto::io

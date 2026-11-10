@@ -2,6 +2,9 @@ add_library(carto_application STATIC
     src/application.cpp
     src/ik_fk_key_admission.cpp
     src/gltf_scene_import.cpp
+    src/shared_rig.cpp
+    src/material_library.cpp
+    src/object_aging.cpp
 )
 
 target_include_directories(carto_application
@@ -19,6 +22,7 @@ target_link_libraries(carto_application
         carto_geometry
         carto_journal
         carto_project
+        carto_io
         carto_editor
         carto_production
         carto_render

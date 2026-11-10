@@ -9026,7 +9026,8 @@ core::Result<application::DispatchReceipt> UiController::import_static_gltf_scen
     std::uint64_t expected_project_generation,
     core::Revision expected_project_revision,
     std::string_view expected_source_namespace,
-    bool rights_confirmed, std::string justification) {
+    bool rights_confirmed, std::string justification,
+    bool allow_default_material_projection) {
     const auto fail = [this](core::Diagnostic diagnostic) {
         auto surfaced = diagnostic.with_context("native static scene import");
         record_ui_problem(surfaced);
@@ -9050,8 +9051,12 @@ core::Result<application::DispatchReceipt> UiController::import_static_gltf_scen
     const auto encoded = read_bounded_file(path, kMaxStaticSceneBytes, "static scene source");
     if (!encoded) return fail(encoded.error());
     const auto* data = reinterpret_cast<const std::uint8_t*>(encoded.value().data());
-    const std::span<const std::uint8_t> source(data, encoded.value().size());
-    const auto parsed = io::import_gltf_scene(source);
+    const auto captured = io::capture_gltf_scene_source(path,
+        std::span<const std::uint8_t>(data, encoded.value().size()));
+    if (!captured) return fail(captured.error());
+    const std::span<const std::uint8_t> source(captured.value());
+    const auto parsed = io::import_gltf_scene(source,
+        {.allow_default_material_projection = allow_default_material_projection});
     if (!parsed) return fail(parsed.error());
     const auto digest = parsed.value().materials.artifact_digest;
     const auto identity = "gltf.scene." + digest.hex();
@@ -9067,6 +9072,8 @@ core::Result<application::DispatchReceipt> UiController::import_static_gltf_scen
     // Parse/decode all inputs before any persistence. Only immutable verified
     // cache additions precede the independently validated application action.
     const auto staged_source = persist_managed_source_blob(*context.project_path, source,
+        source.size() >= 12U && std::equal(source.begin(), source.begin() + 12,
+            "CARTOGLTFPK1") ? "application/vnd.cartographer.gltf-source-package" :
         source.size() >= 4U && source[0] == 0x67U && source[1] == 0x6cU &&
             source[2] == 0x54U && source[3] == 0x46U ? "model/gltf-binary" : "model/gltf+json",
         kMaxStaticSceneBytes, "static scene source");
@@ -9092,6 +9099,7 @@ core::Result<application::DispatchReceipt> UiController::import_static_gltf_scen
     action.source_digest = digest;
     action.rights_confirmed = rights_confirmed;
     action.justification = std::move(justification);
+    action.allow_default_material_projection = allow_default_material_projection;
     auto admitted = dispatch(action);
     if (!admitted) return fail(admitted.error().with_context(
         "verified source bytes remain in the local asset cache"));

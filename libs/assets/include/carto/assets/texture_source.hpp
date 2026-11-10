@@ -85,4 +85,15 @@ struct DecodedRgba8Texture {
     std::span<const std::uint8_t> bytes,
     const TextureSourceLimits& limits = {});
 
+// PNG pixel decoding uses the Windows system codec on Windows builds.
+// Other builds fail explicitly. Still images only; straight RGBA8 sample
+// values, including alpha, remain unpremultiplied and source-digest-bound.
+// Color/data interpretation is a separate binding/mip-generation decision.
+[[nodiscard]] core::Result<DecodedRgba8Texture> decode_png_rgba8(
+    std::span<const std::uint8_t> bytes,
+    const TextureSourceLimits& limits = {});
+[[nodiscard]] core::Result<DecodedRgba8Texture> decode_texture_rgba8(
+    std::span<const std::uint8_t> bytes,
+    const TextureSourceLimits& limits = {});
+
 } // namespace carto::assets

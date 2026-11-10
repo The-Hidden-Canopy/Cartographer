@@ -16,6 +16,7 @@
 
 
 #include <carto/attributes/set.hpp>
+#include <carto/character/rig_module.hpp>
 #include <carto/biological/authoring.hpp>
 #include <carto/geometry/primitives.hpp>
 #include <carto/assets/blob_store.hpp>
@@ -6879,6 +6880,24 @@ void checkpoint_rebase_preserves_persistent_mesh_patch_history() {
         base, speculative, {}, write_assets, revision_delta);
     REQUIRE(selected && selected.value().mesh_patches().size() == 1U);
     REQUIRE(selected.value().mesh_patches().front().replay(source));
+
+    character::RigModuleTemplate module;module.name="public.synthetic.rebase-rig";
+    kinematic::KinematicNode joint;joint.id={1};module.joints.push_back(joint);
+    const auto module_bytes=module.serialize();REQUIRE(module_bytes);
+    auto library_changed=base;REQUIRE(library_changed.insert_rig_module_template(module_bytes.value()));
+    const auto library_drift=project::ProjectDocument::merge_disjoint_scene_mesh_changes(
+        base,library_changed,speculative,{},read_assets,{},write_assets);
+    REQUIRE(!library_drift&&library_drift.error().code==core::ErrorCode::stale_data);
+    auto rig_base=base;REQUIRE(rig_base.insert_rig_module_template(module_bytes.value()));
+    const auto rig_root=rig_base.create_object("Rig root");REQUIRE(rig_root);
+    const auto& module_entry=rig_base.rig_module_templates().begin()->second;
+    auto binding_changed=rig_base;
+    REQUIRE(binding_changed.set_rig_template_binding({rig_root.value(),module.name,module_entry.revision,module_entry.digest,
+        "Independent public-safe fixture",1,{{1,rig_root.value()}}}));
+    auto rig_speculative=rig_base;REQUIRE(rig_speculative.apply_mesh_patch(asset.value(),patch));
+    const auto binding_drift=project::ProjectDocument::merge_disjoint_scene_mesh_changes(
+        rig_base,binding_changed,rig_speculative,{},read_assets,{},write_assets);
+    REQUIRE(!binding_drift&&binding_drift.error().code==core::ErrorCode::stale_data);
 }
 
 void application_repeats_last_tool_against_current_document() {

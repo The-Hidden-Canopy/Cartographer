@@ -12,6 +12,7 @@
 #include <carto/production/render_mesh.hpp>
 #include <carto/production/bake_graph.hpp>
 #include <carto/render_graph/graph.hpp>
+#include <carto/render/material.hpp>
 
 #include <carto/attributes/set.hpp>
 #include <carto/attributes/uv.hpp>
@@ -409,6 +410,31 @@ void d3d12_device_reports_native_identity_and_owns_resources() {
     REQUIRE(device.wait(copy_serial.value()));
     const auto copied = device.read_buffer(readback.value(), 0U, bytes.size());
     REQUIRE(copied && copied.value() == bytes);
+    d3d12::ReadbackHostTiming mapped_timing;
+    bool visited = false;
+    REQUIRE(device.visit_readback(readback.value(), 1U, bytes.size()-1U,
+        [&](std::span<const std::uint8_t> view) {
+            visited = true;
+            REQUIRE(view.size() == bytes.size()-1U);
+            REQUIRE(std::equal(view.begin(), view.end(), bytes.begin()+1));
+            return core::Result<void>::success();
+        }, mapped_timing));
+    REQUIRE(visited && mapped_timing.map_ms >= 0 && mapped_timing.unmap_ms >= 0);
+    REQUIRE(!device.visit_readback(readback.value(), 64U, 1U,
+        [](auto) { return core::Result<void>::success(); }, mapped_timing));
+    REQUIRE(!device.visit_readback(upload.value(), 0U, 1U,
+        [](auto) { return core::Result<void>::success(); }, mapped_timing));
+    REQUIRE(!device.visit_readback(readback.value(), 0U, bytes.size(),
+        [](auto) { return core::Result<void>::failure(
+            {core::ErrorCode::invalid_state, "intentional visitor rejection"}); }, mapped_timing));
+    bool exception_propagated = false;
+    try {
+        static_cast<void>(device.visit_readback(readback.value(), 0U, bytes.size(),
+            [](auto) -> core::Result<void> { throw TestFailure("intentional visitor exception"); },
+            mapped_timing));
+    } catch (const TestFailure&) { exception_propagated = true; }
+    REQUIRE(exception_propagated);
+    REQUIRE(device.read_buffer(readback.value(), 0U, bytes.size()).value() == bytes);
 
     device_ir::DeviceCommandStream rejected_stream;
     rejected_stream.append(device_ir::CmdTransitionResource{
@@ -1288,6 +1314,7 @@ void d3d12_executes_builtin_shader_suite_and_dispatches_compute() {
         gpu::TextureDimension::texture_2d,
         gpu::TextureUsage::sampled | gpu::TextureUsage::color_attachment |
             gpu::TextureUsage::transfer_source,
+        {0.0F, 0.0F, 0.0F, 0.0F},
     });
     const auto depth_target = device.create_texture(gpu::TextureDesc{
         32U,
@@ -1419,7 +1446,7 @@ void d3d12_executes_builtin_shader_suite_and_dispatches_compute() {
     });
     render_stream.append(device_ir::CmdWriteTimestamp{0U});
     render_stream.append(device_ir::CmdBeginRendering{pbr_target.value(), depth_target.value()});
-    render_stream.append(device_ir::CmdClearColor{pbr_target.value(), {0.0F, 0.0F, 0.0F, 1.0F}});
+    render_stream.append(device_ir::CmdClearColor{pbr_target.value(), {0.0F, 0.0F, 0.0F, 0.0F}});
     render_stream.append(device_ir::CmdClearDepth{depth_target.value(), 1.0F});
     render_stream.append(device_ir::CmdSetViewport{0.0F, 0.0F, 32.0F, 32.0F, 0.0F, 1.0F});
     render_stream.append(device_ir::CmdSetScissor{0, 0, 32U, 32U});
@@ -1498,6 +1525,138 @@ void d3d12_executes_builtin_shader_suite_and_dispatches_compute() {
     REQUIRE(tone_pixels);
     REQUIRE(tone_pixels.value()[center] > 0.0F && tone_pixels.value()[center] <= 1.01F);
     REQUIRE(tone_pixels.value()[center + 3U] > 0.9F);
+
+    // Independently evaluate the textured shader's complete covered region.
+    // The normal map is (1,+1,1) after the documented DirectX Y conversion.
+    const auto shade_legacy = [&](const std::array<float, 58U> &constants) {
+        device_ir::DeviceCommandStream stream;
+        stream.append(device_ir::CmdTransitionResource{{pbr_target.value()},
+                                                       device_ir::ResourceState::shader_read,
+                                                       device_ir::ResourceState::render_target});
+        stream.append(device_ir::CmdBeginRendering{pbr_target.value(), depth_target.value()});
+        stream.append(device_ir::CmdClearColor{pbr_target.value(), {0, 0, 0, 0}});
+        stream.append(device_ir::CmdClearDepth{depth_target.value(), 1});
+        stream.append(device_ir::CmdSetViewport{0, 0, 32, 32, 0, 1});
+        stream.append(device_ir::CmdSetScissor{0, 0, 32, 32});
+        stream.append(device_ir::CmdBindPipeline{pbr_pipeline.value()});
+        stream.append(device_ir::CmdBindVertexBuffer{vertex_buffer.value(), 0, 52});
+        stream.append(
+            device_ir::CmdBindIndexBuffer{index_buffer.value(), 0, device_ir::IndexFormat::uint32});
+        device_ir::CmdBindResources bindings;
+        for (std::uint32_t slot = 0; slot < 5; ++slot)
+            bindings.bindings.push_back(
+                {0,
+                 slot,
+                 {material_textures[slot]},
+                 slot == 0 ? std::optional{sampler.value()} : std::nullopt});
+        stream.append(std::move(bindings));
+        stream.append(device_ir::CmdPushConstants{bytes_of(constants)});
+        stream.append(device_ir::CmdDrawIndexed{3, 1, 0, 0, 0});
+        stream.append(device_ir::CmdEndRendering{});
+        stream.append(device_ir::CmdTransitionResource{{pbr_target.value()},
+                                                       device_ir::ResourceState::render_target,
+                                                       device_ir::ResourceState::shader_read});
+        const auto serial = device.submit(stream);
+        REQUIRE(serial && device.wait(serial.value()));
+        const auto pixels = device.read_texture_rgba32f(pbr_target.value());
+        REQUIRE(pixels);
+        return pixels.value();
+    };
+    const auto decode_srgb = [](double byte) {
+        const double v = byte / 255.0;
+        return v <= 0.04045 ? v / 12.92 : std::pow((v + 0.055) / 1.055, 2.4);
+    };
+    const double theta = .3, cs = std::cos(theta), sn = std::sin(theta);
+    const auto rotate = [&](core::Vec3d v) {
+        return core::Vec3d{cs * v.x - sn * v.y, sn * v.x + cs * v.y, v.z};
+    };
+    for (double sx : {2.0, -2.0}) {
+        const auto &v = vertices.front();
+        const auto n = rotate({v.normal[0] / sx, v.normal[1] / .5, v.normal[2]}).normalized();
+        auto t = rotate({v.tangent[0] * sx, v.tangent[1] * .5, v.tangent[2]});
+        t = (t - n * core::dot(n, t)).normalized();
+        const auto b = core::cross(n, t) * (double(v.tangent[3]) * (sx < 0 ? -1.0 : 1.0));
+        const auto mapped_normal = (t + b + n).normalized();
+        for (double roughness : {.1, .5, 1.0})
+            for (double metallic : {0.0, .5, 1.0})
+                for (double eye_x : {0.0, 1.0, 3.0})
+                    for (double reserved_w : {-8.0, 0.0, 8.0}) {
+                        auto c = pbr_constants;
+                        c[16] = float(cs * sx);
+                        c[17] = float(sn * sx);
+                        c[20] = float(-sn * .5);
+                        c[21] = float(cs * .5);
+                        c[32] = float(eye_x);
+                        c[35] = float(reserved_w);
+                        c[44] = float(metallic);
+                        c[45] = float(roughness);
+                        const auto parity_pixels = shade_legacy(c);
+                        render::StandardMaterial material;
+                        material.base_color_factor = {1, decode_srgb(128), decode_srgb(64), 1};
+                        material.metallic = metallic;
+                        material.roughness = roughness * 128.0 / 255.0;
+                        material.emissive_factor = {.2, .1 * decode_srgb(64), 0};
+                        material.emissive_strength = 1;
+                        material.dielectric_f0 = .08;
+                        material.clearcoat = .75;
+                        material.clearcoat_roughness = .2;
+                        std::size_t compared = 0;
+                        for (std::size_t p = 0; p < 32U * 32U; ++p) {
+                            if (parity_pixels[p * 4 + 3] < .9F)
+                                continue;
+                            const core::Vec3d position{2.0 * (double(p % 32) + .5) / 32.0 - 1.0,
+                                                       1.0 - 2.0 * (double(p / 32) + .5) / 32.0, 0};
+                            render::PbrSurface surface;
+                            surface.normal = mapped_normal;
+                            surface.view_direction = core::Vec3d{eye_x, 0, 2} - position;
+                            const auto expected = render::evaluate_pbr_reference(
+                                material, surface, {{0, 0, 1}, {4, 4, 4}});
+                            REQUIRE(expected);
+                            const auto rgb = expected.value().hdr_color;
+                            const std::array values{rgb.x, rgb.y, rgb.z};
+                            for (std::size_t channel = 0; channel < 3; ++channel) {
+                                const double actual = parity_pixels[p * 4 + channel],
+                                             wanted = values[channel];
+                                REQUIRE(std::isfinite(actual) &&
+                                        std::abs(actual - wanted) < 3e-4 + std::abs(wanted) * 2e-3);
+                            }
+                            ++compared;
+                        }
+                        REQUIRE(compared > 50);
+                    }
+    }
+    auto grazing = pbr_constants;
+    grazing[32] = 1e7F;
+    grazing[40] = grazing[41] = grazing[42] = 0;
+    grazing[44] = 1;
+    grazing[45] = .7F;
+    grazing[46] = 0; // flat normal isolates the grazing BRDF denominator
+    grazing[56] = 0;
+    const auto grazing_pixels = shade_legacy(grazing);
+    render::StandardMaterial grazing_material;
+    grazing_material.base_color_factor = {1, decode_srgb(128), decode_srgb(64), 1};
+    grazing_material.metallic = 1;
+    grazing_material.roughness = .7*128.0/255.0;
+    grazing_material.dielectric_f0 = .08;
+    for (std::size_t p=0; p<32U*32U; ++p) {
+        if (grazing_pixels[p*4+3] < .9F) continue;
+        render::PbrSurface surface;
+        surface.view_direction = {1e7-(2.0*(double(p%32)+.5)/32.0-1.0),
+            -(1.0-2.0*(double(p/32)+.5)/32.0), 2};
+        const auto expected = render::evaluate_pbr_reference(grazing_material, surface, {{0,0,1},{4,4,4}});
+        REQUIRE(expected);
+        const auto color = expected.value().hdr_color;
+        const std::array values{color.x,color.y,color.z};
+        for (std::size_t channel=0; channel<3; ++channel)
+            REQUIRE(std::abs(grazing_pixels[p*4+channel]-values[channel]) < 3e-4+std::abs(values[channel])*2e-3);
+    }
+    auto unlit = pbr_constants;
+    unlit[40] = unlit[41] = unlit[42] = 0;
+    unlit[52] = unlit[53] = unlit[54] = 0;
+    const auto dark = shade_legacy(unlit);
+    REQUIRE(dark[center] == 0 && dark[center + 1] == 0 && dark[center + 2] == 0);
+    std::cout << "Textured PBR parity: 162 roughness/metal/view/scale/reserved-w cases; full "
+                 "covered regions; no ambient surrogate\n";
 
     const auto shadow_color = device.create_texture(gpu::TextureDesc{
         32U,
