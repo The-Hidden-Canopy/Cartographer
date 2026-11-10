@@ -14,6 +14,7 @@
 #include "project_document_access.hpp"
 #include "../apps/desktop/studio_edge_tools.hpp"
 #include "../apps/desktop/studio_face_tools.hpp"
+#include "../apps/desktop/studio_vertex_tools.hpp"
 #include <carto/ui/ui.hpp>
 #include <carto/geometry/primitives.hpp>
 #include <carto/journal/journal.hpp>
@@ -49,6 +50,20 @@ carto::geometry::EditableMesh quad() {
     const auto d = mesh.add_vertex({0.0, 1.0, 0.0});
     REQUIRE(a && b && c && d);
     REQUIRE(mesh.add_face({a.value(), b.value(), c.value(), d.value()}));
+    return mesh;
+}
+
+carto::geometry::EditableMesh tetrahedron() {
+    carto::geometry::EditableMesh mesh;
+    const auto a = mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto b = mesh.add_vertex({2.0, 0.0, 0.0});
+    const auto c = mesh.add_vertex({0.0, 2.0, 0.0});
+    const auto d = mesh.add_vertex({0.0, 0.0, 2.0});
+    REQUIRE(a && b && c && d);
+    REQUIRE(mesh.add_face({a.value(), c.value(), b.value()}));
+    REQUIRE(mesh.add_face({a.value(), b.value(), d.value()}));
+    REQUIRE(mesh.add_face({a.value(), d.value(), c.value()}));
+    REQUIRE(mesh.add_face({b.value(), c.value(), d.value()}));
     return mesh;
 }
 
@@ -505,6 +520,87 @@ void multi_face_tool_controls_match_authoring_commands() {
     REQUIRE(availability.selected_faces == 0U && !availability.individual && !availability.remove);
 }
 
+void multi_vertex_bevel_controls_use_atomic_project_history() {
+    using namespace carto;
+    Fixture fixture;
+    REQUIRE(fixture.ui.dispatch(application::CreateMeshObjectAction{"Tetrahedron 1", tetrahedron()}));
+    REQUIRE(fixture.ui.dispatch(application::CreateMeshObjectAction{"Tetrahedron 2", tetrahedron()}));
+    const auto objects = fixture.session.snapshot().objects;
+    REQUIRE(objects.size() == 3U);
+    const auto first = objects[1].object;
+    const auto second = objects[2].object;
+    REQUIRE(first.mesh_asset && second.mesh_asset);
+    REQUIRE(fixture.ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::vertex}));
+    REQUIRE(fixture.ui.dispatch(application::SelectVertexAction{first.id, geometry::VertexId{1U}}));
+    auto availability = studio::vertex_tool_availability(fixture.session.snapshot().selection);
+    REQUIRE(availability.selected_vertices == 1U && availability.single && availability.bevel);
+    REQUIRE(fixture.ui.dispatch(application::SelectVertexAction{
+        second.id, geometry::VertexId{1U}, editor::SelectionOperation::add}));
+    availability = studio::vertex_tool_availability(fixture.session.snapshot().selection);
+    REQUIRE(availability.selected_vertices == 2U && !availability.single && availability.bevel);
+    editor::ToolArguments arguments;
+    arguments.distance = 0.25;
+    arguments.segments = 2U;
+    const auto result = fixture.ui.dispatch(application::InvokeToolAction{"mesh.bevel-vertex", arguments});
+    REQUIRE(result && result.value().affected.objects.size() == 2U);
+    REQUIRE(result.value().affected.vertices.size() == 2U);
+    const auto first_beveled = fixture.session.document_.meshes().at(*first.mesh_asset).vertex_count();
+    const auto second_beveled = fixture.session.document_.meshes().at(*second.mesh_asset).vertex_count();
+    REQUIRE(first_beveled > 4U && second_beveled > 4U);
+    REQUIRE(fixture.ui.dispatch(application::UndoAction{}));
+    REQUIRE(fixture.session.document_.meshes().at(*first.mesh_asset).vertex_count() == 4U);
+    REQUIRE(fixture.session.document_.meshes().at(*second.mesh_asset).vertex_count() == 4U);
+    REQUIRE(fixture.ui.dispatch(application::RedoAction{}));
+    REQUIRE(fixture.session.document_.meshes().at(*first.mesh_asset).vertex_count() == first_beveled);
+    REQUIRE(fixture.session.document_.meshes().at(*second.mesh_asset).vertex_count() == second_beveled);
+    REQUIRE(fixture.ui.dispatch(application::SaveProjectAction{}));
+    application::ApplicationSession reopened;
+    REQUIRE(application::testing::dispatch(reopened, application::OpenProjectAction{fixture.path}));
+    REQUIRE(reopened.document_.meshes().at(*first.mesh_asset).vertex_count() == first_beveled);
+    REQUIRE(reopened.document_.meshes().at(*second.mesh_asset).vertex_count() == second_beveled);
+
+    Fixture rejection;
+    REQUIRE(rejection.ui.dispatch(application::CreateMeshObjectAction{"Closed tetrahedron", tetrahedron()}));
+    REQUIRE(rejection.ui.dispatch(application::CreateMeshObjectAction{"Open quad", quad()}));
+    const auto rejected_objects = rejection.session.snapshot().objects;
+    const auto closed = rejected_objects[1].object;
+    const auto open = rejected_objects[2].object;
+    REQUIRE(closed.mesh_asset && open.mesh_asset);
+    REQUIRE(rejection.ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::vertex}));
+    REQUIRE(rejection.ui.dispatch(application::SelectVertexAction{closed.id, geometry::VertexId{1U}}));
+    REQUIRE(rejection.ui.dispatch(application::SelectVertexAction{
+        open.id, geometry::VertexId{1U}, editor::SelectionOperation::add}));
+    const auto before = rejection.session.snapshot();
+    const auto before_document = rejection.session.document_.serialize();
+    const auto rejected = rejection.ui.dispatch(application::InvokeToolAction{"mesh.bevel-vertex", arguments});
+    REQUIRE(!rejected);
+    REQUIRE(rejection.session.document_.serialize() == before_document);
+    REQUIRE(rejection.session.snapshot().project_revision == before.project_revision);
+    REQUIRE(rejection.session.snapshot().undo_count == before.undo_count);
+    REQUIRE(rejection.session.document_.meshes().at(*closed.mesh_asset).vertex_count() == 4U);
+    REQUIRE(rejection.session.document_.meshes().at(*open.mesh_asset).vertex_count() == 4U);
+
+    application::SelectionView selection;
+    selection.mode = editor::SelectionMode::vertex;
+    selection.component_groups.resize(1U);
+    selection.component_groups[0].vertices.resize(editor::kMaxSelectedVerticesPerBevel);
+    availability = studio::vertex_tool_availability(selection);
+    REQUIRE(availability.selected_vertices == editor::kMaxSelectedVerticesPerBevel && availability.bevel);
+    selection.component_groups[0].vertices.emplace_back(geometry::VertexId{65U});
+    availability = studio::vertex_tool_availability(selection);
+    REQUIRE(!availability.bevel && !availability.single);
+    selection.component_groups[0].vertices.clear();
+    availability = studio::vertex_tool_availability(selection);
+    REQUIRE(availability.selected_vertices == 0U && !availability.bevel);
+    selection.component_groups[0].vertices = {geometry::VertexId{1U}};
+    selection.component_groups.resize(2U);
+    availability = studio::vertex_tool_availability(selection);
+    REQUIRE(!availability.single && !availability.bevel);
+    selection.mode = editor::SelectionMode::face;
+    availability = studio::vertex_tool_availability(selection);
+    REQUIRE(availability.selected_vertices == 0U && !availability.single && !availability.bevel);
+}
+
 } // namespace
 
 int main() {
@@ -515,6 +611,7 @@ int main() {
         batch_availability_matches_refusal_for_ineligible_authored_sources();
         multi_edge_tool_controls_match_authoring_commands();
         multi_face_tool_controls_match_authoring_commands();
+        multi_vertex_bevel_controls_use_atomic_project_history();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return EXIT_FAILURE;

@@ -3842,7 +3842,6 @@ core::Result<void> BevelProjectSelectedVertexCommand::execute() {
             core::ErrorCode::invalid_argument,
             "project vertex bevel requires an object-bound vertex selection"));
     }
-    constexpr std::size_t kMaxProjectVertexBevelSelection = 64U;
     std::map<scene::ObjectId, const geometry::EditableMesh*> owner_meshes;
     std::map<std::uint64_t, scene::ObjectId> asset_owners;
     std::size_t selected_vertex_count = 0U;
@@ -3853,7 +3852,7 @@ core::Result<void> BevelProjectSelectedVertexCommand::execute() {
                 "project vertex bevel requires at least one selected vertex per object"));
         }
         if (group.vertices.size() >
-            kMaxProjectVertexBevelSelection - selected_vertex_count) {
+            kMaxSelectedVerticesPerBevel - selected_vertex_count) {
             return core::Result<void>::failure(core::Diagnostic(
                 core::ErrorCode::invalid_argument,
                 "project vertex bevel selection exceeds the 64-vertex command limit"));

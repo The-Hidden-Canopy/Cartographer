@@ -17,6 +17,7 @@ namespace carto::editor {
 
 inline constexpr std::size_t kMaxSelectedFacesPerDeletion = 256U;
 inline constexpr std::size_t kMaxSelectedEdgesPerBevel = 64U;
+inline constexpr std::size_t kMaxSelectedVerticesPerBevel = 64U;
 
 // A project-bound command may mutate a ProjectDocument only when it carries
 // this admission token. ApplicationSession creates the token for an

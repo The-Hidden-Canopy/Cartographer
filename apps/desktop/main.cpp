@@ -43,6 +43,7 @@
 #include "studio_environment_import.hpp"
 #include "studio_edge_tools.hpp"
 #include "studio_face_tools.hpp"
+#include "studio_vertex_tools.hpp"
 #include "studio_material_draft.hpp"
 #include "studio_material_graph_draft.hpp"
 #include "studio_sweep_source.hpp"
@@ -20581,9 +20582,10 @@ struct DesktopState {
                     "The next unmodified click on one unambiguous edge applies one loop cut.");
             }
         } else {
-            const std::size_t count = snapshot.selection.vertices.size();
+            const auto vertex_tools = carto::studio::vertex_tool_availability(snapshot.selection);
+            const std::size_t count = vertex_tools.selected_vertices;
             ImGui::Text("Vertex selection · %zu", count);
-            const bool one_vertex = count == 1U;
+            const bool one_vertex = vertex_tools.single;
             ImGui::BeginDisabled(!one_vertex);
             vertex_slide_factor = std::clamp(vertex_slide_factor, 0.001, 0.999);
             ImGui::InputDouble("Slide factor", &vertex_slide_factor, 0.05, 0.1, "%.3f");
@@ -20593,13 +20595,15 @@ struct DesktopState {
                 static_cast<void>(dispatch(carto::application::InvokeToolAction{
                     "mesh.slide-vertex", arguments}));
             }
+            ImGui::EndDisabled();
+            ImGui::BeginDisabled(!vertex_tools.bevel);
             bevel_width = std::max(bevel_width, 0.0001);
             bevel_segments = std::max(bevel_segments, 1);
             ImGui::InputDouble("Bevel width", &bevel_width, 0.01, 0.1, "%.4f");
             ImGui::TextDisabled(
                 "Concave planar caps scale from the shortest incident edge; convex caps use per-edge width.");
             ImGui::InputInt("Segments", &bevel_segments);
-            if (ImGui::Button("Bevel vertex", ImVec2(-1, 30))) {
+            if (ImGui::Button(one_vertex ? "Bevel vertex" : "Bevel vertices individually", ImVec2(-1, 30))) {
                 carto::editor::ToolArguments arguments;
                 arguments.distance = bevel_width;
                 arguments.segments = static_cast<std::uint32_t>(
@@ -20608,6 +20612,13 @@ struct DesktopState {
                     "mesh.bevel-vertex", arguments}));
             }
             ImGui::EndDisabled();
+            if (count > 1U && vertex_tools.bevel) {
+                ImGui::TextDisabled("Each vertex is beveled in order; the whole operation fails if any vertex is unsupported.");
+            }
+            if (count > carto::editor::kMaxSelectedVerticesPerBevel) {
+                ImGui::TextDisabled("Vertex bevel supports up to %zu selected vertices.",
+                    carto::editor::kMaxSelectedVerticesPerBevel);
+            }
             const bool two_vertices = count == 2U;
             ImGui::BeginDisabled(!two_vertices);
             if (ImGui::Button("Merge vertices", ImVec2(-1, 30))) {
