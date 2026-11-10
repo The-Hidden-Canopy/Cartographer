@@ -13951,6 +13951,35 @@ void application_recovers_long_project_path_after_journal_refusal() {
     journal_path += ".journal";
     journal::Journal durable_journal(journal_path);
     REQUIRE(durable_journal.verify());
+    assets::BlobStore store(parent / ".carto-assets" / "source-blobs");
+    const auto orphan = store.put("unused long-path asset", "application/octet-stream");
+    REQUIRE(orphan);
+    const auto snapshot = reopened.snapshot();
+    const auto inventory = reopened.inspect_source_blob_store(
+        snapshot.project_generation, snapshot.project_revision);
+    REQUIRE(inventory);
+    REQUIRE(std::find(inventory.value().orphan_candidates.begin(),
+        inventory.value().orphan_candidates.end(), orphan.value().digest) !=
+        inventory.value().orphan_candidates.end());
+    const auto blocked_root = parent / "blocked-assets";
+    const auto native_blocked_root = core::native_io_path(blocked_root, error);
+    REQUIRE(!error);
+    REQUIRE(core::create_directories(native_blocked_root, error));
+    REQUIRE(!error);
+    application::ApplicationSession blocked_assets;
+    REQUIRE(application::testing::dispatch(blocked_assets,
+        application::SaveProjectAction{blocked_root / "project.carto"}));
+    const auto native_bad_directory = core::native_io_path(blocked_root / ".carto-assets", error);
+    REQUIRE(!error);
+    {
+        std::ofstream bad_directory(native_bad_directory, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(bad_directory));
+        bad_directory << "not a directory";
+    }
+    const auto blocked_snapshot = blocked_assets.snapshot();
+    const auto rejected_inventory = blocked_assets.inspect_source_blob_store(
+        blocked_snapshot.project_generation, blocked_snapshot.project_revision);
+    REQUIRE(!rejected_inventory && rejected_inventory.error().code == core::ErrorCode::validation_failed);
 }
 
 int main() {

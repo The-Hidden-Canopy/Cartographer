@@ -3203,7 +3203,10 @@ core::Result<assets::BlobOrphanReport> ApplicationSession::inspect_source_blob_s
         ? std::filesystem::current_path(error) : saved_project_path->parent_path();
     if (error) return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
         core::ErrorCode::io_error, "unable to resolve the saved project directory"));
-    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    const auto native_root = core::native_io_path(requested_root, error);
+    if (error) return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the saved project directory"));
+    const auto project_root = std::filesystem::weakly_canonical(native_root, error);
     if (error || project_root.empty()) {
         return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
             core::ErrorCode::io_error, "unable to resolve the saved project directory"));
@@ -3274,7 +3277,10 @@ core::Result<assets::BlobOrphanReport> ApplicationSession::inspect_source_blob_s
     auto managed_directory = project_root;
     for (const auto component : {".carto-assets", "source-blobs"}) {
         managed_directory /= component;
-        const auto status = std::filesystem::symlink_status(managed_directory, error);
+        const auto native_managed_directory = core::native_io_path(managed_directory, error);
+        if (error) return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
+            core::ErrorCode::io_error, "unable to resolve the managed source blob directory"));
+        const auto status = std::filesystem::symlink_status(native_managed_directory, error);
         if (error && error != std::errc::no_such_file_or_directory) {
             return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
                 core::ErrorCode::io_error,
