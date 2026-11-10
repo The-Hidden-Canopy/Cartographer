@@ -2030,13 +2030,19 @@ core::Result<RecoveryInspection> inspect_recovery_unlocked(
     inspection.journal_path = journal_path_for(project_path);
 
     std::error_code error;
-    const bool project_exists = std::filesystem::exists(project_path, error);
+    const auto native_project = core::native_io_path(project_path, error);
+    if (error) return core::Result<RecoveryInspection>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the project path"));
+    const bool project_exists = std::filesystem::exists(native_project, error);
     if (error) {
         return core::Result<RecoveryInspection>::failure(core::Diagnostic(
             core::ErrorCode::io_error,
             "unable to inspect the project path"));
     }
-    const bool journal_exists = std::filesystem::exists(inspection.journal_path, error);
+    const auto native_journal = core::native_io_path(inspection.journal_path, error);
+    if (error) return core::Result<RecoveryInspection>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the project journal path"));
+    const bool journal_exists = std::filesystem::exists(native_journal, error);
     if (error) {
         return core::Result<RecoveryInspection>::failure(core::Diagnostic(
             core::ErrorCode::io_error,
@@ -2145,14 +2151,19 @@ core::Result<RecoveryInspection> ApplicationSession::inspect_recovery(
     }
 
     std::error_code error;
-    const bool project_exists = std::filesystem::exists(project_path, error);
+    const auto native_project = core::native_io_path(project_path, error);
+    if (error) return core::Result<RecoveryInspection>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the project path"));
+    const bool project_exists = std::filesystem::exists(native_project, error);
     if (error) {
         return core::Result<RecoveryInspection>::failure(core::Diagnostic(
             core::ErrorCode::io_error,
             "unable to inspect the project path"));
     }
-    const bool journal_exists =
-        std::filesystem::exists(journal_path_for(project_path), error);
+    const auto native_journal = core::native_io_path(journal_path_for(project_path), error);
+    if (error) return core::Result<RecoveryInspection>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the project journal path"));
+    const bool journal_exists = std::filesystem::exists(native_journal, error);
     if (error) {
         return core::Result<RecoveryInspection>::failure(core::Diagnostic(
             core::ErrorCode::io_error,
@@ -2185,7 +2196,10 @@ core::Result<ApplicationSession::PreparedJournal> ApplicationSession::prepare_jo
 
     const auto path = journal_path_for(project_path);
     std::error_code exists_error;
-    const bool existed = std::filesystem::exists(path, exists_error);
+    const auto native_path = core::native_io_path(path, exists_error);
+    if (exists_error) return core::Result<PreparedJournal>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the project journal path"));
+    const bool existed = std::filesystem::exists(native_path, exists_error);
     if (exists_error) {
         return core::Result<PreparedJournal>::failure(core::Diagnostic(
             core::ErrorCode::io_error,
@@ -2194,7 +2208,7 @@ core::Result<ApplicationSession::PreparedJournal> ApplicationSession::prepare_jo
     std::uintmax_t original_bytes = 0U;
     if (existed) {
         std::error_code size_error;
-        original_bytes = std::filesystem::file_size(path, size_error);
+        original_bytes = std::filesystem::file_size(native_path, size_error);
         if (size_error) {
             return core::Result<PreparedJournal>::failure(core::Diagnostic(
                 core::ErrorCode::io_error,
@@ -4679,11 +4693,16 @@ core::Result<DispatchReceipt> ApplicationSession::save_project(const SaveProject
     const auto saved = document_.save_atomic_unlocked(*selected);
     if (!saved) {
         std::error_code cleanup_error;
+        const auto native_journal = core::native_io_path(
+            prepared_journal.value().journal.path(), cleanup_error);
+        if (cleanup_error) return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project save failed and durable journal rollback path could not be resolved"));
         if (prepared_journal.value().created_file) {
-            std::filesystem::remove(prepared_journal.value().journal.path(), cleanup_error);
+            std::filesystem::remove(native_journal, cleanup_error);
         } else if (prepared_journal.value().appended_baseline) {
             std::filesystem::resize_file(
-                prepared_journal.value().journal.path(),
+                native_journal,
                 prepared_journal.value().original_bytes,
                 cleanup_error);
         }

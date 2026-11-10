@@ -1,4 +1,5 @@
 #include <carto/project/file_lock.hpp>
+#include <carto/core/filesystem.hpp>
 
 #include <mutex>
 #include <utility>
@@ -77,6 +78,10 @@ core::Result<void> FileLock::acquire() {
 
     auto lock_path = target_;
     lock_path += ".lock";
+    std::error_code path_error;
+    lock_path = core::native_io_path(lock_path, path_error);
+    if (path_error) return core::Result<void>::failure(io_error(
+        "unable to resolve file lock path"));
     const auto parent = lock_path.parent_path();
     if (!parent.empty()) {
         std::error_code error;

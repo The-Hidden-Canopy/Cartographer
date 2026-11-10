@@ -72,7 +72,8 @@ public:
 
     ~TempDirectory() {
         std::error_code ignored;
-        std::filesystem::remove_all(path_, ignored);
+        const auto native = carto::core::native_io_path(path_, ignored);
+        if (!ignored) std::filesystem::remove_all(native, ignored);
     }
 
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
@@ -13901,6 +13902,57 @@ void application_projects_planar_uvs_through_human_revisioned_history() {
     REQUIRE(locked_session.document_.meshes().at(*selected.mesh_asset).uv_sets().find(8U) == nullptr);
 }
 
+void application_recovers_long_project_path_after_journal_refusal() {
+    using namespace carto;
+    TempDirectory directory;
+    const auto parent = directory.path() / std::string(160U, 'l') / std::string(80U, 'p');
+    std::error_code error;
+    const auto native_parent = core::native_io_path(parent, error);
+    REQUIRE(!error);
+    REQUIRE(core::create_directories(native_parent, error));
+    REQUIRE(!error);
+    const auto path = parent / "long-journal.carto";
+#ifdef _WIN32
+    REQUIRE(path.native().size() > 260U);
+#endif
+    application::ApplicationSession session;
+    REQUIRE(application::testing::dispatch(session, application::SaveProjectAction{path}));
+    REQUIRE(application::testing::dispatch(session,
+        application::CreateBoxAction{"First", {1.0, 1.0, 1.0}}));
+    REQUIRE(application::testing::dispatch(session, application::SaveProjectAction{}));
+    const auto before = session.snapshot();
+    auto marker = path;
+    marker += ".journal.uncertain";
+    const auto native_marker = core::native_io_path(marker, error);
+    REQUIRE(!error);
+    REQUIRE(std::filesystem::create_directory(native_marker, error));
+    REQUIRE(!error);
+    const auto blocked = application::testing::dispatch(session,
+        application::CreateBoxAction{"Blocked", {1.0, 1.0, 1.0}});
+    REQUIRE(!blocked);
+    const auto after_refusal = session.snapshot();
+    REQUIRE(after_refusal.project_revision == before.project_revision);
+    REQUIRE(after_refusal.objects.size() == before.objects.size());
+    REQUIRE(after_refusal.undo_count == before.undo_count);
+    REQUIRE(std::filesystem::is_directory(native_marker));
+    REQUIRE(std::filesystem::remove(native_marker, error));
+    REQUIRE(!error);
+    REQUIRE(application::testing::dispatch(session,
+        application::CreateBoxAction{"Recovered", {1.0, 1.0, 1.0}}));
+    const auto pending = application::ApplicationSession::inspect_recovery(path);
+    REQUIRE(pending && pending.value().state == application::RecoveryInspectionState::pending);
+    application::ApplicationSession reopened;
+    REQUIRE(application::testing::dispatch(reopened,
+        application::OpenProjectAction{path, false, application::OpenProjectOptions{true}}));
+    REQUIRE(reopened.snapshot().objects.size() == 2U);
+    const auto clean = application::ApplicationSession::inspect_recovery(path);
+    REQUIRE(clean && clean.value().state == application::RecoveryInspectionState::clean);
+    auto journal_path = path;
+    journal_path += ".journal";
+    journal::Journal durable_journal(journal_path);
+    REQUIRE(durable_journal.verify());
+}
+
 int main() {
     try {
         application_mesh_geometry_digest_is_canonical_and_revision_independent();
@@ -14048,6 +14100,7 @@ int main() {
         application_routes_spatial_field_creation_and_paint_through_revisioned_history();
         application_authors_revision_bound_roads_through_history_and_journal();
         application_routes_source_reimport_through_human_history();
+        application_recovers_long_project_path_after_journal_refusal();
         application_reviews_authored_source_metadata_through_human_history();
         application_source_blob_inventory_refuses_managed_root_symlinks();
         application_source_blob_inventory_retains_journal_reachable_blobs();

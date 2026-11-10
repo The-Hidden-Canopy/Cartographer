@@ -9052,13 +9052,17 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
 }
 
 core::Result<ProjectDocument> ProjectDocument::load(const std::filesystem::path& path) {
-    std::ifstream input(path, std::ios::binary);
+    std::error_code path_error;
+    const auto native_path = core::native_io_path(path, path_error);
+    if (path_error) return core::Result<ProjectDocument>::failure(
+        Diagnostic(ErrorCode::io_error, "unable to resolve project file path"));
+    std::ifstream input(native_path, std::ios::binary);
     if (!input) {
         return core::Result<ProjectDocument>::failure(
             Diagnostic(ErrorCode::io_error, "unable to open project file for reading"));
     }
     std::error_code size_error;
-    const auto file_size = std::filesystem::file_size(path, size_error);
+    const auto file_size = std::filesystem::file_size(native_path, size_error);
     if (size_error) {
         return core::Result<ProjectDocument>::failure(
             Diagnostic(ErrorCode::io_error, "unable to inspect project file size"));

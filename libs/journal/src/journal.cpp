@@ -1,4 +1,5 @@
 #include <carto/journal/journal.hpp>
+#include <carto/core/filesystem.hpp>
 
 #include <algorithm>
 #include <charconv>
@@ -146,11 +147,16 @@ public:
     ~JournalFileLock() { release(); }
 
     core::Result<void> acquire(const std::filesystem::path& journal_path, bool exclusive) {
-        const std::filesystem::path lock_path = journal_path.string() + ".lock";
+        auto lock_path = journal_path;
+        lock_path += ".lock";
+        std::error_code path_error;
+        lock_path = core::native_io_path(lock_path, path_error);
+        if (path_error) return core::Result<void>::failure(io_error(
+            "unable to resolve journal lock path"));
         const auto parent = lock_path.parent_path();
         if (!parent.empty()) {
             std::error_code error;
-            std::filesystem::create_directories(parent, error);
+            core::create_directories(parent, error);
             if (error) return core::Result<void>::failure(io_error(
                 "unable to create journal lock directory"));
         }
@@ -320,12 +326,16 @@ core::Result<JournalEntry> Journal::parse_record(std::string_view line) const {
 core::Result<std::vector<JournalEntry>> Journal::read_all() const {
     std::lock_guard lock(g_journal_mutex);
     std::error_code error;
-    const bool journal_exists = std::filesystem::exists(path_, error);
+    const auto native_path = core::native_io_path(path_, error);
+    if (error) return core::Result<std::vector<JournalEntry>>::failure(
+        io_error("unable to resolve journal path"));
+    const bool journal_exists = std::filesystem::exists(native_path, error);
     if (error) {
         return core::Result<std::vector<JournalEntry>>::failure(
             io_error("unable to inspect journal path"));
     }
-    const std::filesystem::path lock_path = path_.string() + ".lock";
+    auto lock_path = native_path;
+    lock_path += ".lock";
     const bool lock_exists = std::filesystem::exists(lock_path, error);
     if (error) {
         return core::Result<std::vector<JournalEntry>>::failure(
@@ -343,7 +353,10 @@ core::Result<std::vector<JournalEntry>> Journal::read_all() const {
 
 core::Result<std::vector<JournalEntry>> Journal::read_all_unlocked() const {
     std::error_code error;
-    if (std::filesystem::exists(uncertainty_marker(path_), error)) {
+    const auto native_path = core::native_io_path(path_, error);
+    if (error) return core::Result<std::vector<JournalEntry>>::failure(
+        io_error("unable to resolve journal path"));
+    if (std::filesystem::exists(uncertainty_marker(native_path), error)) {
         return core::Result<std::vector<JournalEntry>>::failure(
             io_error("journal has an unresolved append uncertainty marker"));
     }
@@ -351,13 +364,13 @@ core::Result<std::vector<JournalEntry>> Journal::read_all_unlocked() const {
         return core::Result<std::vector<JournalEntry>>::failure(
             io_error("unable to inspect journal uncertainty marker"));
     }
-    if (!std::filesystem::exists(path_, error)) {
+    if (!std::filesystem::exists(native_path, error)) {
         if (error) {
             return core::Result<std::vector<JournalEntry>>::failure(io_error("unable to inspect journal path"));
         }
         return core::Result<std::vector<JournalEntry>>::success({});
     }
-    const auto file_size = std::filesystem::file_size(path_, error);
+    const auto file_size = std::filesystem::file_size(native_path, error);
     if (error) {
         return core::Result<std::vector<JournalEntry>>::failure(
             io_error("unable to inspect journal size"));
@@ -366,7 +379,7 @@ core::Result<std::vector<JournalEntry>> Journal::read_all_unlocked() const {
         return core::Result<std::vector<JournalEntry>>::failure(
             validation("journal file exceeds the configured limit"));
     }
-    std::ifstream stream(path_, std::ios::binary);
+    std::ifstream stream(native_path, std::ios::binary);
     if (!stream) {
         return core::Result<std::vector<JournalEntry>>::failure(io_error("unable to open journal"));
     }
@@ -457,33 +470,36 @@ core::Result<JournalEntry> Journal::append(const JournalAppend& request) {
         return core::Result<JournalEntry>::failure(invalid("journal record exceeds the configured limit"));
     }
 
-    const auto parent = path_.parent_path();
     std::error_code error;
+    const auto native_path = core::native_io_path(path_, error);
+    if (error) return core::Result<JournalEntry>::failure(io_error(
+        "unable to resolve journal path"));
+    const auto parent = native_path.parent_path();
     if (!parent.empty()) {
-        std::filesystem::create_directories(parent, error);
+        core::create_directories(parent, error);
         if (error) {
             return core::Result<JournalEntry>::failure(io_error("unable to create journal directory"));
         }
     }
-    const bool exists = std::filesystem::exists(path_, error);
+    const bool exists = std::filesystem::exists(native_path, error);
     if (error) {
         return core::Result<JournalEntry>::failure(io_error("unable to inspect journal before append"));
     }
     bool needs_header = !exists;
     if (exists) {
-        const auto size = std::filesystem::file_size(path_, error);
+        const auto size = std::filesystem::file_size(native_path, error);
         if (error) {
             return core::Result<JournalEntry>::failure(io_error("unable to inspect journal size"));
         }
         needs_header = size == 0U;
     }
-    const auto original_size = exists ? std::filesystem::file_size(path_, error) : 0U;
+    const auto original_size = exists ? std::filesystem::file_size(native_path, error) : 0U;
     if (error) {
         return core::Result<JournalEntry>::failure(io_error("unable to record journal append boundary"));
     }
     // Persist the uncertainty boundary before touching journal bytes. A failed
     // rollback, close, or cleanup must remain visible to a new process.
-    const auto marker_path = uncertainty_marker(path_);
+    const auto marker_path = uncertainty_marker(native_path);
     std::ofstream pending(marker_path, std::ios::binary | std::ios::trunc);
     if (!pending) {
         return core::Result<JournalEntry>::failure(io_error("unable to create journal uncertainty marker"));
@@ -502,7 +518,7 @@ core::Result<JournalEntry> Journal::append(const JournalAppend& request) {
         }
         return core::Result<void>::success();
     };
-    std::ofstream stream(path_, std::ios::binary | std::ios::app);
+    std::ofstream stream(native_path, std::ios::binary | std::ios::app);
     if (!stream) {
         if (auto cleared = clear_marker(); !cleared) {
             return core::Result<JournalEntry>::failure(cleared.error());
@@ -518,9 +534,9 @@ core::Result<JournalEntry> Journal::append(const JournalAppend& request) {
     if (!stream) {
         std::error_code rollback_error;
         if (exists) {
-            std::filesystem::resize_file(path_, original_size, rollback_error);
+            std::filesystem::resize_file(native_path, original_size, rollback_error);
         } else {
-            std::filesystem::remove(path_, rollback_error);
+            std::filesystem::remove(native_path, rollback_error);
         }
         if (rollback_error) {
             return core::Result<JournalEntry>::failure(

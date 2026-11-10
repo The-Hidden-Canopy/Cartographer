@@ -3,6 +3,7 @@
 // and leaves parsing, locks, hashes, revisions and all Journal methods intact.
 // No test hook or fault switch is added to the production library or ABI.
 #include <carto/journal/journal.hpp>
+#include <carto/core/filesystem.hpp>
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -118,7 +119,8 @@ public:
     ~TempDirectory() {
         journal_io_fault::control = {};
         std::error_code ignored;
-        std::filesystem::remove_all(path_, ignored);
+        const auto native = carto::core::native_io_path(path_, ignored);
+        if (!ignored) std::filesystem::remove_all(native, ignored);
     }
     const std::filesystem::path& path() const { return path_; }
 private:
@@ -126,7 +128,10 @@ private:
 };
 
 std::string bytes(const std::filesystem::path& path) {
-    std::ifstream input(path, std::ios::binary);
+    std::error_code error;
+    const auto native = carto::core::native_io_path(path, error);
+    require(!error, "resolve evidence file");
+    std::ifstream input(native, std::ios::binary);
     require(static_cast<bool>(input), "read evidence file");
     return std::string(std::istreambuf_iterator<char>(input), {});
 }
@@ -145,7 +150,10 @@ void seed(Journal& journal) {
 }
 
 void fail_append(Journal& journal, Failure failure, bool rollback_failure) {
-    journal_io_fault::control = {journal.path(), failure, rollback_failure, false, false};
+    std::error_code error;
+    const auto native = carto::core::native_io_path(journal.path(), error);
+    require(!error, "resolve fault target");
+    journal_io_fault::control = {native, failure, rollback_failure, false, false};
     const auto failed = append(journal, 1U, 2U);
     require(!failed, "injected append must report failure");
     require(journal_io_fault::control.output_failure_reported, "actual output fault reached");
@@ -252,6 +260,30 @@ void uncertain_journal_does_not_block_independent_journal() {
     require(static_cast<bool>(append(independent, 1U, 2U)), "unrelated journal remains usable");
     require(static_cast<bool>(independent.verify()), "unrelated journal remains verified");
 }
+
+void long_path_preserves_rollback_and_uncertainty() {
+    TempDirectory temp;
+    const auto directory = temp.path() / std::string(160U, 'l') / std::string(80U, 'j');
+    std::error_code error;
+    const auto native_directory = carto::core::native_io_path(directory, error);
+    require(!error, "resolve long journal directory");
+    require(carto::core::create_directories(native_directory, error) && !error,
+        "create long journal directory");
+    const auto path = directory / "journal.log";
+#ifdef _WIN32
+    require(path.native().size() > 260U, "journal fixture exceeds Windows legacy path limit");
+#endif
+    Journal journal(path);
+    seed(journal);
+    const auto before = bytes(path);
+    fail_append(journal, Failure::complete_record_flush, false);
+    require(bytes(path) == before, "long-path successful rollback restores exact bytes");
+    Journal reopened(path);
+    const auto revision = reopened.current_revision();
+    require(revision && revision.value() == Revision{1U}, "long-path reopen retains revision");
+    fail_append(reopened, Failure::partial_record, true);
+    require(blocked_without_mutation(path), "long-path uncertainty blocks fresh readers and writers");
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -274,5 +306,6 @@ int main(int argc, char** argv) {
         complete_record_failed_rollback_blocks_fresh_process(std::filesystem::absolute(argv[0]));
     });
     run("uncertainty is scoped to its own journal", uncertain_journal_does_not_block_independent_journal);
+    run("long-path rollback and uncertainty", long_path_preserves_rollback_and_uncertainty);
     return failed == 0U ? 0 : 1;
 }
