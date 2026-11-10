@@ -1,3 +1,4 @@
+#include <carto/core/filesystem.hpp>
 #include <carto/production/prepared_publication.hpp>
 
 #include "link_test_support.hpp"
@@ -16,6 +17,16 @@
 #include <vector>
 
 namespace {
+
+std::filesystem::path test_io_path(const std::filesystem::path& path) {
+    std::error_code error;
+    const auto result = carto::core::native_io_path(path, error);
+    if (error) {
+        std::cerr << "FAIL: test path cannot be resolved\n";
+        std::exit(EXIT_FAILURE);
+    }
+    return result;
+}
 
 void require(bool condition, const char* message) {
     if (!condition) {
@@ -46,7 +57,7 @@ public:
 
     ~TempDirectory() {
         std::error_code ignored;
-        std::filesystem::remove_all(path_, ignored);
+        std::filesystem::remove_all(test_io_path(path_), ignored);
     }
 
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
@@ -56,8 +67,10 @@ private:
 };
 
 void write_text(const std::filesystem::path& path, std::string_view value) {
-    std::filesystem::create_directories(path.parent_path());
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    std::error_code error;
+    carto::core::create_directories(test_io_path(path.parent_path()), error);
+    require(!error, "test parent directory creates");
+    std::ofstream output(test_io_path(path), std::ios::binary | std::ios::trunc);
     require(static_cast<bool>(output), "test file opens");
     output.write(value.data(), static_cast<std::streamsize>(value.size()));
     output.close();
@@ -224,7 +237,7 @@ void publication_is_atomic_complete_and_relocatable() {
         "conflicting immutable content cannot advance current");
 
     const auto relocated = temp.path() / "relocated";
-    std::filesystem::copy(root, relocated, std::filesystem::copy_options::recursive);
+    std::filesystem::copy(test_io_path(root), test_io_path(relocated), std::filesystem::copy_options::recursive);
     require(selected_digest(relocated) == second_digest,
         "publication remains valid after relocation");
 
@@ -238,7 +251,7 @@ void publication_is_atomic_complete_and_relocatable() {
         "post-publication product corruption is detected");
 
     const auto with_extra = temp.path() / "with-extra";
-    std::filesystem::copy(root, with_extra, std::filesystem::copy_options::recursive);
+    std::filesystem::copy(test_io_path(root), test_io_path(with_extra), std::filesystem::copy_options::recursive);
     const auto extra_revision = with_extra / "revisions" / second_digest.hex();
     write_text(extra_revision / "undeclared.bin", "undeclared");
     require(!production::read_selected_prepared_scene(with_extra),
@@ -412,6 +425,30 @@ void publication_rejects_missing_selector_over_nonempty_store() {
         "selector-loss rejection preserves the existing immutable revision");
 }
 
+void publication_reopens_and_detects_corruption_under_long_paths() {
+    using namespace carto;
+    TempDirectory temp;
+    const auto root = temp.path() / std::string(80U, 'a') /
+        std::string(80U, 'b') / std::string(80U, 'c') / "published";
+    require(root.native().size() > 260U, "fixture exercises an extended publication path");
+    const auto first = make_fixture(40U, "long-path-first");
+    const auto second = make_fixture(41U, "long-path-second");
+    const auto published = production::publish_prepared_scene(
+        root, first.envelope, first.payloads, std::nullopt);
+    require(static_cast<bool>(published), "long-path publication succeeds");
+    require(selected_digest(root) == fixture_digest(first.envelope),
+        "long-path publication reopens");
+    const auto updated = production::publish_prepared_scene(
+        root, second.envelope, second.payloads, published.value().prepared_scene_digest);
+    require(static_cast<bool>(updated), "long-path selector replacement succeeds");
+    require(selected_digest(root) == fixture_digest(second.envelope),
+        "updated long-path publication reopens");
+    write_text(updated.value().revision_path / second.envelope.products.front().relative_path,
+        "corrupted product");
+    require(!production::read_selected_prepared_scene(root),
+        "long-path publication still rejects product corruption");
+}
+
 void dependency_closure_digest_binds_the_resolved_closure() {
     using namespace carto;
     TempDirectory temp;
@@ -469,6 +506,7 @@ int main() {
     publication_is_bound_to_source_lineage();
     publication_rejects_linked_ancestor_paths();
     publication_rejects_missing_selector_over_nonempty_store();
+    publication_reopens_and_detects_corruption_under_long_paths();
     dependency_closure_digest_binds_the_resolved_closure();
     std::cout << "prepared publication tests passed\n";
     return EXIT_SUCCESS;

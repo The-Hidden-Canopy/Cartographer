@@ -1,5 +1,7 @@
 #include <carto/verification/failure_injection.hpp>
 
+#include <carto/core/filesystem.hpp>
+
 #include <algorithm>
 #include <fstream>
 #include <iterator>
@@ -58,7 +60,12 @@ core::Result<std::filesystem::path> resolve_revision_file(
     }
     const auto full = output_root / "revisions" / revision_digest.hex() / relative;
     std::error_code error;
-    const auto status = std::filesystem::symlink_status(full, error);
+    const auto native = core::native_io_path(full, error);
+    if (error) {
+        return core::Result<std::filesystem::path>::failure(io_error(
+            std::string(label) + " path cannot be resolved"));
+    }
+    const auto status = std::filesystem::symlink_status(native, error);
     if (error &&
         error.default_error_condition() !=
             std::make_error_condition(std::errc::no_such_file_or_directory)) {
@@ -73,7 +80,7 @@ core::Result<std::filesystem::path> resolve_revision_file(
         return core::Result<std::filesystem::path>::failure(io_error(
             std::string(label) + " is missing or not a regular file"));
     }
-    return core::Result<std::filesystem::path>::success(full);
+    return core::Result<std::filesystem::path>::success(native);
 }
 
 core::Result<std::vector<std::uint8_t>> read_file_bytes(

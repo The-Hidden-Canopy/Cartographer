@@ -1,3 +1,4 @@
+#include <carto/core/filesystem.hpp>
 #include <carto/attributes/layer.hpp>
 #include <carto/attributes/set.hpp>
 #include <carto/attributes/uv.hpp>
@@ -25,6 +26,16 @@
 
 namespace {
 
+std::filesystem::path test_io_path(const std::filesystem::path& path) {
+    std::error_code error;
+    const auto result = carto::core::native_io_path(path, error);
+    if (error) {
+        std::cerr << "FAIL: test path cannot be resolved\n";
+        std::exit(EXIT_FAILURE);
+    }
+    return result;
+}
+
 void require(bool condition, const char* message) {
     if (!condition) {
         std::cerr << "FAIL: " << message << '\n';
@@ -45,7 +56,7 @@ public:
 
     ~TempDirectory() {
         std::error_code ignored;
-        std::filesystem::remove_all(path_, ignored);
+        std::filesystem::remove_all(test_io_path(path_), ignored);
     }
 
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
@@ -355,7 +366,7 @@ void one_operation_is_shared_complete_and_last_valid() {
     require(material_product != selected.value()->envelope.products.end(),
         "prepared material catalog product is declared");
     std::ifstream material_input(
-        selected.value()->revision_path / material_product->relative_path,
+        test_io_path(selected.value()->revision_path / material_product->relative_path),
         std::ios::binary);
     const std::string material_text{
         std::istreambuf_iterator<char>{material_input},
@@ -367,7 +378,7 @@ void one_operation_is_shared_complete_and_last_valid() {
 
     const auto relocated = temp.path() / "relocated";
     std::filesystem::copy(
-        output_root, relocated, std::filesystem::copy_options::recursive);
+        test_io_path(output_root), test_io_path(relocated), std::filesystem::copy_options::recursive);
     std::error_code remove_error;
     std::filesystem::remove_all(source_root, remove_error);
     require(!remove_error &&
@@ -501,7 +512,7 @@ void portable_source_meaning_survives_narrower_optional_lookdev() {
     require(material_product != selected.value()->envelope.products.end(),
         "source material catalog remains included");
     std::ifstream input(
-        selected.value()->revision_path / material_product->relative_path,
+        test_io_path(selected.value()->revision_path / material_product->relative_path),
         std::ios::binary);
     const std::string encoded{
         std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};

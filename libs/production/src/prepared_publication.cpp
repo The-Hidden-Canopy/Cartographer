@@ -1,5 +1,6 @@
 #include <carto/production/prepared_publication.hpp>
 
+#include <carto/core/filesystem.hpp>
 #include <carto/project/file_lock.hpp>
 
 #include <algorithm>
@@ -23,6 +24,13 @@
 
 namespace carto::production {
 namespace {
+
+// Resolve only for filesystem calls; callers retain their logical paths.
+std::filesystem::path io_path(const std::filesystem::path& path) {
+    std::error_code error;
+    const auto native = core::native_io_path(path, error);
+    return error ? path : native;
+}
 
 constexpr std::string_view kSelectorMagic = "CARTOGRAPHER_PREPARED_SELECTION";
 constexpr std::uint32_t kSelectorVersion = 1U;
@@ -63,7 +71,7 @@ std::string unique_suffix() {
 
 core::Result<void> reject_symlink(const std::filesystem::path& path) {
     std::error_code error;
-    const auto status = std::filesystem::symlink_status(path, error);
+    const auto status = std::filesystem::symlink_status(io_path(path), error);
     if (error &&
         error.default_error_condition() !=
             std::make_error_condition(std::errc::no_such_file_or_directory)) {
@@ -75,7 +83,7 @@ core::Result<void> reject_symlink(const std::filesystem::path& path) {
             "prepared publication paths cannot be symbolic links"));
     }
 #ifdef _WIN32
-    const DWORD attributes = GetFileAttributesW(path.wstring().c_str());
+    const DWORD attributes = GetFileAttributesW(io_path(path).wstring().c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES) {
         const DWORD failure = GetLastError();
         if (failure != ERROR_FILE_NOT_FOUND && failure != ERROR_PATH_NOT_FOUND) {
@@ -120,18 +128,18 @@ core::Result<bool> revision_store_is_empty(
         return core::Result<bool>::failure(result.error());
     }
     std::error_code error;
-    if (!std::filesystem::exists(revisions, error)) {
+    if (!std::filesystem::exists(io_path(revisions), error)) {
         if (error) {
             return core::Result<bool>::failure(io_error(
                 "unable to inspect prepared revision store"));
         }
         return core::Result<bool>::success(true);
     }
-    if (!std::filesystem::is_directory(revisions, error) || error) {
+    if (!std::filesystem::is_directory(io_path(revisions), error) || error) {
         return core::Result<bool>::failure(validation(
             "prepared revision store is not a directory"));
     }
-    const std::filesystem::directory_iterator first(revisions, error);
+    const std::filesystem::directory_iterator first(io_path(revisions), error);
     if (error) {
         return core::Result<bool>::failure(io_error(
             "unable to enumerate prepared revision store"));
@@ -148,7 +156,7 @@ core::Result<std::vector<std::uint8_t>> read_bounded_bytes(
         return core::Result<std::vector<std::uint8_t>>::failure(result.error());
     }
     std::error_code error;
-    const bool regular_file = std::filesystem::is_regular_file(path, error);
+    const bool regular_file = std::filesystem::is_regular_file(io_path(path), error);
     if (error) {
         return core::Result<std::vector<std::uint8_t>>::failure(io_error(
             std::string(label) + " status query failed: " + error.message()));
@@ -157,13 +165,13 @@ core::Result<std::vector<std::uint8_t>> read_bounded_bytes(
         return core::Result<std::vector<std::uint8_t>>::failure(io_error(
             std::string(label) + " is missing or not a regular file"));
     }
-    const auto size = std::filesystem::file_size(path, error);
+    const auto size = std::filesystem::file_size(io_path(path), error);
     if (error || size > maximum || size > std::numeric_limits<std::size_t>::max()) {
         return core::Result<std::vector<std::uint8_t>>::failure(validation(
             std::string(label) + " exceeds its bounded size"));
     }
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
-    std::ifstream input(path, std::ios::binary);
+    std::ifstream input(io_path(path), std::ios::binary);
     if (!input) {
         return core::Result<std::vector<std::uint8_t>>::failure(io_error(
             "unable to open " + std::string(label)));
@@ -191,18 +199,18 @@ core::Result<void> write_bytes(
     }
     if (auto result = reject_link_chain(path.parent_path()); !result) return result;
     std::error_code error;
-    std::filesystem::create_directories(path.parent_path(), error);
+    core::create_directories(io_path(path.parent_path()), error);
     if (error) {
         return core::Result<void>::failure(io_error(
             "unable to create " + std::string(label) + " parent"));
     }
     if (auto result = reject_link_chain(path.parent_path()); !result) return result;
     if (auto result = reject_link_chain(path); !result) return result;
-    if (std::filesystem::exists(path, error) || error) {
+    if (std::filesystem::exists(io_path(path), error) || error) {
         return core::Result<void>::failure(validation(
             std::string(label) + " refuses to overwrite an existing path"));
     }
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    std::ofstream output(io_path(path), std::ios::binary | std::ios::trunc);
     if (!output) {
         return core::Result<void>::failure(io_error(
             "unable to create " + std::string(label)));
@@ -233,7 +241,7 @@ core::Result<std::optional<assets::Sha256Digest>> read_selector(
     const std::filesystem::path& output_root) {
     const auto path = output_root / "current";
     std::error_code exists_error;
-    const bool exists = std::filesystem::exists(path, exists_error);
+    const bool exists = std::filesystem::exists(io_path(path), exists_error);
     if (exists_error) {
         return core::Result<std::optional<assets::Sha256Digest>>::failure(io_error(
             "unable to inspect prepared selection"));
@@ -289,26 +297,26 @@ core::Result<void> replace_selector_atomically(
     }
 #ifdef _WIN32
     std::error_code exists_error;
-    const bool exists = std::filesystem::exists(current, exists_error);
+    const bool exists = std::filesystem::exists(io_path(current), exists_error);
     if (exists_error) {
         std::error_code ignored;
-        std::filesystem::remove(temporary, ignored);
+        std::filesystem::remove(io_path(temporary), ignored);
         return core::Result<void>::failure(io_error(
             "unable to inspect current prepared selection"));
     }
     BOOL replaced = FALSE;
     if (exists) {
         replaced = ReplaceFileW(
-            current.wstring().c_str(), temporary.wstring().c_str(), nullptr,
+            io_path(current).wstring().c_str(), io_path(temporary).wstring().c_str(), nullptr,
             REPLACEFILE_WRITE_THROUGH, nullptr, nullptr);
     } else {
         replaced = MoveFileExW(
-            temporary.wstring().c_str(), current.wstring().c_str(),
+            io_path(temporary).wstring().c_str(), io_path(current).wstring().c_str(),
             MOVEFILE_WRITE_THROUGH);
     }
     if (!replaced) {
         std::error_code ignored;
-        std::filesystem::remove(temporary, ignored);
+        std::filesystem::remove(io_path(temporary), ignored);
         return core::Result<void>::failure(io_error(
             "atomic prepared selection replacement failed"));
     }
@@ -331,7 +339,7 @@ core::Result<SelectedPreparedScene> load_revision(
         return core::Result<SelectedPreparedScene>::failure(result.error());
     }
     std::error_code error;
-    if (!std::filesystem::is_directory(revision_path, error) || error) {
+    if (!std::filesystem::is_directory(io_path(revision_path), error) || error) {
         return core::Result<SelectedPreparedScene>::failure(io_error(
             "prepared revision directory is unavailable"));
     }
@@ -366,7 +374,7 @@ core::Result<SelectedPreparedScene> load_revision(
     }
     auto remaining_files = expected_files;
     std::filesystem::recursive_directory_iterator cursor(
-        revision_path, std::filesystem::directory_options::none, error);
+        io_path(revision_path), std::filesystem::directory_options::none, error);
     const std::filesystem::recursive_directory_iterator end;
     if (error) {
         return core::Result<SelectedPreparedScene>::failure(io_error(
@@ -382,9 +390,8 @@ core::Result<SelectedPreparedScene> load_revision(
             return core::Result<SelectedPreparedScene>::failure(io_error(
                 "unable to inspect prepared revision entry"));
         }
-        const auto relative = std::filesystem::relative(
-            entry_path, revision_path, error).generic_string();
-        if (error || relative.empty()) {
+        const auto relative = entry_path.lexically_relative(io_path(revision_path)).generic_string();
+        if (relative.empty()) {
             return core::Result<SelectedPreparedScene>::failure(io_error(
                 "unable to resolve prepared revision entry"));
         }
@@ -438,7 +445,7 @@ public:
     ~StagingCleanup() {
         if (!active_) return;
         std::error_code ignored;
-        std::filesystem::remove_all(path_, ignored);
+        std::filesystem::remove_all(io_path(path_), ignored);
     }
     void release() noexcept { active_ = false; }
 
@@ -533,7 +540,7 @@ core::Result<PreparedPublicationReceipt> publish_prepared_scene(
         return core::Result<PreparedPublicationReceipt>::failure(result.error());
     }
     std::error_code error;
-    std::filesystem::create_directories(output_root, error);
+    core::create_directories(io_path(output_root), error);
     if (error) {
         return core::Result<PreparedPublicationReceipt>::failure(io_error(
             "unable to create prepared publication root"));
@@ -545,7 +552,7 @@ core::Result<PreparedPublicationReceipt> publish_prepared_scene(
     if (auto result = reject_link_chain(revisions); !result) {
         return core::Result<PreparedPublicationReceipt>::failure(result.error());
     }
-    std::filesystem::create_directories(revisions, error);
+    core::create_directories(io_path(revisions), error);
     if (error) {
         return core::Result<PreparedPublicationReceipt>::failure(io_error(
             "unable to create prepared revision store"));
@@ -611,7 +618,7 @@ core::Result<PreparedPublicationReceipt> publish_prepared_scene(
         return core::Result<PreparedPublicationReceipt>::failure(result.error());
     }
     bool reused = false;
-    const bool final_exists = std::filesystem::exists(final_path, error);
+    const bool final_exists = std::filesystem::exists(io_path(final_path), error);
     if (error) {
         return core::Result<PreparedPublicationReceipt>::failure(io_error(
             "unable to inspect immutable prepared revision"));
@@ -625,7 +632,7 @@ core::Result<PreparedPublicationReceipt> publish_prepared_scene(
         reused = true;
     } else {
         const auto staging = revisions / (".stage-" + unique_suffix());
-        if (!std::filesystem::create_directory(staging, error) || error) {
+        if (!std::filesystem::create_directory(io_path(staging), error) || error) {
             return core::Result<PreparedPublicationReceipt>::failure(io_error(
                 "unable to create prepared revision staging directory"));
         }
@@ -651,7 +658,7 @@ core::Result<PreparedPublicationReceipt> publish_prepared_scene(
             return core::Result<PreparedPublicationReceipt>::failure(
                 verified.error().with_context("prepared revision staging verification"));
         }
-        std::filesystem::rename(staging, final_path, error);
+        std::filesystem::rename(io_path(staging), io_path(final_path), error);
         if (error) {
             return core::Result<PreparedPublicationReceipt>::failure(io_error(
                 "unable to publish immutable prepared revision"));

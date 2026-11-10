@@ -1,5 +1,7 @@
 #include <carto/production/prepared_character.hpp>
 
+#include <carto/core/filesystem.hpp>
+
 #include <carto/character/coordinate.hpp>
 
 #include <algorithm>
@@ -130,7 +132,13 @@ core::Result<std::vector<std::uint8_t>> read_bounded_file(
     std::uintmax_t maximum,
     std::string_view label) {
     std::error_code error;
-    const auto status = std::filesystem::symlink_status(path, error);
+    const auto native = core::native_io_path(path, error);
+    if (error) {
+        return core::Result<std::vector<std::uint8_t>>::failure(core::Diagnostic(
+            core::ErrorCode::io_error,
+            "unable to resolve prepared character " + std::string(label)));
+    }
+    const auto status = std::filesystem::symlink_status(native, error);
     if (error) {
         return core::Result<std::vector<std::uint8_t>>::failure(core::Diagnostic(
             core::ErrorCode::io_error,
@@ -145,13 +153,13 @@ core::Result<std::vector<std::uint8_t>> read_bounded_file(
             core::ErrorCode::io_error,
             "prepared character " + std::string(label) + " is missing or not a regular file"));
     }
-    const auto size = std::filesystem::file_size(path, error);
+    const auto size = std::filesystem::file_size(native, error);
     if (error || size > maximum || size > std::numeric_limits<std::size_t>::max()) {
         return core::Result<std::vector<std::uint8_t>>::failure(validation(
             "prepared character " + std::string(label) + " exceeds its bounded size"));
     }
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
-    std::ifstream input(path, std::ios::binary);
+    std::ifstream input(native, std::ios::binary);
     if (!input) {
         return core::Result<std::vector<std::uint8_t>>::failure(core::Diagnostic(
             core::ErrorCode::io_error,
@@ -630,7 +638,8 @@ core::Result<character::CharacterPreparedManifest> verify_prepared_character_pac
             "prepared character package directory must not be empty"));
     }
     std::error_code error;
-    if (!std::filesystem::is_directory(package_dir, error) || error) {
+    const auto native_package_dir = core::native_io_path(package_dir, error);
+    if (error || !std::filesystem::is_directory(native_package_dir, error) || error) {
         return core::Result<character::CharacterPreparedManifest>::failure(core::Diagnostic(
             core::ErrorCode::io_error,
             "prepared character package directory is unavailable"));
@@ -671,7 +680,7 @@ core::Result<character::CharacterPreparedManifest> verify_prepared_character_pac
     std::map<std::string, assets::Sha256Digest> payload_digests;
     std::uintmax_t total_bytes = manifest_bytes.value().size();
     std::filesystem::recursive_directory_iterator cursor(
-        package_dir, std::filesystem::directory_options::none, error);
+        native_package_dir, std::filesystem::directory_options::none, error);
     const std::filesystem::recursive_directory_iterator end;
     if (error) {
         return core::Result<character::CharacterPreparedManifest>::failure(core::Diagnostic(
@@ -690,9 +699,8 @@ core::Result<character::CharacterPreparedManifest> verify_prepared_character_pac
             return core::Result<character::CharacterPreparedManifest>::failure(validation(
                 "prepared character package contains a symbolic link"));
         }
-        const auto relative =
-            std::filesystem::relative(entry_path, package_dir, error).generic_string();
-        if (error || relative.empty()) {
+        const auto relative = entry_path.lexically_relative(native_package_dir).generic_string();
+        if (relative.empty()) {
             return core::Result<character::CharacterPreparedManifest>::failure(core::Diagnostic(
                 core::ErrorCode::io_error,
                 "unable to resolve prepared character package entry"));
