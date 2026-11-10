@@ -20619,8 +20619,7 @@ struct DesktopState {
                 ImGui::TextDisabled("Vertex bevel supports up to %zu selected vertices.",
                     carto::editor::kMaxSelectedVerticesPerBevel);
             }
-            const bool two_vertices = count == 2U;
-            ImGui::BeginDisabled(!two_vertices);
+            ImGui::BeginDisabled(!vertex_tools.merge_pair);
             if (ImGui::Button("Merge vertices", ImVec2(-1, 30))) {
                 static_cast<void>(dispatch(carto::application::InvokeToolAction{
                     "mesh.merge-vertices", {}}));
@@ -20632,7 +20631,7 @@ struct DesktopState {
                     "mesh.merge-vertices", arguments}));
             }
             ImGui::EndDisabled();
-            ImGui::BeginDisabled(count < 2U);
+            ImGui::BeginDisabled(!vertex_tools.merge_by_distance);
             ImGui::InputDouble("Merge distance", &merge_distance, 0.0001, 0.001, "%.5f");
             merge_distance = std::max(merge_distance, 1e-9);
             if (ImGui::Button("Merge by distance", ImVec2(-1, 30))) {
@@ -20663,8 +20662,10 @@ struct DesktopState {
             }
             ImGui::EndDisabled();
             ImGui::EndDisabled();
-            if (!one_vertex && count < 2U) {
-                ImGui::TextDisabled("Select one vertex, or two or more vertices to merge.");
+            if (count > 1U && !vertex_tools.merge_by_distance) {
+                ImGui::TextDisabled("Merging requires at least two selected vertices in every selected object.");
+            } else if (count == 0U) {
+                ImGui::TextDisabled("Select vertices to edit.");
             }
         }
 

@@ -6,6 +6,8 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 
 ## 0.1 - current foundation
 
+- [x] native vertex merge controls use per-object cardinality for target/center weld and merge-by-distance; existing command validation remains authoritative for geometry and shared assets
+
 - [x] CMake target graph and headless build
 - [x] double-precision scene objects and cycle-safe hierarchy
 - [x] editable polygon mesh with stable IDs and topology validation
