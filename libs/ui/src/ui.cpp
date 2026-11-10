@@ -2,6 +2,7 @@
 
 #include <carto/assets/blob_store.hpp>
 #include <carto/assets/texture_source.hpp>
+#include <carto/core/filesystem.hpp>
 #include <carto/io/builtin_provider.hpp>
 #include <carto/io/gltf_scene_import.hpp>
 #include <carto/io/obj.hpp>
@@ -889,13 +890,16 @@ core::Result<std::string> read_bounded_file(
             std::string(description) + " path must name a file"));
     }
     std::error_code error;
-    if (!std::filesystem::is_regular_file(path, error)) {
+    const auto native_path = core::native_io_path(path, error);
+    if (error) return core::Result<std::string>::failure(io_error(
+        "unable to resolve " + std::string(description) + " path"));
+    if (!std::filesystem::is_regular_file(native_path, error)) {
         return core::Result<std::string>::failure(error
             ? io_error(std::string(description) + " file is unavailable")
             : core::Diagnostic(core::ErrorCode::not_found,
                 std::string(description) + " file does not exist"));
     }
-    const auto size = std::filesystem::file_size(path, error);
+    const auto size = std::filesystem::file_size(native_path, error);
     if (error) return core::Result<std::string>::failure(io_error(
         "unable to inspect " + std::string(description) + " size"));
     if (size > maximum_bytes || size > std::numeric_limits<std::size_t>::max() ||
@@ -903,7 +907,7 @@ core::Result<std::string> read_bounded_file(
         return core::Result<std::string>::failure(validation(
             std::string(description) + " file exceeds the supported size"));
     }
-    std::ifstream stream(path, std::ios::binary);
+    std::ifstream stream(native_path, std::ios::binary);
     if (!stream) return core::Result<std::string>::failure(io_error(
         "unable to open " + std::string(description) + " file"));
     std::string bytes(static_cast<std::size_t>(size), '\0');
@@ -986,7 +990,10 @@ core::Result<void> validate_managed_directory_chain(
     std::error_code error;
     for (const auto& component : relative) {
         cursor /= component;
-        const auto status = std::filesystem::symlink_status(cursor, error);
+        const auto native_cursor = core::native_io_path(cursor, error);
+        if (error) return core::Result<void>::failure(io_error(
+            "unable to resolve managed mesh directory"));
+        const auto status = std::filesystem::symlink_status(native_cursor, error);
         if (error && error != std::errc::no_such_file_or_directory) {
             return core::Result<void>::failure(io_error(
                 "unable to inspect managed mesh directory"));
@@ -1006,8 +1013,11 @@ core::Result<PendingMeshSource> stage_mesh_source(
     const std::filesystem::path& project_path) {
     constexpr std::size_t kMaxMeshSourceBytes = 128U * 1024U * 1024U;
     std::error_code error;
-    const auto canonical_source = std::filesystem::canonical(source_path, error);
-    if (error || !std::filesystem::is_regular_file(canonical_source, error) || error) {
+    const auto native_source = core::native_io_path(source_path, error);
+    if (error) return core::Result<PendingMeshSource>::failure(io_error(
+        "mesh source is not a readable regular file"));
+    const auto canonical_source = std::filesystem::canonical(native_source, error);
+    if (error || !std::filesystem::is_regular_file(native_source, error) || error) {
         return core::Result<PendingMeshSource>::failure(io_error(
             "mesh source is not a readable regular file"));
     }
@@ -1020,7 +1030,10 @@ core::Result<PendingMeshSource> stage_mesh_source(
         : project_path.parent_path();
     if (error) return core::Result<PendingMeshSource>::failure(io_error(
         "unable to resolve the saved project directory"));
-    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    const auto native_root = core::native_io_path(requested_root, error);
+    if (error) return core::Result<PendingMeshSource>::failure(io_error(
+        "unable to resolve the saved project directory"));
+    const auto project_root = std::filesystem::weakly_canonical(native_root, error);
     if (error || project_root.empty()) return core::Result<PendingMeshSource>::failure(io_error(
         "unable to resolve the saved project directory"));
 
@@ -1037,10 +1050,16 @@ core::Result<PendingMeshSource> stage_mesh_source(
     if (auto checked = validate_managed_directory_chain(project_root, staging_root); !checked) {
         return core::Result<PendingMeshSource>::failure(checked.error());
     }
-    std::filesystem::create_directories(staging_root, error);
+    const auto native_staging_root = core::native_io_path(staging_root, error);
+    if (error) return core::Result<PendingMeshSource>::failure(io_error(
+        "unable to resolve the private mesh import staging directory"));
+    core::create_directories(native_staging_root, error);
     if (error) return core::Result<PendingMeshSource>::failure(io_error(
         "unable to create the private mesh import staging directory"));
-    const auto staged_path = preference_temporary_path(staging_root / (digest.hex() + ".snapshot"));
+    const auto staged_path = core::native_io_path(
+        preference_temporary_path(staging_root / (digest.hex() + ".snapshot")), error);
+    if (error) return core::Result<PendingMeshSource>::failure(io_error(
+        "unable to resolve a private mesh import snapshot"));
     std::ofstream staged_file(staged_path, std::ios::binary | std::ios::trunc);
     if (!staged_file) return core::Result<PendingMeshSource>::failure(io_error(
         "unable to create a private mesh import snapshot"));
@@ -1087,7 +1106,10 @@ core::Result<StagedMeshSource> persist_mesh_source(
         return core::Result<StagedMeshSource>::failure(checked.error());
     }
     std::error_code error;
-    const auto destination_status = std::filesystem::symlink_status(destination, error);
+    const auto native_destination = core::native_io_path(destination, error);
+    if (error) return core::Result<StagedMeshSource>::failure(io_error(
+        "unable to resolve managed mesh source file"));
+    const auto destination_status = std::filesystem::symlink_status(native_destination, error);
     if (error && error != std::errc::no_such_file_or_directory) {
         return core::Result<StagedMeshSource>::failure(io_error(
             "unable to inspect managed mesh source file"));
@@ -1109,7 +1131,7 @@ core::Result<StagedMeshSource> persist_mesh_source(
         return core::Result<StagedMeshSource>::failure(validation(
             "managed mesh source digest changed during persistence"));
     }
-    const auto canonical_destination = std::filesystem::canonical(destination, error);
+    const auto canonical_destination = std::filesystem::canonical(native_destination, error);
     if (error || !is_within_directory(pending.project_root, canonical_destination)) {
         return core::Result<StagedMeshSource>::failure(validation(
             "managed mesh source resolved outside the saved project directory"));
@@ -10521,7 +10543,9 @@ core::Result<application::RelinkMovedSourceAction> UiController::prepare_moved_s
     const auto requested_root = current.project_path->parent_path().empty()
         ? std::filesystem::current_path(error) : current.project_path->parent_path();
     if (error) return Result::failure(io_error("unable to resolve the saved project directory"));
-    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    const auto native_root = core::native_io_path(requested_root, error);
+    if (error) return Result::failure(io_error("unable to resolve the saved project directory"));
+    const auto project_root = std::filesystem::weakly_canonical(native_root, error);
     if (error || project_root.empty()) {
         return Result::failure(io_error("unable to resolve the saved project directory"));
     }
@@ -10530,7 +10554,9 @@ core::Result<application::RelinkMovedSourceAction> UiController::prepare_moved_s
     if (auto checked = validate_managed_directory_chain(project_root, destination.parent_path()); !checked) {
         return Result::failure(checked.error());
     }
-    const auto status = std::filesystem::symlink_status(destination, error);
+    const auto native_destination = core::native_io_path(destination, error);
+    if (error) return Result::failure(io_error("unable to resolve the managed source blob"));
+    const auto status = std::filesystem::symlink_status(native_destination, error);
     if (error && error != std::errc::no_such_file_or_directory) {
         return Result::failure(io_error("unable to inspect the managed source blob"));
     }
@@ -10543,7 +10569,7 @@ core::Result<application::RelinkMovedSourceAction> UiController::prepare_moved_s
     if (stored.value().digest != digest) {
         return Result::failure(validation("moved source digest changed during persistence"));
     }
-    const auto canonical_destination = std::filesystem::canonical(destination, error);
+    const auto canonical_destination = std::filesystem::canonical(native_destination, error);
     if (error || !is_within_directory(project_root, canonical_destination)) {
         return Result::failure(validation("moved source blob resolved outside the saved project directory"));
     }

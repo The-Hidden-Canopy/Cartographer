@@ -1,6 +1,7 @@
 #include <carto/ui/ui.hpp>
 #include <carto/assets/blob_store.hpp>
 #include <carto/assets/source_registry.hpp>
+#include <carto/core/filesystem.hpp>
 #include <carto/geometry/primitives.hpp>
 #include <carto/journal/journal.hpp>
 #include <carto/project/project.hpp>
@@ -37,7 +38,8 @@ public:
     }
     ~TempDirectory() {
         std::error_code ignored;
-        std::filesystem::remove_all(path_, ignored);
+        const auto native = carto::core::native_io_path(path_, ignored);
+        if (!ignored) std::filesystem::remove_all(native, ignored);
     }
     const std::filesystem::path& path() const noexcept { return path_; }
 
@@ -46,13 +48,19 @@ private:
 };
 
 std::string read_bytes(const std::filesystem::path& path) {
-    std::ifstream input(path, std::ios::binary);
+    std::error_code error;
+    const auto native_path = carto::core::native_io_path(path, error);
+    REQUIRE(!error);
+    std::ifstream input(native_path, std::ios::binary);
     REQUIRE(input.good());
     return {std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
 }
 
 void write_bytes(const std::filesystem::path& path, std::string_view bytes) {
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    std::error_code error;
+    const auto native_path = carto::core::native_io_path(path, error);
+    REQUIRE(!error);
+    std::ofstream output(native_path, std::ios::binary | std::ios::trunc);
     REQUIRE(output.good());
     output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     REQUIRE(output.good());
@@ -271,7 +279,16 @@ void frontend_relinks_only_exact_moved_source_bytes_with_retained_lineage() {
     TempDirectory directory;
     const auto path = directory.path() / "source-relink.carto";
     const std::string source_bytes = "o Triangle\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
-    const auto moved_path = directory.path() / "moved.obj";
+    const auto moved_directory = directory.path() / std::string(160U, 'x');
+    std::error_code moved_directory_error;
+    const auto native_moved_directory = core::native_io_path(moved_directory, moved_directory_error);
+    REQUIRE(!moved_directory_error);
+    REQUIRE(core::create_directories(native_moved_directory, moved_directory_error));
+    REQUIRE(!moved_directory_error);
+    const auto moved_path = moved_directory / "moved.obj";
+#ifdef _WIN32
+    REQUIRE(moved_path.native().size() > 260U);
+#endif
     const auto changed_path = directory.path() / "changed.obj";
     write_bytes(moved_path, source_bytes);
     write_bytes(changed_path, source_bytes + "# changed source bytes\n");
@@ -406,7 +423,16 @@ void frontend_restores_native_import_source_without_registry_or_journal_mutation
     using namespace carto;
     TempDirectory directory;
     const auto path = directory.path() / "native-source-restoration.carto";
-    const auto original_path = directory.path() / "original.obj";
+    const auto original_directory = directory.path() / std::string(160U, 'y');
+    std::error_code original_directory_error;
+    const auto native_original_directory = core::native_io_path(original_directory, original_directory_error);
+    REQUIRE(!original_directory_error);
+    REQUIRE(core::create_directories(native_original_directory, original_directory_error));
+    REQUIRE(!original_directory_error);
+    const auto original_path = original_directory / "original.obj";
+#ifdef _WIN32
+    REQUIRE(original_path.native().size() > 260U);
+#endif
     const auto moved_path = directory.path() / "moved-source.obj";
     const std::string source_bytes = "o Triangle\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
     write_bytes(original_path, source_bytes);
@@ -425,8 +451,13 @@ void frontend_restores_native_import_source_without_registry_or_journal_mutation
         managed_blob.lexically_relative(directory.path()).generic_string());
     REQUIRE(store.verify(registered.source_digest));
     const auto before = capture_publication(ui, session, path);
-    std::filesystem::rename(managed_blob, moved_path);
-    REQUIRE(!std::filesystem::exists(managed_blob));
+    std::error_code blob_path_error;
+    const auto native_managed_blob = core::native_io_path(managed_blob, blob_path_error);
+    REQUIRE(!blob_path_error);
+    const auto native_moved_path = core::native_io_path(moved_path, blob_path_error);
+    REQUIRE(!blob_path_error);
+    std::filesystem::rename(native_managed_blob, native_moved_path);
+    REQUIRE(!std::filesystem::exists(native_managed_blob));
     REQUIRE(read_bytes(moved_path) == source_bytes);
 
     const auto prepared = ui.prepare_moved_source_relink(registered.identity, moved_path,
@@ -471,18 +502,20 @@ void frontend_refuses_internal_source_symlink_substitution_after_relink_review()
     const auto before = capture_publication(ui, session, path);
     assets::BlobStore store(directory.path() / ".carto-assets" / "source-blobs");
     const auto managed_blob = store.path_for(registered.source_digest);
-    REQUIRE(std::filesystem::remove(managed_blob));
     std::error_code error;
-    std::filesystem::create_symlink(internal_alias, managed_blob, error);
+    const auto native_managed_blob = core::native_io_path(managed_blob, error);
+    REQUIRE(!error);
+    REQUIRE(std::filesystem::remove(native_managed_blob));
+    std::filesystem::create_symlink(internal_alias, native_managed_blob, error);
     if (error) {
         std::cout << "SKIP: internal source symlink substitution case unavailable: "
             << error.message() << '\n';
         return;
     }
-    REQUIRE(std::filesystem::is_symlink(std::filesystem::symlink_status(managed_blob)));
-    REQUIRE(std::filesystem::equivalent(managed_blob, internal_alias));
-    // Equal verified bytes inside the project must not authorize a different locator.
-    REQUIRE(store.verify(registered.source_digest));
+    REQUIRE(std::filesystem::is_symlink(std::filesystem::symlink_status(native_managed_blob)));
+    REQUIRE(std::filesystem::equivalent(native_managed_blob, internal_alias));
+    // Equal bytes inside the project must not authorize a different locator.
+    REQUIRE(!store.verify(registered.source_digest));
     const auto relinked = ui.relink_moved_source(prepared.value(), source.project_generation,
         source.project_revision);
     REQUIRE(!relinked && relinked.error().code == core::ErrorCode::validation_failed);

@@ -641,13 +641,19 @@ core::Result<void> verify_source_blob(
         : project_path.parent_path();
     if (error) return core::Result<void>::failure(core::Diagnostic(
         core::ErrorCode::io_error, "unable to resolve the saved project directory"));
-    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    const auto native_root = core::native_io_path(requested_root, error);
+    if (error) return core::Result<void>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the saved project directory"));
+    const auto project_root = std::filesystem::weakly_canonical(native_root, error);
     if (error || project_root.empty()) return core::Result<void>::failure(core::Diagnostic(
         core::ErrorCode::io_error, "unable to resolve the saved project directory"));
 
     assets::BlobStore store(project_root / ".carto-assets" / "source-blobs");
     const auto expected_path = store.path_for(record.source_digest);
-    const auto stored_path = std::filesystem::canonical(expected_path, error);
+    const auto native_expected = core::native_io_path(expected_path, error);
+    if (error) return core::Result<void>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the source-backed mesh path"));
+    const auto stored_path = std::filesystem::canonical(native_expected, error);
     if (error) return core::Result<void>::failure(core::Diagnostic(
         core::ErrorCode::not_found, "source-backed mesh bytes are missing"));
     const auto relative_path = stored_path.lexically_relative(project_root);
@@ -660,7 +666,10 @@ core::Result<void> verify_source_blob(
             core::ErrorCode::validation_failed,
             "source-backed mesh path is not the project-local content-addressed blob"));
     }
-    const auto size = std::filesystem::file_size(stored_path, error);
+    const auto native_stored = core::native_io_path(stored_path, error);
+    if (error) return core::Result<void>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the source-backed mesh path"));
+    const auto size = std::filesystem::file_size(native_stored, error);
     if (error || size > kMaxMeshSourceBytes) {
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::validation_failed,
@@ -679,14 +688,20 @@ core::Result<std::string> locate_staged_source(
         : project_path.parent_path();
     if (error) return core::Result<std::string>::failure(core::Diagnostic(
         core::ErrorCode::io_error, "unable to resolve the saved project directory"));
-    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    const auto native_root = core::native_io_path(requested_root, error);
+    if (error) return core::Result<std::string>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the saved project directory"));
+    const auto project_root = std::filesystem::weakly_canonical(native_root, error);
     if (error || project_root.empty()) {
         return core::Result<std::string>::failure(core::Diagnostic(
             core::ErrorCode::io_error, "unable to resolve the saved project directory"));
     }
     assets::BlobStore store(project_root / ".carto-assets" / "source-blobs");
     const auto expected_path = store.path_for(digest);
-    const auto stored_path = std::filesystem::canonical(expected_path, error);
+    const auto native_expected = core::native_io_path(expected_path, error);
+    if (error) return core::Result<std::string>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the staged source path"));
+    const auto stored_path = std::filesystem::canonical(native_expected, error);
     if (error) return core::Result<std::string>::failure(core::Diagnostic(
         core::ErrorCode::not_found, "staged source bytes are missing"));
     const auto relative_path = stored_path.lexically_relative(project_root);
@@ -699,7 +714,10 @@ core::Result<std::string> locate_staged_source(
             core::ErrorCode::validation_failed,
             "staged source path is not the project-local content-addressed blob"));
     }
-    const auto size = std::filesystem::file_size(stored_path, error);
+    const auto native_stored = core::native_io_path(stored_path, error);
+    if (error) return core::Result<std::string>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the staged source path"));
+    const auto size = std::filesystem::file_size(native_stored, error);
     if (error || size > kMaxMeshSourceBytes) {
         return core::Result<std::string>::failure(core::Diagnostic(
             core::ErrorCode::validation_failed,
