@@ -9,6 +9,7 @@
 #include <carto/project/recovery.hpp>
 #include <carto/project/transaction.hpp>
 #include <carto/core/json.hpp>
+#include <carto/core/filesystem.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -37,6 +38,19 @@ public:
         }                                                                                \
     } while (false)
 
+std::filesystem::path native_path(const std::filesystem::path& path) {
+    std::error_code error;
+    const auto native = carto::core::native_io_path(path, error);
+    REQUIRE(!error);
+    return native;
+}
+
+void create_test_directories(const std::filesystem::path& path) {
+    std::error_code error;
+    carto::core::create_directories(native_path(path), error);
+    REQUIRE(!error);
+}
+
 class TempDirectory final {
 public:
     TempDirectory() {
@@ -48,7 +62,8 @@ public:
 
     ~TempDirectory() {
         std::error_code ignored;
-        std::filesystem::remove_all(path_, ignored);
+        const auto native = carto::core::native_io_path(path_, ignored);
+        if (!ignored) std::filesystem::remove_all(native, ignored);
     }
 
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
@@ -91,8 +106,15 @@ void project_file_lock_serializes_writers_in_process() {
 
 void blob_store_temporary_name_fits_a_valid_digest_path() {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-    const auto base = std::filesystem::temp_directory_path() /
+    auto scratch = std::filesystem::temp_directory_path();
+    const auto current = std::filesystem::current_path();
+    if (current.native().size() < scratch.native().size()) scratch = current;
+    const auto base = scratch /
         ("bp-" + std::to_string(stamp));
+    if (base.native().size() >= 159U) {
+        std::cout << "SKIP: scratch path is too long for the bounded-name case\n";
+        return;
+    }
     REQUIRE(std::filesystem::create_directory(base));
     const auto base_chars = base.native().size();
     REQUIRE(base_chars < 159U);
@@ -121,7 +143,7 @@ void blob_store_temporary_name_fits_a_valid_digest_path() {
     REQUIRE(store.verify(digest));
     const auto listed = store.list();
     REQUIRE(listed && listed.value().size() == 2U);
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(native_path(root))) {
         if (!entry.is_regular_file()) continue;
         const auto name = entry.path().filename().string();
         REQUIRE(name.size() == 64U);
@@ -138,7 +160,7 @@ void blob_store_temporary_name_fits_a_valid_digest_path() {
     REQUIRE(std::string(std::istreambuf_iterator<char>(sentinel),
                         std::istreambuf_iterator<char>()) == "preserve");
     sentinel.close();
-    std::filesystem::remove_all(base);
+    std::filesystem::remove_all(native_path(base));
 }
 
 void blob_store_is_content_addressed_and_integrity_checked() {
@@ -149,13 +171,13 @@ void blob_store_is_content_addressed_and_integrity_checked() {
     REQUIRE(stored.value().bytes == 5U);
     REQUIRE(stored.value().digest.hex() ==
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
-    REQUIRE(std::filesystem::is_regular_file(store.path_for(stored.value().digest)));
+    REQUIRE(std::filesystem::is_regular_file(native_path(store.path_for(stored.value().digest))));
     const auto read = store.read(stored.value().digest);
     REQUIRE(read);
     REQUIRE(std::string(read.value().begin(), read.value().end()) == "hello");
     REQUIRE(store.verify(stored.value().digest));
 
-    std::ofstream tamper(store.path_for(stored.value().digest), std::ios::binary | std::ios::trunc);
+    std::ofstream tamper(native_path(store.path_for(stored.value().digest)), std::ios::binary | std::ios::trunc);
     tamper << "tampered";
     tamper.close();
     REQUIRE(!store.verify(stored.value().digest));
@@ -234,7 +256,7 @@ void blob_store_lists_deterministically_and_reports_orphan_candidates() {
     REQUIRE(!invalid_pending_report && invalid_pending_report.error().code ==
         carto::core::ErrorCode::validation_failed);
 
-    std::ofstream tamper(store.path_for(second.value().digest), std::ios::binary | std::ios::trunc);
+    std::ofstream tamper(native_path(store.path_for(second.value().digest)), std::ios::binary | std::ios::trunc);
     tamper << "corrupted";
     tamper.close();
     REQUIRE(store.list());
@@ -279,9 +301,9 @@ void blob_store_rejects_digest_named_entries_outside_canonical_shards() {
     carto::assets::BlobStore wrong_depth_store(wrong_depth_root);
     const auto digest = carto::assets::sha256(std::span<const std::uint8_t>{});
     const auto wrong_depth_path = wrong_depth_root / "sha256" / "extra" / digest.hex();
-    std::filesystem::create_directories(wrong_depth_path.parent_path());
+    create_test_directories(wrong_depth_path.parent_path());
     {
-        std::ofstream file(wrong_depth_path, std::ios::binary | std::ios::trunc);
+        std::ofstream file(native_path(wrong_depth_path), std::ios::binary | std::ios::trunc);
         REQUIRE(static_cast<bool>(file));
     }
     const auto wrong_depth_listing = wrong_depth_store.list();
@@ -296,9 +318,9 @@ void blob_store_rejects_digest_named_entries_outside_canonical_shards() {
     carto::assets::BlobStore malformed_store(malformed_root);
     const auto malformed_path = malformed_root / "sha256" / "00" / "00" /
         std::string(64U, 'g');
-    std::filesystem::create_directories(malformed_path.parent_path());
+    create_test_directories(malformed_path.parent_path());
     {
-        std::ofstream file(malformed_path, std::ios::binary | std::ios::trunc);
+        std::ofstream file(native_path(malformed_path), std::ios::binary | std::ios::trunc);
         REQUIRE(static_cast<bool>(file));
     }
     const auto malformed_listing = malformed_store.list();
@@ -317,9 +339,9 @@ void blob_store_rejects_digest_named_entries_outside_canonical_shards() {
     }
     const auto uppercase_path = uppercase_root / "sha256" /
         canonical_hex.substr(0U, 2U) / canonical_hex.substr(2U, 2U) / uppercase_hex;
-    std::filesystem::create_directories(uppercase_path.parent_path());
+    create_test_directories(uppercase_path.parent_path());
     {
-        std::ofstream file(uppercase_path, std::ios::binary | std::ios::trunc);
+        std::ofstream file(native_path(uppercase_path), std::ios::binary | std::ios::trunc);
         REQUIRE(static_cast<bool>(file));
     }
     const auto uppercase_listing = uppercase_store.list();
@@ -340,7 +362,7 @@ void blob_store_refuses_symlinked_blob_files() {
         file << payload;
         REQUIRE(static_cast<bool>(file));
     }
-    const auto blob_path = store.path_for(stored.value().digest);
+    const auto blob_path = native_path(store.path_for(stored.value().digest));
     std::error_code error;
     REQUIRE(std::filesystem::remove(blob_path, error));
     REQUIRE(!error);
@@ -784,7 +806,7 @@ void package_persists_evaluation_graph_as_verified_content_addressed_state() {
 
     const auto graph_blob = opened.value().manifest().evaluation_graph_blob.value();
     const auto graph_path = opened.value().blob_store().path_for(graph_blob);
-    std::ofstream tampered(graph_path, std::ios::binary | std::ios::trunc);
+    std::ofstream tampered(native_path(graph_path), std::ios::binary | std::ios::trunc);
     tampered << "tampered";
     tampered.close();
     const auto rejected = carto::project::ProjectPackage::open(path);
