@@ -109,7 +109,8 @@ carto::geometry::EditableMesh make_cross_tile_mesh() {
 
 int create_fixture_with_mesh(
     const std::filesystem::path& path,
-    carto::geometry::EditableMesh mesh) {
+    carto::geometry::EditableMesh mesh,
+    bool include_scene = false) {
     using namespace carto;
     auto created = project::ProjectDocument::create("Mesh CLI Fixture");
     require(static_cast<bool>(created), "could not create the fixture project");
@@ -126,6 +127,18 @@ int create_fixture_with_mesh(
     require(static_cast<bool>(transaction), "could not begin the mesh fixture transaction");
     require(static_cast<bool>(transaction.value().add_mesh(std::move(mesh))),
         "could not add the fixture mesh");
+    if (include_scene) {
+        require(transaction.value().insert_mesh(2U, make_mesh()) &&
+                transaction.value().insert_object(scene::SceneObject{
+                    scene::ObjectId{1U}, "Root", {}, std::nullopt, std::nullopt, true, false}) &&
+                transaction.value().insert_object(scene::SceneObject{
+                    scene::ObjectId{2U}, "Assembly", {}, scene::ObjectId{1U}, 1U, true, false}) &&
+                transaction.value().insert_object(scene::SceneObject{
+                    scene::ObjectId{3U}, "Leaf", {}, scene::ObjectId{2U}, 2U, true, false}) &&
+                transaction.value().insert_object(scene::SceneObject{
+                    scene::ObjectId{4U}, "Instance", {}, std::nullopt, 1U, true, false}),
+            "could not add the preparation fixture hierarchy and shared instance");
+    }
     require(static_cast<bool>(transaction.value().commit("fixture.mesh.create")),
         "could not commit the fixture mesh");
     require(static_cast<bool>(document.save_atomic(path)), "could not save the fixture project");
@@ -171,6 +184,9 @@ int mutate_fixture(const std::filesystem::path& path) {
 int main(int argc, char** argv) {
     try {
         if (argc == 3 && std::string_view(argv[1]) == "create") return create_fixture(argv[2]);
+        if (argc == 3 && std::string_view(argv[1]) == "create-scene") {
+            return create_fixture_with_mesh(argv[2], make_mesh(), true);
+        }
         if (argc == 3 && std::string_view(argv[1]) == "create-multi-tile") {
             return create_multi_tile_fixture(argv[2]);
         }
@@ -179,7 +195,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 3 && std::string_view(argv[1]) == "mutate") return mutate_fixture(argv[2]);
         throw std::runtime_error(
-            "usage: cli_mesh_fixture create|create-multi-tile|create-cross-tile|mutate project.carto");
+            "usage: cli_mesh_fixture create|create-scene|create-multi-tile|create-cross-tile|mutate project.carto");
     } catch (const std::exception& error) {
         std::cerr << "FAIL mesh CLI fixture: " << error.what() << '\n';
         return 1;

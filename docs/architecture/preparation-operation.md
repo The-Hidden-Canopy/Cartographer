@@ -69,3 +69,11 @@ cancellation to a cooperative stop token, joins on destruction, and exposes
 queued, running, cancellation-requested, published, cancelled, stale, and
 failed states. A cancellation request arriving after atomic publication cannot
 relabel the completed result as cancelled.
+
+`cartographer_preparation_cli_tests` exercises the actual executable with a
+two-asset hierarchy and a shared instance: saved/default profile parity,
+asset/selection/assembly/scene scope, canonical selection order, exact revision
+reuse, source advancement, namespace and rollback refusal, invalid argument and
+profile rejection, source/selector preservation, relocation without the source,
+and modified-product refusal. This is portable file/CLI acceptance, not native
+destination import or desktop visual acceptance.

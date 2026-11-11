@@ -22,8 +22,9 @@ execute_process(
 if(NOT cpu_bake_result EQUAL 0)
     message(FATAL_ERROR "CPU normal-map CLI bake failed: ${cpu_bake_stdout}${cpu_bake_stderr}")
 endif()
-if(NOT cpu_bake_stdout MATCHES "evidence=carto.cpu-reference")
-    message(FATAL_ERROR "CPU normal-map CLI bake did not report CPU evidence: ${cpu_bake_stdout}")
+if(NOT cpu_bake_stdout MATCHES "evidence=carto.cpu-reference" OR
+   NOT cpu_bake_stdout MATCHES "platform_profile=\"carto.cpu-reference.v1\"")
+    message(FATAL_ERROR "CPU normal-map CLI bake did not report CPU evidence and its quoted profile: ${cpu_bake_stdout}")
 endif()
 string(REGEX MATCH "artifact_digest=([0-9a-f]+)" cpu_digest_match "${cpu_bake_stdout}")
 if(cpu_digest_match STREQUAL "")
@@ -37,7 +38,7 @@ execute_process(
     ERROR_VARIABLE cpu_inspect_stderr)
 if(NOT cpu_inspect_result EQUAL 0 OR
    NOT cpu_inspect_stdout MATCHES "verification=artifact-source-receipt-readback" OR
-   NOT cpu_inspect_stdout MATCHES "platform_profile=\"carto.cpu-reference.v1" OR
+   NOT cpu_inspect_stdout MATCHES "platform_profile=\"carto.cpu-reference.v1\"" OR
    cpu_inspect_stdout MATCHES "evidence=")
     message(FATAL_ERROR "CPU normal-map CLI inspection failed: ${cpu_inspect_stdout}${cpu_inspect_stderr}")
 endif()
@@ -69,6 +70,7 @@ execute_process(
     ERROR_VARIABLE multi_bake_stderr)
 if(NOT multi_bake_result EQUAL 0 OR
    NOT multi_bake_stdout MATCHES "kind=tangent-normal-tiles" OR
+   NOT multi_bake_stdout MATCHES "platform_profile=\"carto.cpu-reference.v1\"" OR
    NOT multi_bake_stdout MATCHES "tile_count=2")
     message(FATAL_ERROR "multi-tile normal bake failed or omitted tile count: ${multi_bake_stdout}${multi_bake_stderr}")
 endif()
@@ -78,6 +80,7 @@ execute_process(
     OUTPUT_VARIABLE multi_inspect_stdout
     ERROR_VARIABLE multi_inspect_stderr)
 if(NOT multi_inspect_result EQUAL 0 OR
+   NOT multi_inspect_stdout MATCHES "platform_profile=\"carto.cpu-reference.v1\"" OR
    NOT multi_inspect_stdout MATCHES "tile_count=2")
     message(FATAL_ERROR "multi-tile normal inspection failed: ${multi_inspect_stdout}${multi_inspect_stderr}")
 endif()

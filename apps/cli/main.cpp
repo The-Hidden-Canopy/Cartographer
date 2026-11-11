@@ -7182,7 +7182,7 @@ int bake_tangent_normal_map_tiles_cpu(char** argv) {
         std::cout << "baked"
                   << " kind=tangent-normal-tiles"
                   << " evidence=carto.cpu-reference"
-                  << " platform_profile=" << platform_profile
+                  << " platform_profile=" << std::quoted(platform_profile)
                   << " source=" << std::quoted(source_identity)
                   << " target=" << std::quoted(target_identity)
                   << " uv_set=" << uv_set.value()
@@ -7452,7 +7452,7 @@ int bake_tangent_normal_map_cpu(char** argv) {
                   << " covered_texels=" << report.artifact->covered_texels
                   << " projected_texels=" << report.artifact->projected_texels
                   << " projection_misses=" << report.artifact->projection_misses
-                  << " platform_profile=" << platform_profile
+                  << " platform_profile=" << std::quoted(platform_profile)
                   << " artifact_digest=" << report.artifact->artifact_digest.hex()
                   << " payload_digest=" << receipt.output_digest.hex()
                   << " receipt_digest=" << receipt.receipt_digest.hex()
@@ -7563,7 +7563,7 @@ int inspect_tangent_normal_map(
         std::cout << "verified"
                   << " kind=tangent-normal"
                   << " verification=artifact-source-receipt-readback"
-                  << " platform_profile=" << receipt.key.platform_profile
+                  << " platform_profile=" << std::quoted(receipt.key.platform_profile)
                   << " source=" << std::quoted(receipt.key.source.identity)
                   << " source_revision=" << receipt.key.source.revision.value()
                   << " source_digest=" << receipt.key.source.content_digest.hex()
@@ -8323,7 +8323,7 @@ int bake_tangent_normal_map_d3d12(char** argv) {
                   << " gpu_driver=" << std::quoted(report.projection->driver)
                   << " gpu_wall_nanoseconds=" <<
                         report.projection->wall_time_nanoseconds
-                  << " platform_profile=" << platform_profile
+                  << " platform_profile=" << std::quoted(platform_profile)
                   << " artifact_digest=" << report.bake.artifact->artifact_digest.hex()
                   << " payload_digest=" << receipt.output_digest.hex()
                   << " receipt_digest=" << receipt.receipt_digest.hex()
@@ -8438,7 +8438,7 @@ int inspect_tangent_normal_map_d3d12(
                   << " covered_texels=" << artifact.value().covered_texels
                   << " projected_texels=" << artifact.value().projected_texels
                   << " artifact_digest=" << artifact.value().artifact_digest.hex()
-                  << " platform_profile=" << receipt.key.platform_profile
+                  << " platform_profile=" << std::quoted(receipt.key.platform_profile)
                   << " payload_digest=" << receipt.output_digest.hex()
                   << " receipt_digest=" << receipt.receipt_digest.hex() << '\n';
     } catch (const std::exception& error) {

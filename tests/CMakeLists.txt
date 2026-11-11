@@ -738,7 +738,7 @@ if(TARGET cartographer_cli)
             "-DCARTO_CLI=$<TARGET_FILE:cartographer_cli>"
             "-DCARTO_FIXTURE=$<TARGET_FILE:cartographer_cli_mesh_fixture>"
             "-DCARTO_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
-            "-DCARTO_ENABLE_D3D12=${CARTO_ENABLE_D3D12}"
+            "-DCARTO_ENABLE_D3D12=OFF"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/run_ao_cli_tests.cmake"
     )
     set_tests_properties(cartographer_ao_cli_tests PROPERTIES RUN_SERIAL TRUE)
@@ -749,10 +749,32 @@ if(TARGET cartographer_cli)
             "-DCARTO_CLI=$<TARGET_FILE:cartographer_cli>"
             "-DCARTO_FIXTURE=$<TARGET_FILE:cartographer_cli_mesh_fixture>"
             "-DCARTO_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
-            "-DCARTO_ENABLE_D3D12=${CARTO_ENABLE_D3D12}"
+            "-DCARTO_ENABLE_D3D12=OFF"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/run_bake_normal_cli_tests.cmake"
     )
     set_tests_properties(cartographer_bake_normal_cli_tests PROPERTIES RUN_SERIAL TRUE)
+    # Keep CPU CLI acceptance runnable independently of native GPU admission.
+    # D3D12 builds retain the complete GPU/parity paths as separate tests.
+    if(CARTO_ENABLE_D3D12)
+        foreach(bake_suite IN ITEMS ao bake_normal)
+            add_test(NAME cartographer_${bake_suite}_d3d12_cli_tests
+                COMMAND ${CMAKE_COMMAND}
+                    "-DCARTO_CLI=$<TARGET_FILE:cartographer_cli>"
+                    "-DCARTO_FIXTURE=$<TARGET_FILE:cartographer_cli_mesh_fixture>"
+                    "-DCARTO_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+                    "-DCARTO_ENABLE_D3D12=ON"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/run_${bake_suite}_cli_tests.cmake")
+            set_tests_properties(cartographer_${bake_suite}_d3d12_cli_tests
+                PROPERTIES RUN_SERIAL TRUE LABELS "GPU")
+        endforeach()
+    endif()
+    add_test(NAME cartographer_preparation_cli_tests
+        COMMAND ${CMAKE_COMMAND}
+            "-DCARTO_CLI=$<TARGET_FILE:cartographer_cli>"
+            "-DCARTO_FIXTURE=$<TARGET_FILE:cartographer_cli_mesh_fixture>"
+            "-DCARTO_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/run_preparation_cli_tests.cmake")
+    set_tests_properties(cartographer_preparation_cli_tests PROPERTIES RUN_SERIAL TRUE)
 endif()
 
 add_executable(cartographer_lookdev_draw_package_tests
