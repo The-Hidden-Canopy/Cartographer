@@ -1,4 +1,5 @@
 #include "gltf_test_payload.hpp"
+#include <algorithm>
 #include <array>
 #include <locale>
 #include <carto/io/gltf_material_import.hpp>
@@ -584,6 +585,52 @@ int main(int argc, char** argv) {
         Scene reopened_cut{take(project::ProjectDocument::load(cut_saved)), cut.mesh};
         check(exported(reopened_cut, cut_root, "cut-reopened").bytes == cut_payload.bytes,
               "transferred attributes survive save/reopen export");
+        auto source_root = root / "source-aware";
+        std::filesystem::create_directory(source_root);
+        auto sourced = make_scene(fixture(), source_root);
+        const auto without_source = take(io::export_gltf(sourced.doc, source_root / "plain.gltf"));
+        check(std::none_of(without_source.warnings.begin(), without_source.warnings.end(),
+                           [](const auto& warning) {
+                               return warning.find("reimport links are not included") != std::string::npos;
+                           }),
+              "source handoff warning is omitted when no imported sources are registered");
+        const std::string source_bytes = "private source fixture";
+        const auto source_digest = assets::sha256({
+            reinterpret_cast<const std::uint8_t*>(source_bytes.data()), source_bytes.size()});
+        assets::SourceImportRecord record;
+        record.identity = "source.fixture";
+        record.relative_source_path = "private/original.glb";
+        record.source_generation = core::Revision{1U};
+        record.kind = assets::SourceAssetKind::mesh;
+        record.source_digest = source_digest;
+        record.importer_identity = "carto.import.gltf";
+        record.artifact_identity = "mesh.fixture";
+        record.artifact_digest = source_digest;
+        auto plan = take(assets::plan_source_reimport(sourced.doc.source_asset_registry(), {record}));
+        journal::Journal source_journal(source_root / "create.log");
+        auto source_tx = take(project::ProjectTransaction::begin(sourced.doc, source_journal,
+                                                                  "source.fixture"));
+        okay(source_tx.apply_source_reimport_plan(plan));
+        static_cast<void>(take(source_tx.commit("source.fixture.import")));
+        const auto sourced_gltf = take(io::export_gltf(sourced.doc, source_root / "source.gltf"));
+        const auto sourced_glb = take(io::export_glb(sourced.doc, source_root / "source.glb"));
+        const auto warns_source_handoff = [](const auto& report) {
+            return std::any_of(report.warnings.begin(), report.warnings.end(), [](const auto& warning) {
+                return warning.find("reimport links are not included") != std::string::npos &&
+                       warning.find("original source files") != std::string::npos &&
+                       warning.find("private/original.glb") == std::string::npos;
+            });
+        };
+        check(warns_source_handoff(sourced_gltf) && warns_source_handoff(sourced_glb) &&
+                  read(source_root / "source.gltf").find("private/original.glb") == std::string::npos &&
+                  read(source_root / "source.glb").find("private/original.glb") == std::string::npos &&
+                  read(source_root / "source.gltf").find(source_bytes) == std::string::npos &&
+                  read(source_root / "source.glb").find(source_bytes) == std::string::npos,
+              "source-aware glTF and GLB warn that originals and reimport links are absent");
+        const auto source_feedback = desktop::interchange_export_feedback(sourced_glb);
+        check(source_feedback.find("reimport links are not included") != std::string::npos &&
+                  source_feedback.find("private/original.glb") == std::string::npos,
+              "actual source-handoff warning reaches desktop feedback without source locators");
         auto invalid = fixture();
         auto attributes = invalid.attributes();
         auto *found = attributes.find("cartographer.normal0");
@@ -778,6 +825,42 @@ int main(int argc, char** argv) {
         check(!tangent_export && tangent_export.error().message.find("tangent") != std::string::npos &&
                   read(good_glb) == glb_before,
               "authored tangent replacement is refused without replacing prior GLB");
+        auto preserved_tangent_mesh = fixture(true, true);
+        auto preserved_attributes = preserved_tangent_mesh.attributes();
+        const auto preserved_uv = *preserved_attributes.find("uv.export");
+        okay(preserved_attributes.add_layer({{"cartographer.tangent.7", attributes::AttributeDomain::corner,
+                                             attributes::AttributeType::vec4},
+                                            std::vector<attributes::AttributeValue>(6, core::Vec4d{1, 0, 0, 1})}));
+        okay(preserved_attributes.add_layer({{"cartographer.tangent_uv.7", attributes::AttributeDomain::corner,
+                                             attributes::AttributeType::vec2}, preserved_uv.values}));
+        okay(preserved_tangent_mesh.set_attribute_payload(
+            std::move(preserved_attributes), preserved_tangent_mesh.uv_sets()));
+        const auto preserved_root = root / "preserved-authored-tangents";
+        std::filesystem::create_directory(preserved_root);
+        auto preserved_scene = make_scene(preserved_tangent_mesh, preserved_root);
+        const auto preserved_source = preserved_scene.doc.serialize();
+        const auto preserved_path = preserved_root / "source.carto";
+        static_cast<void>(take(preserved_scene.doc.save_atomic(preserved_path)));
+        const auto preserved_reopened = take(project::ProjectDocument::load(preserved_path));
+        for (const auto* extension : {".gltf", ".glb"}) {
+            const auto path = preserved_root / (std::string("tangent") + extension);
+            if (std::string_view(extension) == ".glb")
+                static_cast<void>(take(io::export_glb(preserved_reopened, path)));
+            else
+                static_cast<void>(take(io::export_gltf(preserved_reopened, path)));
+            const auto tangents = Payload(path).attribute("TANGENT");
+            check(!tangents.empty() && tangents.size() % 4U == 0U,
+                "validated authored tangent pairs remain exportable after reopen");
+            for (std::size_t i = 0; i < tangents.size(); i += 4U) {
+                near(tangents[i], 1.0, "authored tangent x retained");
+                near(tangents[i + 1U], 0.0, "authored tangent y retained");
+                near(tangents[i + 2U], 0.0, "authored tangent z retained");
+                near(tangents[i + 3U], 1.0, "authored tangent handedness retained");
+            }
+        }
+        check(preserved_scene.doc.serialize() == preserved_source &&
+                  preserved_reopened.serialize() == preserved_source,
+              "tangent export does not mutate authored attributes or reopened source");
         auto stale_tangent_mesh = fixture(true, true);
         auto stale_attributes = stale_tangent_mesh.attributes();
         auto uv_layer = *stale_attributes.find("uv.export");
@@ -828,6 +911,25 @@ int main(int argc, char** argv) {
         check(!color_export && color_export.error().message.find("color") != std::string::npos &&
                   read(good) == before,
               "authored color loss is refused without replacing prior glTF");
+        auto custom_mesh = fixture();
+        auto custom_attributes = custom_mesh.attributes();
+        okay(custom_attributes.add_layer({{"author.roughness", attributes::AttributeDomain::face,
+                                          attributes::AttributeType::float32},
+                                         {0.2F, 0.8F}}));
+        okay(custom_mesh.set_attribute_payload(std::move(custom_attributes), custom_mesh.uv_sets()));
+        auto custom_root = root / "authored-custom-layer";
+        std::filesystem::create_directory(custom_root);
+        const auto custom_scene = make_scene(custom_mesh, custom_root);
+        const auto custom_source = custom_scene.doc.serialize();
+        const auto custom_gltf = io::export_gltf(custom_scene.doc, good);
+        const auto custom_glb = io::export_glb(custom_scene.doc, good_glb);
+        check(!custom_gltf && !custom_glb &&
+                  custom_gltf.error().message.find("author.roughness") != std::string::npos &&
+                  custom_glb.error().message.find("author.roughness") != std::string::npos &&
+                  custom_gltf.error().message.find(std::to_string(custom_scene.mesh)) != std::string::npos &&
+                  read(good) == before && read(good_glb) == glb_before &&
+                  custom_scene.doc.serialize() == custom_source,
+              "unsupported custom attribute loss is diagnosed before glTF or GLB replacement");
         auto multiple_uv = fixture();
         auto uv_attributes = multiple_uv.attributes();
         auto uv_sets = multiple_uv.uv_sets();

@@ -411,6 +411,27 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
             (!uv_sets.descriptors().empty() && uv_sets.active_for_render() == nullptr))
             return core::Result<GltfExportReport>::failure(validation(
                 "glTF export cannot preserve all authored UV sets on mesh " + std::to_string(mesh_id)));
+        for (const auto& [id, layer] : mesh.attributes().layers()) {
+            static_cast<void>(layer);
+            const bool declared_uv = std::any_of(uv_sets.descriptors().begin(),
+                uv_sets.descriptors().end(), [&](const auto& entry) {
+                    return id == entry.second.layer_id;
+                });
+            // Tangent pairs were validated above and every authored frame must
+            // still be consumed below. Material primitives may select any
+            // declared UV set; the existing report discloses unused streams.
+            const bool authored_tangent = id.starts_with("cartographer.tangent.") ||
+                id.starts_with("cartographer.tangent_uv.");
+            const bool supported = id == "cartographer.normal0" ||
+                id == "condition.material_region" ||
+                (id == "cartographer.material_slot" && export_materials) ||
+                declared_uv || authored_tangent;
+            if (!supported) {
+                return core::Result<GltfExportReport>::failure(validation(
+                    "glTF export cannot preserve attribute layer '" + id +
+                    "' on mesh " + std::to_string(mesh_id)));
+            }
+        }
     }
 
     std::vector<std::uint8_t> buffer;
@@ -774,6 +795,11 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
         "and consumer lighting still require rendered acceptance");
     report.warnings.push_back(
         "float64 authoring positions and normals are narrowed to glTF float32");
+    if (!document.source_asset_registry().records().empty()) {
+        report.warnings.push_back(
+            "Imported source files and reimport links are not included in this glTF artifact; "
+            "retain the Cartographer project and original source files for reimport");
+    }
     const auto& presentation = document.presentation_catalog();
     if (presentation.environment() || !presentation.lights().empty() || !presentation.cameras().empty()) {
         report.warnings.push_back(

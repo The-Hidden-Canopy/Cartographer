@@ -22,6 +22,10 @@ foreach(format IN ITEMS gltf glb)
     if(NOT result EQUAL 0 OR NOT stdout MATCHES "materials=1")
         message(FATAL_ERROR "Imported ${format} project did not reopen/export with materials: ${stdout}${stderr}")
     endif()
+    if(NOT stdout MATCHES "reimport links are not included" OR
+       NOT stdout MATCHES "original source files")
+        message(FATAL_ERROR "Reopened ${format} export omitted the source handoff warning: ${stdout}${stderr}")
+    endif()
     file(SHA256 "${project}" project_before)
     execute_process(COMMAND "${CARTO_CLI}" import-gltf "${source}" "${project}" --confirm-reuse-rights
         RESULT_VARIABLE result OUTPUT_QUIET ERROR_QUIET)

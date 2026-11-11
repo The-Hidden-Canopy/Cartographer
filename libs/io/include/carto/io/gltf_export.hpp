@@ -63,6 +63,10 @@ struct GltfExportOptions {
 // viewport's material-region alias and resolved catalog variants. Unsupported
 // appearance features fail before replacing a prior good artifact. Consumer
 // lighting and back-face shading may differ from the authoring viewport.
+// Unrecognized authored attribute layers also fail before publication. Declared
+// UV streams retain the existing per-material selection and omission warnings;
+// imported originals and reimport links remain in the source project and are
+// explicitly reported as absent from this derived artifact.
 [[nodiscard]] core::Result<GltfExportReport> export_gltf(
     const project::ProjectDocument& document,
     const std::filesystem::path& path);
