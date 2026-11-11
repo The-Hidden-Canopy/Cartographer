@@ -50,6 +50,7 @@
 #include "studio_viewshed.hpp"
 #include "studio_view_settings.hpp"
 #include "studio_viewport_capture.hpp"
+#include "studio_translate_gizmo.hpp"
 #include "uv_inspector.hpp"
 #include "native_presentation.hpp"
 #include "native_upload_lifetime.hpp"
@@ -2498,15 +2499,15 @@ using ViewportEdgeHit = carto::ui::ProjectedEdgePickCandidate;
 struct NativeTranslateGizmo {
     carto::scene::ObjectId object;
     ImVec2 origin;
-    ImVec2 x_tip;
-    ImVec2 z_tip;
-    carto::core::Vec2d screen_x_axis_per_world;
-    carto::core::Vec2d screen_z_axis_per_world;
+    std::vector<carto::studio::ViewportTranslateHandle> handles;
     carto::core::Transform transform = carto::core::Transform::identity();
     carto::core::Revision project_revision;
 };
 
 struct NativeTransformDragCapture {
+    std::uint64_t project_generation = 0U;
+    carto::studio::ViewportViewKind view_kind = carto::studio::ViewportViewKind::top_plan_xz;
+    bool spatial_alignment = false;
     carto::editor::ViewportTransformSession session;
     carto::editor::SnapSession geometry_snap_session;
     std::optional<carto::editor::SnapCandidate> geometry_snap_candidate;
@@ -7286,26 +7287,17 @@ struct DesktopState {
             return false;
         }
         const auto& gizmo = *native_viewport_hits.translate_gizmo;
-        if (snapshot.project_revision != gizmo.project_revision ||
+        if (snapshot.project_generation != native_viewport_hits.project_generation ||
+            snapshot.project_revision != gizmo.project_revision ||
             snapshot.project_revision != native_viewport_hits.project_revision ||
             (ghost_edit && agent_ghost_selected_object != gizmo.object) ||
             (!ghost_edit && snapshot.selection.objects.front() != gizmo.object)) {
             return false;
         }
-        const auto handle_start = [&gizmo](ImVec2 tip) {
-            const ImVec2 delta = tip - gizmo.origin;
-            const float length = std::sqrt(delta.x * delta.x + delta.y * delta.y);
-            if (!std::isfinite(length) || length <= 1.0e-4F) return gizmo.origin;
-            return gizmo.origin + delta * (8.0F / length);
-        };
-        const float x_distance = point_segment_distance_squared(
-            screen_point, handle_start(gizmo.x_tip), gizmo.x_tip);
-        const float z_distance = point_segment_distance_squared(
-            screen_point, handle_start(gizmo.z_tip), gizmo.z_tip);
-        constexpr float kHandleRadiusSquared = kTranslateGizmoHitRadius * kTranslateGizmoHitRadius;
-        if (x_distance > kHandleRadiusSquared && z_distance > kHandleRadiusSquared) {
-            return false;
-        }
+        const auto hit = carto::studio::hit_viewport_translate_handle(
+            gizmo.handles, {screen_point.x, screen_point.y}, kTranslateGizmoHitRadius);
+        if (!hit.has_value()) return false;
+        const auto& handle = gizmo.handles[*hit];
         const auto object = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
             [&gizmo](const auto& value) { return value.object.id == gizmo.object; });
         if (object == snapshot.objects.end() || object->object.locked) {
@@ -7348,12 +7340,8 @@ struct DesktopState {
             }
             initial_transform = branch_instance->world_transform;
         }
-        const auto axis = x_distance <= z_distance
-            ? carto::editor::ViewportTranslateAxis::world_x
-            : carto::editor::ViewportTranslateAxis::world_z;
-        const carto::core::Vec2d screen_axis_per_world_unit = axis ==
-                carto::editor::ViewportTranslateAxis::world_x
-            ? gizmo.screen_x_axis_per_world : gizmo.screen_z_axis_per_world;
+        const auto axis = handle.axis;
+        const auto screen_axis_per_world_unit = handle.screen_axis_per_world;
         if (ghost_edit && agent_ghost_justification.empty()) {
             action_feedback = "Enter a correction justification before editing the ghost.";
             action_feedback_error = true;
@@ -7362,6 +7350,9 @@ struct DesktopState {
         carto::core::Vec2d pointer{
             static_cast<double>(screen_point.x), static_cast<double>(screen_point.y)};
         NativeTransformDragCapture capture;
+        capture.project_generation = snapshot.project_generation;
+        capture.view_kind = viewport_view.view;
+        capture.spatial_alignment = perspective_camera_active;
         if (auto result = capture.session.begin_projected(gizmo.object, initial_transform,
                 snapshot.project_revision, axis, pointer,
                 screen_axis_per_world_unit); !result) {
@@ -7391,9 +7382,11 @@ struct DesktopState {
     bool route_native_transform_drag(const carto::ui::NativePointerEvent& event) {
         if (!native_transform_drag.has_value()) return false;
         const auto snapshot = ui.snapshot();
-        if (snapshot.project_revision != native_transform_drag->session.source_revision()) {
+        if (snapshot.project_generation != native_transform_drag->project_generation ||
+            viewport_view.view != native_transform_drag->view_kind ||
+            snapshot.project_revision != native_transform_drag->session.source_revision()) {
             cancel_native_transform_drag(
-                "Transform cancelled because the project revision changed.");
+                "Transform cancelled because the project or viewport view changed.");
             return true;
         }
         if (native_transform_drag->agent_ghost &&
@@ -7432,7 +7425,8 @@ struct DesktopState {
             native_transform_drag->geometry_snap_session,
             std::optional<carto::scene::ObjectId>{
                 native_transform_drag->session.object()},
-            native_transform_drag->snap_perpendicular_tolerance);
+            native_transform_drag->snap_perpendicular_tolerance,
+            native_transform_drag->spatial_alignment);
         if (!snapped_preview) {
             cancel_native_transform_drag(snapped_preview.error().message);
             return true;
@@ -7455,7 +7449,7 @@ struct DesktopState {
             } else if (geometry_snap) {
                 action_feedback = "Translate preview · no aligned geometry target within 0.25 m";
             } else {
-                action_feedback = "Translate preview · X/Z axis constrained";
+                action_feedback = "Translate preview · world axis constrained";
             }
             action_feedback_error = false;
             return true;
@@ -7478,7 +7472,7 @@ struct DesktopState {
             committed_transform.value(), capture.axis, snapshot.viewport.scene,
             snapshot.project_revision, grid_snap, geometry_snap,
             capture.geometry_snap_session, std::optional<carto::scene::ObjectId>{object},
-            capture.snap_perpendicular_tolerance);
+            capture.snap_perpendicular_tolerance, capture.spatial_alignment);
         if (!final_preview) {
             action_feedback = final_preview.error().message;
             action_feedback_error = true;
@@ -7500,9 +7494,9 @@ struct DesktopState {
                 return true;
             }
         }
-        const bool changed = capture.axis == carto::editor::ViewportTranslateAxis::world_x
-            ? final_transform.translation.x != initial.translation.x
-            : final_transform.translation.z != initial.translation.z;
+        const bool changed = final_transform.translation.x != initial.translation.x ||
+            final_transform.translation.y != initial.translation.y ||
+            final_transform.translation.z != initial.translation.z;
         if (changed) {
             if (capture.agent_ghost) {
                 const auto corrected = ui.correct_agent_ghost_transform(
@@ -8118,19 +8112,8 @@ struct DesktopState {
         bool transform_handle_hit = false;
         if (native_viewport_hits.translate_gizmo.has_value()) {
             const auto& gizmo = *native_viewport_hits.translate_gizmo;
-            constexpr float kHandleRadiusSquared = kTranslateGizmoHitRadius * kTranslateGizmoHitRadius;
-            const auto handle_start = [&gizmo](ImVec2 tip) {
-                const ImVec2 delta = tip - gizmo.origin;
-                const float length = std::sqrt(delta.x * delta.x + delta.y * delta.y);
-                if (!std::isfinite(length) || length <= 1.0e-4F) return gizmo.origin;
-                return gizmo.origin + delta * (8.0F / length);
-            };
-            transform_handle_hit = point_segment_distance_squared(
-                    pointer, handle_start(gizmo.x_tip), gizmo.x_tip) <=
-                kHandleRadiusSquared ||
-                point_segment_distance_squared(
-                    pointer, handle_start(gizmo.z_tip), gizmo.z_tip) <=
-                kHandleRadiusSquared;
+            transform_handle_hit = carto::studio::hit_viewport_translate_handle(
+                gizmo.handles, {pointer.x, pointer.y}, kTranslateGizmoHitRadius).has_value();
         }
         const bool condition_handle_hit = std::any_of(
             native_viewport_hits.condition_gizmos.begin(),
@@ -10344,7 +10327,7 @@ struct DesktopState {
         ImGui::TextDisabled("Viewport translation · geometry snap");
         ImGui::TextWrapped(
             "Shift-drag requests a revision-bound vertex, edge-midpoint, or face-center snap. "
-            "The active X/Z gizmo axis controls movement; this value limits cross-axis "
+            "The active world gizmo axis controls movement; this value limits cross-axis "
             "alignment error in world meters.");
         ImGui::SetNextItemWidth(-1.0F);
         ImGui::SliderFloat("Cross-axis tolerance (m)",
@@ -11800,7 +11783,7 @@ struct DesktopState {
             if (carto::ui::workspace_supports_scene_object_translation(
                     snapshot.workspace_kind)) {
                 ImGui::TextDisabled(
-                    "Pan View or middle-drag · select an object, then drag the labeled X/Z Move handles · Ctrl grid · Shift geometry snap");
+                    "Pan View or middle-drag · select an object, then drag the visible X/Y/Z Move handles · Ctrl grid · Shift geometry snap");
             }
         }
         if (ImGui::CollapsingHeader("Display & shading")) {
@@ -12314,9 +12297,12 @@ struct DesktopState {
 #endif
             for (const auto& instance : instances) {
                 auto transform = instance.world_transform;
-                if (native_transform_drag && instance.object == native_transform_drag->session.object()) {
-                    transform.translation.x = native_transform_drag->preview_transform.translation.x;
-                    transform.translation.z = native_transform_drag->preview_transform.translation.z;
+                if (native_transform_drag &&
+                    snapshot.project_generation == native_transform_drag->project_generation &&
+                    snapshot.project_revision == native_transform_drag->session.source_revision() &&
+                    viewport_view.view == native_transform_drag->view_kind &&
+                    instance.object == native_transform_drag->session.object()) {
+                    transform.translation = native_transform_drag->preview_transform.translation;
                 }
                 request.transform_overrides.emplace(instance.object, transform);
                 key << ':' << instance.object.value << ':' << transform.translation.x << ':' << transform.translation.y
@@ -13507,17 +13493,17 @@ struct DesktopState {
         }
 
         if (native_transform_drag.has_value()) {
-            if (showing_agent_preview || snapshot.project_revision !=
-                    native_transform_drag->session.source_revision()) {
+            if (showing_agent_preview ||
+                snapshot.project_generation != native_transform_drag->project_generation ||
+                viewport_view.view != native_transform_drag->view_kind ||
+                snapshot.project_revision != native_transform_drag->session.source_revision()) {
                 cancel_native_transform_drag(
                     "Transform preview cancelled because its source snapshot is no longer current.");
             } else {
                 for (auto& instance : instances) {
                     if (instance.object == native_transform_drag->session.object()) {
-                        instance.world_transform.translation.x =
-                            native_transform_drag->preview_transform.translation.x;
-                        instance.world_transform.translation.z =
-                            native_transform_drag->preview_transform.translation.z;
+                        instance.world_transform.translation =
+                            native_transform_drag->preview_transform.translation;
                     }
                 }
             }
@@ -14597,54 +14583,43 @@ struct DesktopState {
             const auto instance = std::find_if(instances.begin(), instances.end(),
                 [selected_id](const auto& value) { return value.object == selected_id; });
             if (selected != snapshot.objects.end() && !selected->object.locked &&
-                instance != instances.end() &&
-                (!perspective_camera_active ||
-                    (camera_depth(instance->world_transform.translation) < 0.0 &&
-                     camera_depth(instance->world_transform.translation +
-                         Vec3d{1.0, 0.0, 0.0}) < 0.0 &&
-                     camera_depth(instance->world_transform.translation +
-                         Vec3d{0.0, 0.0, 1.0}) < 0.0))) {
-                const ImVec2 center = project(instance->world_transform.translation);
-                constexpr float kGizmoLength = kTranslateGizmoHandleLength;
-                const ImVec2 x_sample = project(
-                    instance->world_transform.translation + Vec3d{1.0, 0.0, 0.0});
-                const ImVec2 z_sample = project(
-                    instance->world_transform.translation + Vec3d{0.0, 0.0, 1.0});
-                const ImVec2 x_delta = x_sample - center;
-                const ImVec2 z_delta = z_sample - center;
-                const float x_length = std::sqrt(x_delta.x * x_delta.x + x_delta.y * x_delta.y);
-                const float z_length = std::sqrt(z_delta.x * z_delta.x + z_delta.y * z_delta.y);
-                if (!std::isfinite(x_length) || !std::isfinite(z_length) ||
-                    x_length <= 1.0e-4F || z_length <= 1.0e-4F) {
-                    native_viewport_hits.interactive = false;
-                } else {
-                    const ImVec2 x_direction = x_delta * (1.0F / x_length);
-                    const ImVec2 z_direction = z_delta * (1.0F / z_length);
-                    const ImVec2 x_perpendicular{-x_direction.y, x_direction.x};
-                    const ImVec2 z_perpendicular{-z_direction.y, z_direction.x};
-                    const ImVec2 x_tip = center + x_direction * kGizmoLength;
-                    const ImVec2 z_tip = center + z_direction * kGizmoLength;
-                    const ImU32 x_color = rgba(snapshot.colors.accent_primary, 1.0F);
-                    const ImU32 z_color = rgba(snapshot.colors.accent_secondary, 1.0F);
-                    const auto gizmo_transform = instance->world_transform;
-                    draw->AddCircleFilled(center, 6.0F,
-                        rgba(snapshot.colors.text_primary, 1.0F));
-                    draw->AddLine(center, x_tip, x_color, 4.0F);
-                    draw->AddLine(center, z_tip, z_color, 4.0F);
-                    draw->AddTriangleFilled(x_tip,
-                        x_tip - x_direction * 11.0F + x_perpendicular * 5.0F,
-                        x_tip - x_direction * 11.0F - x_perpendicular * 5.0F, x_color);
-                    draw->AddTriangleFilled(z_tip,
-                        z_tip - z_direction * 11.0F + z_perpendicular * 5.0F,
-                        z_tip - z_direction * 11.0F - z_perpendicular * 5.0F, z_color);
-                    draw->AddCircleFilled(x_tip, 7.0F, x_color);
-                    draw->AddCircleFilled(z_tip, 7.0F, z_color);
-                    draw->AddText(x_tip + ImVec2(10.0F, -8.0F), x_color, "MOVE X");
-                    draw->AddText(z_tip + ImVec2(9.0F, -18.0F), z_color, "MOVE Z");
-                    native_viewport_hits.translate_gizmo = NativeTranslateGizmo{
-                        selected_id, center, x_tip, z_tip,
-                        {x_delta.x, x_delta.y}, {z_delta.x, z_delta.y},
-                        gizmo_transform, snapshot.project_revision};
+                instance != instances.end()) {
+                const auto world_origin = instance->world_transform.translation;
+                const auto center = project_visible(world_origin);
+                if (center.has_value()) {
+                    constexpr std::array<Vec3d, 3U> axes{{
+                        {1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}}};
+                    std::array<std::optional<carto::core::Vec2d>, 3U> samples;
+                    for (std::size_t index = 0U; index < axes.size(); ++index) {
+                        const auto sample = project_visible(world_origin + axes[index]);
+                        if (sample) samples[index] = {sample->x, sample->y};
+                    }
+                    auto handles = carto::studio::viewport_translate_handles(
+                        {center->x, center->y}, samples, kTranslateGizmoHandleLength);
+                    if (!handles.empty()) {
+                        draw->AddCircleFilled(*center, 6.0F,
+                            rgba(snapshot.colors.text_primary, 1.0F));
+                        for (const auto& handle : handles) {
+                            const bool is_x = handle.axis == carto::editor::ViewportTranslateAxis::world_x;
+                            const bool is_y = handle.axis == carto::editor::ViewportTranslateAxis::world_y;
+                            const ImU32 ink = rgba(is_x ? snapshot.colors.accent_primary
+                                : is_y ? snapshot.colors.semantic_success
+                                       : snapshot.colors.accent_secondary, 1.0F);
+                            const ImVec2 tip{static_cast<float>(handle.tip.x), static_cast<float>(handle.tip.y)};
+                            const ImVec2 direction = (tip - *center) * (1.0F / kTranslateGizmoHandleLength);
+                            const ImVec2 perpendicular{-direction.y, direction.x};
+                            draw->AddLine(*center, tip, ink, 4.0F);
+                            draw->AddTriangleFilled(tip,
+                                tip - direction * 11.0F + perpendicular * 5.0F,
+                                tip - direction * 11.0F - perpendicular * 5.0F, ink);
+                            draw->AddCircleFilled(tip, 7.0F, ink);
+                            draw->AddText(tip + ImVec2(10.0F, -8.0F), ink,
+                                is_x ? "MOVE X" : is_y ? "MOVE Y" : "MOVE Z");
+                        }
+                        native_viewport_hits.translate_gizmo = NativeTranslateGizmo{
+                            selected_id, *center, std::move(handles),
+                            instance->world_transform, snapshot.project_revision};
+                    }
                 }
             }
         }
@@ -19694,7 +19669,7 @@ struct DesktopState {
         if (object == snapshot.objects.end()) {
             inspector_transform.clear();
             ImGui::TextDisabled(
-                "Select an object, then drag the labeled X/Z handles in the view.");
+                "Select an object, then drag the visible X/Y/Z handles in the view.");
             end_instrument(carto::ui::WorkbenchInstrument::transform, workbench.transform);
             return;
         }
@@ -19704,7 +19679,7 @@ struct DesktopState {
         const auto widget_scope = carto::studio::inspector_draft_widget_id(context);
         ImGui::PushID(widget_scope.c_str());
         ImGui::Text("%s", object->object.name.c_str());
-        ImGui::TextDisabled("Drag MOVE X / MOVE Z in the view, or set an exact position.");
+        ImGui::TextDisabled("Drag a visible MOVE X / Y / Z handle in the view, or set an exact position.");
         if (inspector_transform.stale()) {
             ImGui::TextWrapped("Project changed. Reload current values before applying this draft.");
         }

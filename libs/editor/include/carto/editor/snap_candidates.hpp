@@ -67,12 +67,14 @@ struct SnapCandidate {
 // Queries an already-compiled viewport snapshot. Results bind the snapshot's
 // project revision and each compiled mesh revision, avoiding per-pointer-move
 // mesh recompilation in native transform interactions. Missing mesh-asset
-// identities are not eligible snap targets.
+// identities are not eligible snap targets. Plan queries ignore elevation;
+// spatial queries measure all three axes for editor-camera translation.
 [[nodiscard]] core::Result<std::vector<SnapCandidate>> find_snap_candidates(
     const render::RenderScene& scene,
     core::Vec3d origin,
     std::span<const SnapKind> kinds,
     core::Revision source_revision,
-    double radius);
+    double radius,
+    bool spatial_distance = false);
 
 } // namespace carto::editor

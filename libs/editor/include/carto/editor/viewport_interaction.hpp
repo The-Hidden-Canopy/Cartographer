@@ -142,13 +142,15 @@ private:
 enum class ViewportTranslateAxis {
     world_x,
     world_z,
+    world_y,
 };
 
-// Revision-bound preview for the native 2D work-surface translation handles.
+// Revision-bound preview for projected native world-axis translation handles.
 // The preview transform is in world space; callers convert it back to local
 // space for parented objects before committing through the application path.
 class ViewportTransformSession final {
 public:
+    // Legacy plan mapping accepts X/Z only. Y requires an explicit projection.
     [[nodiscard]] core::Result<void> begin(
         scene::ObjectId object,
         core::Transform source_transform,
@@ -240,7 +242,9 @@ struct ViewportTransformSnapResult final {
     std::optional<SnapCandidate> candidate;
 };
 
-// Applies the native plan-view snapping policy to a revision-bound preview.
+// Applies the native snapping policy to a revision-bound preview.
+// Plan X/Z ignores elevation; editor-camera views request spatial alignment
+// on both unchanged axes. Y translation always uses spatial alignment.
 // Ctrl/grid has precedence over Shift/geometry. Geometry targets are queried
 // from the compiled viewport scene and may exclude the object being moved.
 // The perpendicular tolerance bounds cross-axis alignment error in world
@@ -257,7 +261,8 @@ snap_viewport_transform_preview(
     bool geometry_snap,
     SnapSession& session,
     std::optional<scene::ObjectId> excluded_object = std::nullopt,
-    double perpendicular_tolerance = 0.05);
+    double perpendicular_tolerance = 0.05,
+    bool spatial_alignment = false);
 
 // UI-only orthographic camera for Cartographer's current X/Z plan view. It
 // does not represent a scene camera and cannot mutate project state.

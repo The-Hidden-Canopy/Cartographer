@@ -52,6 +52,7 @@ enum class SnapConstraintAxis : std::uint8_t {
     none,
     world_x,
     world_z,
+    world_y,
 };
 
 struct SnapConstraint final {
@@ -60,6 +61,9 @@ struct SnapConstraint final {
     // on the other screen-plane axis. Elevation is intentionally ignored by
     // the top-down viewport; it remains unchanged by the active gizmo handle.
     double perpendicular_tolerance = 0.05;
+    // Editor-camera translation also checks the other unchanged world axis.
+    // Y translation always checks X and Z, regardless of this flag.
+    bool spatial_alignment = false;
 };
 
 // Applies a revision-bound priority/hysteresis policy to already compiled

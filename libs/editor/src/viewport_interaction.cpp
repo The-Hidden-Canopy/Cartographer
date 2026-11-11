@@ -356,7 +356,8 @@ core::Result<void> ViewportTransformSession::begin(
     ViewportTranslateAxis axis,
     core::Vec2d pointer_start,
     double pixels_per_world_unit) {
-    if (!std::isfinite(pixels_per_world_unit) || pixels_per_world_unit <= 0.0) {
+    if (!std::isfinite(pixels_per_world_unit) || pixels_per_world_unit <= 0.0 ||
+        axis == ViewportTranslateAxis::world_y) {
         return core::Result<void>::failure(invalid(
             "viewport transform source, axis, or pointer scale is invalid"));
     }
@@ -383,7 +384,8 @@ core::Result<void> ViewportTransformSession::begin_projected(
         !screen_axis_per_world_unit.finite() || !std::isfinite(projected_scale) ||
         projected_scale <= 1.0e-18 ||
         (axis != ViewportTranslateAxis::world_x &&
-            axis != ViewportTranslateAxis::world_z)) {
+            axis != ViewportTranslateAxis::world_z &&
+            axis != ViewportTranslateAxis::world_y)) {
         return core::Result<void>::failure(invalid(
             "viewport transform source, axis, or pointer scale is invalid"));
     }
@@ -419,6 +421,8 @@ core::Result<core::Transform> ViewportTransformSession::preview(
     }
     if (state_->axis == ViewportTranslateAxis::world_x) {
         result.translation.x += world_delta;
+    } else if (state_->axis == ViewportTranslateAxis::world_y) {
+        result.translation.y += world_delta;
     } else {
         result.translation.z += world_delta;
     }
@@ -572,9 +576,11 @@ core::Result<ViewportTransformSnapResult> snap_viewport_transform_preview(
     bool geometry_snap,
     SnapSession& session,
     std::optional<scene::ObjectId> excluded_object,
-    double perpendicular_tolerance) {
+    double perpendicular_tolerance,
+    bool spatial_alignment) {
     if (!preview.finite() || (axis != ViewportTranslateAxis::world_x &&
-            axis != ViewportTranslateAxis::world_z) ||
+            axis != ViewportTranslateAxis::world_z &&
+            axis != ViewportTranslateAxis::world_y) ||
         (excluded_object.has_value() && !static_cast<bool>(*excluded_object)) ||
         !std::isfinite(perpendicular_tolerance) ||
         perpendicular_tolerance < 0.0 || perpendicular_tolerance > 0.5) {
@@ -591,13 +597,16 @@ core::Result<ViewportTransformSnapResult> snap_viewport_transform_preview(
         settings.kind = SnapKind::increment;
         settings.increment = 0.25;
         const double value = axis == ViewportTranslateAxis::world_x
-            ? preview.translation.x : preview.translation.z;
+            ? preview.translation.x : axis == ViewportTranslateAxis::world_y
+                ? preview.translation.y : preview.translation.z;
         const auto snapped = snap_scalar(value, settings);
         if (!snapped) {
             return core::Result<ViewportTransformSnapResult>::failure(snapped.error());
         }
         if (axis == ViewportTranslateAxis::world_x) {
             result.transform.translation.x = snapped.value();
+        } else if (axis == ViewportTranslateAxis::world_y) {
+            result.transform.translation.y = snapped.value();
         } else {
             result.transform.translation.z = snapped.value();
         }
@@ -612,8 +621,9 @@ core::Result<ViewportTransformSnapResult> snap_viewport_transform_preview(
     constexpr std::array<SnapKind, 3> kSnapKinds{
         SnapKind::vertex, SnapKind::edge_midpoint, SnapKind::face_center};
     SnapProfile profile;
+    spatial_alignment = spatial_alignment || axis == ViewportTranslateAxis::world_y;
     auto candidates = find_snap_candidates(scene, preview.translation, kSnapKinds,
-        source_revision, profile.break_radius);
+        source_revision, profile.break_radius, spatial_alignment);
     if (!candidates) {
         return core::Result<ViewportTransformSnapResult>::failure(candidates.error());
     }
@@ -623,10 +633,11 @@ core::Result<ViewportTransformSnapResult> snap_viewport_transform_preview(
         });
     }
     const auto constraint = axis == ViewportTranslateAxis::world_x
-        ? SnapConstraintAxis::world_x : SnapConstraintAxis::world_z;
+        ? SnapConstraintAxis::world_x : axis == ViewportTranslateAxis::world_y
+            ? SnapConstraintAxis::world_y : SnapConstraintAxis::world_z;
     const auto decision = acquire_snap(candidates.value(), preview.translation,
         source_revision, profile, session,
-        {constraint, perpendicular_tolerance});
+        {constraint, perpendicular_tolerance, spatial_alignment});
     if (!decision) {
         return core::Result<ViewportTransformSnapResult>::failure(decision.error());
     }
@@ -640,6 +651,8 @@ core::Result<ViewportTransformSnapResult> snap_viewport_transform_preview(
         }
         if (axis == ViewportTranslateAxis::world_x) {
             result.transform.translation.x = result.candidate->position.x;
+        } else if (axis == ViewportTranslateAxis::world_y) {
+            result.transform.translation.y = result.candidate->position.y;
         } else {
             result.transform.translation.z = result.candidate->position.z;
         }

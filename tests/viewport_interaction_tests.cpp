@@ -343,6 +343,100 @@ void viewport_transform_snap_policy_is_shared_and_source_bound() {
     REQUIRE(!invalid_tolerance_session.locked());
 }
 
+void y_translation_and_spatial_snapping_preserve_unchanged_axes() {
+    using namespace carto;
+    const core::Revision revision{23U};
+    core::Transform initial;
+    initial.translation = {1.2, 3.0, 0.0};
+    editor::ViewportTransformSession drag;
+    REQUIRE(!drag.begin(scene::ObjectId{4U}, initial, revision,
+        editor::ViewportTranslateAxis::world_y, {}, 50.0));
+    REQUIRE(drag.begin_projected(scene::ObjectId{4U}, initial, revision,
+        editor::ViewportTranslateAxis::world_y, {100, 80}, {30, -40}));
+    REQUIRE(!drag.begin_projected(scene::ObjectId{4U}, initial, revision,
+        editor::ViewportTranslateAxis::world_y, {100, 80}, {30, -40}));
+    const auto preview = drag.preview({115, 60}, revision);
+    REQUIRE(preview && std::abs(preview.value().translation.y - 3.5) < 1e-12);
+    REQUIRE(preview.value().translation.x == 1.2 && preview.value().translation.z == 0.0);
+    const auto perpendicular = drag.preview({140, 110}, revision);
+    REQUIRE(perpendicular && perpendicular.value().translation.y == 3.0);
+    REQUIRE(!drag.complete({115, 60}, revision.next()) && drag.active());
+    REQUIRE(drag.cancel() && !drag.active());
+    REQUIRE(!drag.complete({115, 60}, revision));
+    REQUIRE(!drag.begin_projected(scene::ObjectId{4U}, initial, revision,
+        static_cast<editor::ViewportTranslateAxis>(99), {}, {1, 0}));
+
+    geometry::EditableMesh mesh;
+    const auto a = mesh.add_vertex({0, 0, 0});
+    const auto b = mesh.add_vertex({2, 0, 0});
+    const auto c = mesh.add_vertex({0, 0, 2});
+    REQUIRE(a && b && c && mesh.add_face({a.value(), b.value(), c.value()}));
+    const auto compiled = mesh.compile();
+    REQUIRE(compiled);
+    const auto source = std::make_shared<const geometry::CompiledMesh>(compiled.value());
+    render::RenderScene scene;
+    core::Transform target;
+    target.translation = {1.2, 4.0, 0.0};
+    const scene::ObjectId target_id{31U};
+    REQUIRE(scene.upsert({target_id, source, target, source->source_revision, 9U}));
+    editor::SnapSession snap;
+    core::Transform moved = initial;
+    moved.translation.y = 3.85;
+    const auto snapped = editor::snap_viewport_transform_preview(moved,
+        editor::ViewportTranslateAxis::world_y, scene, revision, false, true, snap);
+    REQUIRE(snapped && snapped.value().candidate && snap.locked());
+    REQUIRE(snapped.value().transform.translation.y == 4.0);
+    REQUIRE(snapped.value().transform.translation.x == moved.translation.x);
+    REQUIRE(snapped.value().transform.translation.z == moved.translation.z);
+    REQUIRE(snapped.value().candidate->object == target_id);
+    const auto stale = editor::snap_viewport_transform_preview(moved,
+        editor::ViewportTranslateAxis::world_y, scene, revision.next(), false, true, snap);
+    REQUIRE(!stale && stale.error().code == core::ErrorCode::stale_data);
+    const auto grid = editor::snap_viewport_transform_preview(moved,
+        editor::ViewportTranslateAxis::world_y, scene, revision, true, true, snap);
+    REQUIRE(grid && !grid.value().candidate && !snap.locked());
+    REQUIRE(grid.value().transform.translation.y == 3.75);
+    REQUIRE(grid.value().transform.translation.x == moved.translation.x);
+    REQUIRE(grid.value().transform.translation.z == moved.translation.z);
+    const auto self = editor::snap_viewport_transform_preview(moved,
+        editor::ViewportTranslateAxis::world_y, scene, revision, false, true, snap, target_id);
+    REQUIRE(self && !self.value().candidate);
+    for (const auto offset : {core::Vec3d{0.06, 0, 0}, core::Vec3d{0, 0, 0.06}}) {
+        auto misaligned = moved;
+        misaligned.translation = misaligned.translation + offset;
+        const auto rejected = editor::snap_viewport_transform_preview(misaligned,
+            editor::ViewportTranslateAxis::world_y, scene, revision, false, true, snap);
+        REQUIRE(rejected && !rejected.value().candidate);
+    }
+    for (const auto axis : {editor::ViewportTranslateAxis::world_x,
+                           editor::ViewportTranslateAxis::world_z}) {
+        auto elevated = target;
+        elevated.translation.y = 20.0;
+        const auto spatial = editor::snap_viewport_transform_preview(elevated,
+            axis, scene, revision, false, true, snap, std::nullopt, 0.05, true);
+        REQUIRE(spatial && !spatial.value().candidate);
+        // Nearby but off-axis candidates must also fail alignment, not just distance.
+        elevated.translation.y = 4.2;
+        const auto off_axis = editor::snap_viewport_transform_preview(elevated,
+            axis, scene, revision, false, true, snap, std::nullopt, 0.05, true);
+        REQUIRE(off_axis && !off_axis.value().candidate);
+        elevated.translation.y = 4.0;
+        const auto aligned = editor::snap_viewport_transform_preview(elevated,
+            axis, scene, revision, false, true, snap, std::nullopt, 0.05, true);
+        REQUIRE(aligned && aligned.value().candidate);
+        snap.reset();
+    }
+    // Y relocation remains compatible with parent-local command transforms.
+    core::Transform parent;
+    parent.translation = {4, 5, 6};
+    parent.rotation = {0, 0, std::sqrt(0.5), std::sqrt(0.5)};
+    parent.scale = {-2, 3, 4};
+    const auto local = editor::viewport_local_transform_from_world(parent, snapped.value().transform);
+    REQUIRE(local);
+    const auto restored = parent.combine(local.value());
+    REQUIRE((restored.translation - snapped.value().transform.translation).length() < 1e-10);
+}
+
 void viewport_world_transform_converts_to_parent_local_without_drift() {
     using namespace carto;
     constexpr double kHalfSqrt = 0.7071067811865475244;
@@ -496,6 +590,7 @@ int main() {
         drawn_world_bounds_normalize_xz_and_preserve_vertical_limits();
         transform_preview_is_axis_constrained_and_revision_bound();
         viewport_transform_snap_policy_is_shared_and_source_bound();
+        y_translation_and_spatial_snapping_preserve_unchanged_axes();
         viewport_world_transform_converts_to_parent_local_without_drift();
         work_surface_camera_fits_projects_and_preserves_zoom_anchor();
         work_surface_camera_rejects_invalid_fit_and_pointer_inputs();

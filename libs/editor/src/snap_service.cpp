@@ -130,7 +130,7 @@ core::Result<SnapDecision> acquire_snap(
     if (!std::isfinite(constraint.perpendicular_tolerance) ||
         constraint.perpendicular_tolerance < 0.0 ||
         static_cast<std::uint8_t>(constraint.axis) >
-            static_cast<std::uint8_t>(SnapConstraintAxis::world_z)) {
+            static_cast<std::uint8_t>(SnapConstraintAxis::world_y)) {
         return core::Result<SnapDecision>::failure(invalid(
             "snap axis constraint or perpendicular tolerance is invalid"));
     }
@@ -164,15 +164,23 @@ core::Result<SnapDecision> acquire_snap(
         const core::Vec3d delta = candidate.position - origin;
         double distance = delta.length();
         if (constraint.axis == SnapConstraintAxis::world_x) {
-            if (std::abs(delta.z) > constraint.perpendicular_tolerance) {
+            if (std::abs(delta.z) > constraint.perpendicular_tolerance ||
+                (constraint.spatial_alignment &&
+                    std::abs(delta.y) > constraint.perpendicular_tolerance)) {
                 continue;
             }
             distance = std::abs(delta.x);
         } else if (constraint.axis == SnapConstraintAxis::world_z) {
-            if (std::abs(delta.x) > constraint.perpendicular_tolerance) {
+            if (std::abs(delta.x) > constraint.perpendicular_tolerance ||
+                (constraint.spatial_alignment &&
+                    std::abs(delta.y) > constraint.perpendicular_tolerance)) {
                 continue;
             }
             distance = std::abs(delta.z);
+        } else if (constraint.axis == SnapConstraintAxis::world_y) {
+            if (std::abs(delta.x) > constraint.perpendicular_tolerance ||
+                std::abs(delta.z) > constraint.perpendicular_tolerance) continue;
+            distance = std::abs(delta.y);
         }
         if (!std::isfinite(distance)) {
             return core::Result<SnapDecision>::failure(invalid(

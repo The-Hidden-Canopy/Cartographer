@@ -75,7 +75,8 @@ core::Result<void> append_viewport_candidates(
     scene::ObjectId object,
     std::uint64_t mesh_asset,
     core::Revision source_revision,
-    std::vector<SnapCandidate>& candidates) {
+    std::vector<SnapCandidate>& candidates,
+    bool spatial_distance) {
     constexpr std::size_t kMaxViewportSnapCandidates = 65'536U;
     const auto consider = [&](SnapCandidate candidate) -> core::Result<void> {
         candidate.position = transform_point(transform, candidate.position);
@@ -83,11 +84,10 @@ core::Result<void> append_viewport_candidates(
             return core::Result<void>::failure(invalid(
                 "compiled viewport snap target has a non-finite world position"));
         }
-        // The native work surface is an X/Z plan projection. Elevation is
-        // preserved by the active transform axis and does not affect proximity.
-        const double distance = std::hypot(
-            candidate.position.x - origin.x,
-            candidate.position.z - origin.z);
+        // Preserve the plan query while bounding editor-camera targets in 3D.
+        const auto delta = candidate.position - origin;
+        const double distance = spatial_distance
+            ? std::hypot(delta.x, delta.y, delta.z) : std::hypot(delta.x, delta.z);
         if (!std::isfinite(distance)) {
             return core::Result<void>::failure(invalid(
                 "compiled viewport snap distance is non-finite"));
@@ -394,7 +394,8 @@ core::Result<std::vector<SnapCandidate>> find_snap_candidates(
     core::Vec3d origin,
     std::span<const SnapKind> kinds,
     core::Revision source_revision,
-    double radius) {
+    double radius,
+    bool spatial_distance) {
     if (!origin.finite() || !std::isfinite(radius) || radius < 0.0) {
         return core::Result<std::vector<SnapCandidate>>::failure(invalid(
             "compiled snap scene origin or radius is invalid"));
@@ -438,7 +439,7 @@ core::Result<std::vector<SnapCandidate>> find_snap_candidates(
         for (const SnapKind kind : kinds) {
             if (auto result = append_viewport_candidates(
                     *instance.mesh, origin, radius, kind, instance.world_transform,
-                    instance.object, *instance.mesh_asset, source_revision, candidates);
+                    instance.object, *instance.mesh_asset, source_revision, candidates, spatial_distance);
                 !result) {
                 return core::Result<std::vector<SnapCandidate>>::failure(
                     result.error().with_context("compiled viewport snap query"));

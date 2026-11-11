@@ -1504,6 +1504,15 @@ carto_target(cartographer_editor_camera_tests)
 add_test(NAME cartographer_editor_camera_tests
     COMMAND cartographer_editor_camera_tests)
 
+add_executable(cartographer_desktop_translate_gizmo_tests
+    desktop_translate_gizmo_tests.cpp)
+target_include_directories(cartographer_desktop_translate_gizmo_tests
+    PRIVATE "${PROJECT_SOURCE_DIR}/apps/desktop")
+target_link_libraries(cartographer_desktop_translate_gizmo_tests PRIVATE carto_ui)
+carto_target(cartographer_desktop_translate_gizmo_tests)
+add_test(NAME cartographer_desktop_translate_gizmo_tests
+    COMMAND cartographer_desktop_translate_gizmo_tests)
+
 add_executable(cartographer_desktop_projection_pick_tests
     desktop_projection_pick_tests.cpp)
 target_include_directories(cartographer_desktop_projection_pick_tests
