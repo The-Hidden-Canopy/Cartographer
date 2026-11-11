@@ -2784,7 +2784,7 @@ int import_mesh_to_project(
         return EXIT_FAILURE;
     }
     auto baseline = carto::application::HumanApplicationAccess::dispatch(
-        session, carto::application::SaveProjectAction{project_path});
+        session, carto::application::SaveProjectAction{project_path, true});
     if (!baseline) {
         print_error(baseline.error());
         return EXIT_FAILURE;
@@ -2817,7 +2817,7 @@ int import_gltf_scene(const std::filesystem::path& path,const std::filesystem::p
     auto parsed=carto::io::import_gltf_scene(captured.value());if(!parsed){print_error(parsed.error());return EXIT_FAILURE;}
     carto::application::ApplicationSession session;
     const auto send=[&](const carto::application::ApplicationAction& action){auto r=carto::application::HumanApplicationAccess::dispatch(session,action);if(!r)print_error(r.error());return bool(r);};
-    if(!send(carto::application::NewProjectAction{path.stem().string()})||!send(carto::application::SaveProjectAction{output}))return EXIT_FAILURE;
+    if(!send(carto::application::NewProjectAction{path.stem().string()})||!send(carto::application::SaveProjectAction{output,true}))return EXIT_FAILURE;
     carto::ui::UiController controller(session);
     const auto snapshot=controller.snapshot();
     auto imported=controller.import_static_gltf_scene(path,snapshot.project_generation,

@@ -6,6 +6,7 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 
 ## 0.1 - current foundation
 
+- [x] create-only application saves protect CLI mesh imports from replacing existing projects or orphan journals under the shared writer lease
 - [x] repeatable headless CLI preparation acceptance for saved profiles, all four scopes, immutable replay, namespace/rollback refusal, relocation, and tamper detection; CPU bake suites remain independently runnable in D3D12 builds
 - [x] native vertex merge controls use per-object cardinality for target/center weld and merge-by-distance; existing command validation remains authoritative for geometry and shared assets
 

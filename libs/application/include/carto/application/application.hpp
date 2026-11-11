@@ -940,6 +940,9 @@ struct SaveProjectAction {
     std::optional<std::filesystem::path> linked_output_directory;
     std::string linked_human_reason;
     std::stop_token linked_stop;
+    // Import/create callers can refuse an existing project or journal under
+    // the same writer lease used for save. Ordinary Save/Save As is unchanged.
+    bool require_new_target = false;
 };
 
 struct SetWorkspaceAction {

@@ -33,6 +33,15 @@ foreach(format IN ITEMS gltf glb)
     if(NOT before STREQUAL after)
         message(FATAL_ERROR "Scene CLI import modified source asset")
     endif()
+    set(orphan "${root}/orphan-${format}.carto")
+    file(WRITE "${orphan}.journal" "")
+    execute_process(COMMAND "${CARTO_CLI}" import-gltf "${source}" "${orphan}" --confirm-reuse-rights
+        RESULT_VARIABLE result OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+    file(SIZE "${orphan}.journal" journal_size)
+    if(result EQUAL 0 OR EXISTS "${orphan}" OR NOT journal_size EQUAL 0 OR
+       NOT stderr MATCHES "create-only save refuses")
+        message(FATAL_ERROR "${format} import adopted an orphan journal: ${stdout}${stderr}")
+    endif()
 endforeach()
 # Imported scenes with materials must prepare for runtime handoff and report
 # exact admission pins; a publication is refused for any other source project.

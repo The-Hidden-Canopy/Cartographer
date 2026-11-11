@@ -4806,6 +4806,25 @@ core::Result<DispatchReceipt> ApplicationSession::save_project(const SaveProject
     if (auto result = project_lock.acquire(); !result) {
         return failure(result.error().with_context("project write lock"));
     }
+    if (action.require_new_target) {
+        for (const auto& path : {*selected, journal_path_for(*selected)}) {
+            std::error_code error;
+            const auto native = core::native_io_path(path, error);
+            if (error) return failure(core::Diagnostic(core::ErrorCode::io_error,
+                "unable to resolve the new project or journal path"));
+            // Inspect the directory entry itself so dangling links also count
+            // as existing targets. Do not create or append a journal first.
+            const auto status = std::filesystem::symlink_status(native, error);
+            if (error && error != std::errc::no_such_file_or_directory) {
+                return failure(core::Diagnostic(core::ErrorCode::io_error,
+                    "unable to inspect the new project or journal path"));
+            }
+            if (status.type() != std::filesystem::file_type::not_found) {
+                return failure(invalid_state(
+                    "create-only save refuses an existing project or journal"));
+            }
+        }
+    }
     auto prepared_journal = prepare_journal(*selected, document_);
     if (!prepared_journal) {
         return failure(prepared_journal.error().with_context("save project journal"));

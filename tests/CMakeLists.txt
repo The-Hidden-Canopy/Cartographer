@@ -65,6 +65,11 @@ add_executable(cartographer_application_tests
     application_tests.cpp
 )
 
+add_executable(cartographer_create_only_save_tests create_only_save_tests.cpp)
+target_link_libraries(cartographer_create_only_save_tests PRIVATE carto_application carto_journal)
+carto_target(cartographer_create_only_save_tests)
+add_test(NAME cartographer_create_only_save_tests COMMAND cartographer_create_only_save_tests)
+
 add_executable(cartographer_editor_multi_face_deletion_tests
     editor_multi_face_deletion_tests.cpp)
 target_link_libraries(cartographer_editor_multi_face_deletion_tests PRIVATE carto_application carto_journal)
@@ -775,6 +780,13 @@ if(TARGET cartographer_cli)
             "-DCARTO_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/run_preparation_cli_tests.cmake")
     set_tests_properties(cartographer_preparation_cli_tests PROPERTIES RUN_SERIAL TRUE)
+    add_test(NAME cartographer_mesh_cli_import_tests
+        COMMAND ${CMAKE_COMMAND}
+            "-DCARTO_CLI=$<TARGET_FILE:cartographer_cli>"
+            "-DCARTO_FIXTURE=$<TARGET_FILE:cartographer_cli_mesh_fixture>"
+            "-DCARTO_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/run_mesh_cli_import_tests.cmake")
+    set_tests_properties(cartographer_mesh_cli_import_tests PROPERTIES RUN_SERIAL TRUE)
 endif()
 
 add_executable(cartographer_lookdev_draw_package_tests
