@@ -50,7 +50,7 @@ struct SavedScenePreviewRenderSettings {
     const SavedScenePreviewBinding& capture,
     bool project_available,
     bool project_clean,
-    bool perspective_camera,
+    bool supported_camera,
     bool live_project_source,
     std::uint64_t project_generation,
     core::Revision project_revision,
@@ -58,7 +58,7 @@ struct SavedScenePreviewRenderSettings {
     core::Vec2d viewport_extent,
     std::uint64_t environment_selection_generation,
     std::uint64_t render_settings_generation) noexcept {
-    return project_available && project_clean && perspective_camera &&
+    return project_available && project_clean && supported_camera &&
         live_project_source && !capture.camera_state.empty() &&
         capture.project_generation == project_generation &&
         capture.project_revision == project_revision &&

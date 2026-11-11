@@ -51,7 +51,7 @@ struct SavedScenePreviewCameraBinding {
     std::optional<core::Revision> authored_revision;
 };
 
-// Bind a preview to either the current perspective viewport or one explicitly
+// Bind a preview to either the current editor viewport or one explicitly
 // selected saved camera. Project generation/revision are checked
 // separately by the preview binding; this value captures the exact camera
 // source so a changed selection or authored pose cannot reuse old pixels.
@@ -65,7 +65,7 @@ saved_scene_preview_camera_binding(
     if (!authored_camera_object.has_value()) {
         if (viewport_camera_state.empty()) {
             return Result::failure({core::ErrorCode::invalid_state,
-                "preview requires a current perspective viewport camera"});
+                "preview requires a current 3D, Front, or Right editor camera"});
         }
         return Result::success({"viewport:" + std::string(viewport_camera_state),
             "Current viewport camera", std::nullopt, std::nullopt});

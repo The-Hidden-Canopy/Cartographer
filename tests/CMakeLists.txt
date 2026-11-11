@@ -1013,6 +1013,17 @@ if(CARTO_BUILD_DEVICE_CPU)
 endif()
 
 if(CARTO_ENABLE_D3D12)
+    # Camera/request integration only: this suite never creates a GPU device.
+    add_executable(cartographer_desktop_scene_preview_camera_tests
+        desktop_scene_preview_camera_tests.cpp)
+    target_include_directories(cartographer_desktop_scene_preview_camera_tests
+        PRIVATE "${PROJECT_SOURCE_DIR}/apps/desktop")
+    target_link_libraries(cartographer_desktop_scene_preview_camera_tests
+        PRIVATE carto_d3d12_scene carto_application)
+    carto_target(cartographer_desktop_scene_preview_camera_tests)
+    add_test(NAME cartographer_desktop_scene_preview_camera_tests
+        COMMAND cartographer_desktop_scene_preview_camera_tests)
+
     add_executable(cartographer_d3d12_unsignaled_execution_tests
         d3d12_unsignaled_execution_tests.cpp)
     target_link_libraries(cartographer_d3d12_unsignaled_execution_tests PRIVATE carto_d3d12)

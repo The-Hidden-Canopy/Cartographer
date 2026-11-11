@@ -70,6 +70,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 #endif
 #if defined(CARTO_DESKTOP_HAS_D3D12_SCENE)
 #include <carto/d3d12/scene_renderer.hpp>
+#include "studio_scene_preview_camera.hpp"
 #include <carto/d3d12/temporal_sampling.hpp>
 #endif
 #include <carto/production/authoring_aging.hpp>
@@ -11839,8 +11840,8 @@ struct DesktopState {
             if (viewport_view.view == carto::studio::ViewportViewKind::front_xy ||
                 viewport_view.view == carto::studio::ViewportViewKind::right_zy) {
                 ImGui::TextDisabled(
-                    "Orthographic named views render on the CPU painter; the GPU scene "
-                    "preview binds authored or perspective cameras only.");
+                    "Front and Right use the same orthographic camera for live material "
+                    "rendering and saved-scene preview; Structure and Depth remain CPU projections.");
             }
         }
         if (rendered_error.has_value()) {
@@ -16189,15 +16190,10 @@ struct DesktopState {
 
     [[nodiscard]] carto::core::Result<carto::studio::SavedScenePreviewCameraBinding>
     scene_preview_camera_binding(const UiSnapshot& snapshot) const {
-        std::string viewport_camera_state;
-        if (perspective_camera_active && perspective_camera.valid() &&
-            perspective_camera.projection() ==
-                carto::editor::EditorProjection::perspective) {
-            viewport_camera_state = perspective_camera.serialize();
-        }
-        return carto::studio::saved_scene_preview_camera_binding(snapshot,
+        return carto::studio::scene_preview_camera_source_binding(snapshot,
             scene_preview_authored_camera,
-            scene_preview_camera_project_generation, viewport_camera_state);
+            scene_preview_camera_project_generation, perspective_camera_active,
+            perspective_camera, scene_preview_exposure_ev);
     }
 
     [[nodiscard]] bool scene_preview_render_settings_are_valid() const noexcept {
@@ -16352,21 +16348,14 @@ struct DesktopState {
                 }
                 camera = std::move(authored_camera).value();
             } else {
-                const auto camera_position = perspective_camera.position();
-                const auto camera_axes = perspective_camera.axes();
-                camera.position = camera_position;
-                camera.target = perspective_camera.target();
-                camera.up = camera_axes.up;
-                camera.vertical_fov = perspective_camera.vertical_fov();
-                camera.exposure_ev = exposure_ev_for_preview;
-                camera.near_plane = std::max(
-                    0.001, std::min(0.1, perspective_camera.distance() * 0.001));
-                camera.far_plane = std::max(
-                    1000.0, perspective_camera.distance() * 4.0);
-                if (!std::isfinite(camera.far_plane) || camera.far_plane > 1.0e8) {
-                    fail("Current camera distance exceeds the bounded scene preview range.");
+                auto viewport_camera = carto::studio::scene_preview_camera_from_editor_camera(
+                    perspective_camera, exposure_ev_for_preview);
+                if (!viewport_camera) {
+                    fail("Current editor camera is unavailable: " +
+                        viewport_camera.error().message);
                     return;
                 }
+                camera = std::move(viewport_camera).value();
             }
 
             carto::d3d12::SceneRenderMaterialGraphInputs graph_inputs;
