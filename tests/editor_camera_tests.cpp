@@ -152,22 +152,21 @@ void pick_rays_match_projection_conventions() {
     camera.set_projection(EditorProjection::orthographic);
     const auto ortho_centre = camera.ray_for_pixel({400.0, 300.0}, viewport);
     require(ortho_centre.has_value(), "orthographic centre ray is accepted");
-    require(same_vec(ortho_centre.value().origin, camera.position() +
-            axes.forward * camera.distance()),
-        "orthographic centre ray origin sits on the image plane");
+    require(same_vec(ortho_centre.value().origin, camera.position()),
+        "orthographic centre ray origin sits on the camera plane");
     require(near(carto::core::dot(ortho_centre.value().direction, axes.forward),
             1.0),
         "orthographic centre ray direction is the forward axis");
 
     const auto ortho_corner = camera.ray_for_pixel({0.0, 0.0}, viewport);
     const double span = camera.orthographic_height();
-    const auto expected_origin = camera.target() -
+    const auto expected_origin = camera.position() -
         axes.right * (span * 0.5 * aspect) + axes.up * (span * 0.5);
     require(ortho_corner.has_value() &&
             near(ortho_corner.value().origin.x, expected_origin.x) &&
             near(ortho_corner.value().origin.y, expected_origin.y) &&
             near(ortho_corner.value().origin.z, expected_origin.z),
-        "orthographic corner ray offsets on the image plane");
+        "orthographic corner ray offsets on the camera plane");
     require(same_vec(ortho_corner.value().direction,
             ortho_centre.value().direction),
         "orthographic rays are parallel");

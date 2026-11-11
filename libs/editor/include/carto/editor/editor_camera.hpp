@@ -67,8 +67,10 @@ public:
     [[nodiscard]] core::Vec3d position() const noexcept;
 
     // World-space pick ray through a pixel position, using the same span and
-    // FOV conventions as the renderer-facing navigation math. Pixels use +x
-    // right and +y down; pixel coordinates outside the viewport are projected
+    // FOV conventions as the renderer-facing navigation math. Orthographic
+    // rays start on the camera plane, so distance agrees with marker depth
+    // and geometry between the eye and target remains ahead of the ray. Pixels
+    // use +x right and +y down; coordinates outside the viewport are projected
     // rather than rejected. Invalid camera state, non-finite input, or a
     // zero-sized viewport fail closed with a Diagnostic.
     [[nodiscard]] core::Result<EditorRay> ray_for_pixel(
@@ -96,6 +98,8 @@ public:
     // Fly is intentionally unavailable in orthographic projection.
     [[nodiscard]] bool fly(core::Vec3d local, double seconds) noexcept;
     // Fits a sphere in the current projection for the given viewport aspect.
+    // Orthographic framing also keeps the eye outside the sphere without
+    // moving an already more distant eye closer.
     [[nodiscard]] bool frame(
         core::Vec3d centre, double radius, double aspect) noexcept;
 

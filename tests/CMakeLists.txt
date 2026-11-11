@@ -1493,6 +1493,16 @@ carto_target(cartographer_editor_camera_tests)
 add_test(NAME cartographer_editor_camera_tests
     COMMAND cartographer_editor_camera_tests)
 
+add_executable(cartographer_editor_camera_projection_tests
+    editor_camera_projection_tests.cpp
+)
+target_link_libraries(cartographer_editor_camera_projection_tests
+    PRIVATE carto_editor
+)
+carto_target(cartographer_editor_camera_projection_tests)
+add_test(NAME cartographer_editor_camera_projection_tests
+    COMMAND cartographer_editor_camera_projection_tests)
+
 add_executable(cartographer_snap_service_tests
     snap_service_tests.cpp
 )

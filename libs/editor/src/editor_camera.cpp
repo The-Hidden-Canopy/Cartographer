@@ -103,8 +103,9 @@ core::Result<EditorRay> EditorCamera::ray_for_pixel(
 
     if (projection_ == EditorProjection::orthographic) {
         const double span = view_span(*this);
-        const core::Vec3d centre = position() + camera_axes.forward * distance_;
-        const core::Vec3d origin = centre + camera_axes.right *
+        // Match project_marker's camera-depth origin. Starting on the target
+        // plane puts visible geometry between the eye and target behind a ray.
+        const core::Vec3d origin = position() + camera_axes.right *
             (ndc_x * span * 0.5 * aspect) +
             camera_axes.up * (ndc_y * span * 0.5);
         if (!origin.finite()) {
@@ -281,9 +282,15 @@ bool EditorCamera::frame(core::Vec3d centre, double radius, double aspect) noexc
     }
     if (projection_ == EditorProjection::orthographic) {
         const double required_height = std::max(2.0 * radius, 2.0 * radius / aspect);
+        // Orthographic scale does not move the eye. Keep the entire framed
+        // sphere ahead of it, including when a large import replaces a small
+        // scene or when switching to a fixed front/right view.
+        const double required_distance = std::max(distance_, radius * 1.05);
         if (!std::isfinite(required_height) ||
-            required_height > kMaxOrthographicHeight) return false;
+            required_height > kMaxOrthographicHeight ||
+            !std::isfinite(required_distance) || required_distance > kMaxDistance) return false;
         target_ = centre;
+        distance_ = required_distance;
         orthographic_height_ = std::clamp(
             required_height, kMinOrthographicHeight, kMaxOrthographicHeight);
         return true;
