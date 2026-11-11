@@ -46,6 +46,26 @@ void editor_camera_matches_authoring_projection() {
     REQUIRE(!studio::authoring_view_from_editor_camera(huge, 1.0));
 }
 
+void plan_camera_matches_authoring_projection_without_a_gpu() {
+    using namespace carto;
+    editor::WorkSurfaceCamera camera;
+    const core::Vec2d extent{401.0, 799.0};
+    REQUIRE(camera.frame({3.0, -4.0}, {20.0, 10.0}, extent));
+    const auto view = studio::authoring_view_from_plan_camera(camera, {}, extent.x / extent.y);
+    REQUIRE(view);
+    REQUIRE(view.value().projection == project::CameraProjection::orthographic);
+    REQUIRE(view.value().aspect_ratio == extent.x / extent.y);
+    for (const core::Vec2d point : {core::Vec2d{3.0, -4.0},
+                                   core::Vec2d{8.0, -1.0}, core::Vec2d{-4.0, -8.0}}) {
+        const auto expected = camera.world_to_screen(point, {}, extent);
+        const auto actual = view.value().project({point.x, 0.0, point.y}, 401U, 799U);
+        REQUIRE(expected && actual);
+        REQUIRE(std::abs(expected.value().x - actual.value().x) < 1.0e-8);
+        REQUIRE(std::abs(expected.value().y - actual.value().y) < 1.0e-8);
+    }
+    REQUIRE(!studio::authoring_view_from_plan_camera(camera, {}, 0.0));
+}
+
 void explicit_viewshed_observer_preserves_finite_world_coordinates() {
     carto::application::ApplicationSnapshot snapshot;
     snapshot.project_generation = 5U;
@@ -258,6 +278,7 @@ void viewshed_cell_footprints_preserve_projected_grid_geometry() {
 
 int main() {
     editor_camera_matches_authoring_projection();
+    plan_camera_matches_authoring_projection_without_a_gpu();
     explicit_viewshed_observer_preserves_finite_world_coordinates();
     bound_viewshed_observer_uses_current_world_origin();
     bound_viewshed_observer_rejects_stale_missing_and_invalid_sources();

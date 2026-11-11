@@ -27,7 +27,7 @@ void near(double actual, double expected) {
     require(std::abs(actual - expected) < 1.0e-8, "camera projection differs");
 }
 
-project::ProjectDocument fixture() {
+project::ProjectDocument fixture(core::Transform transform = {}) {
     auto document = take(project::ProjectDocument::create("Synthetic preview camera fixture"));
     auto mesh = take(geometry::make_box({2.0, 2.0, 2.0}));
     attributes::AttributeSet payload({
@@ -38,7 +38,7 @@ project::ProjectDocument fixture() {
     take(mesh.set_attribute_payload(std::move(payload), {}));
     auto access = project::testing::access(document);
     const auto mesh_id = take(access.add_mesh(std::move(mesh)));
-    const auto object = take(access.create_object("Preview cube"));
+    const auto object = take(access.create_object("Preview cube", transform));
     take(access.attach_mesh(object, mesh_id));
     project::MaterialCatalog catalog;
     take(catalog.insert_material({1U, "Fixture material", {}, core::Revision{1U}}));
@@ -46,6 +46,19 @@ project::ProjectDocument fixture() {
     take(document.set_material_catalog(std::move(catalog)));
     // Exercise the persisted representation, not an unsaved parallel scene.
     return take(project::ProjectDocument::deserialize(document.serialize()));
+}
+
+render::RenderScene compiled_scene(const project::ProjectDocument& document) {
+    render::RenderScene scene;
+    for (const auto& object : document.scene().objects_sorted()) {
+        if (!object.visible || !object.mesh_asset) continue;
+        const auto compiled = std::make_shared<const geometry::CompiledMesh>(
+            take(document.meshes().at(*object.mesh_asset).compile()));
+        take(scene.upsert({object.id, compiled,
+            take(document.scene().world_transform(object.id)),
+            compiled->source_revision, object.mesh_asset}));
+    }
+    return scene;
 }
 
 core::Vec2d project_preview(const d3d12::SceneRenderCamera& camera,
@@ -178,10 +191,13 @@ void authored_camera_selection_is_independent_of_navigation() {
     snapshot.objects.push_back(object);
     const auto narrow = editor::EditorCamera::deserialize("persp 0 0 0 10 0 0 2 0.005");
     require(narrow.has_value(), "narrow navigation camera");
+    editor::WorkSurfaceCamera unbounded_plan;
+    require(unbounded_plan.frame({}, {1.0e8, 1.0e8}, {800.0, 600.0}),
+        "valid plan camera outside renderer range");
     std::string expected;
     for (const bool active : {false, true}) {
         const auto selected = take(studio::scene_preview_camera_source_binding(snapshot,
-            authored.object, 7U, active, *narrow, 0.0));
+            authored.object, 7U, active, *narrow, 0.0, &unbounded_plan));
         require(selected.authored_object == authored.object, "authored selection lost");
         if (expected.empty()) expected = selected.state;
         else require(selected.state == expected, "navigation activation changed authored binding");
@@ -192,6 +208,122 @@ void authored_camera_selection_is_independent_of_navigation() {
     }
     require(!studio::scene_preview_camera_source_binding(snapshot, {}, 7U, true, *narrow, 0.0),
         "unsupported editor source was admitted after clearing authored selection");
+}
+
+void plan_view_reaches_saved_scene_with_matching_projection_and_clips() {
+    core::Transform transform;
+    transform.translation = {3.0, 35.0, -4.0};
+    transform.rotation = {std::sqrt(0.5), 0.0, 0.0, std::sqrt(0.5)};
+    transform.scale = {-2.0, 3.0, 4.0};
+    const auto document = fixture(transform);
+    const auto original = document.serialize();
+    const auto scene = compiled_scene(document);
+    application::ApplicationSnapshot snapshot;
+    snapshot.project_generation = 9U;
+    snapshot.project_revision = document.revision();
+    snapshot.viewport.scene = scene;
+    editor::EditorCamera unused_editor;
+    for (const core::Vec2d extent : {core::Vec2d{800.0, 600.0},
+                                   core::Vec2d{400.0, 800.0}}) {
+        editor::WorkSurfaceCamera plan;
+        require(plan.frame({3.0, -4.0}, {16.0, 16.0}, extent), "plan frame");
+        const auto original_target = plan.target();
+        const auto original_height = plan.view_height();
+        const auto live = take(studio::authoring_view_from_plan_camera(
+            plan, scene.instances(), extent.x / extent.y));
+        const auto camera = take(studio::scene_preview_camera_from_plan_camera(plan, scene, 0.5));
+        require(camera.projection == d3d12::SceneRenderProjection::orthographic,
+            "plan camera must stay orthographic");
+        near(camera.orthographic_height, plan.view_height());
+        near(camera.position.y, live.position.y);
+        near(camera.near_plane, live.near_plane);
+        near(camera.far_plane, live.far_plane);
+        for (const auto& instance : scene.instances()) {
+            for (const auto point : instance.mesh->positions) {
+                const auto world = instance.world_transform.translation +
+                    instance.world_transform.rotation.rotate(core::componentwise_multiply(
+                        instance.world_transform.scale, point));
+                const auto expected = take(plan.world_to_screen({world.x, world.z}, {}, extent));
+                const auto preview_pixel = project_preview(camera, world, extent);
+                const auto live_pixel = take(live.project(world,
+                    static_cast<std::uint32_t>(extent.x), static_cast<std::uint32_t>(extent.y)));
+                near(preview_pixel.x, expected.x);
+                near(preview_pixel.y, expected.y);
+                near(live_pixel.x, expected.x);
+                near(live_pixel.y, expected.y);
+            }
+        }
+        const auto request = take(d3d12::prepare_project_scene_render("plan-camera-integration",
+            document, camera, static_cast<std::uint32_t>(extent.x),
+            static_cast<std::uint32_t>(extent.y)));
+        take(request.validate());
+        const auto digest = take(request.digest());
+        const auto binding = take(studio::scene_preview_camera_source_binding(snapshot,
+            {}, 9U, false, unused_editor, 0.5, &plan));
+        require(binding.state.starts_with("viewport:plan:"), "plan identity must be distinct");
+        const studio::SavedScenePreviewBinding captured{9U, snapshot.project_revision,
+            2U, 3U, binding.state, extent};
+        const auto matches = [&](const application::ApplicationSnapshot& current,
+                                 const editor::WorkSurfaceCamera& current_plan) {
+            const auto current_binding = take(studio::scene_preview_camera_source_binding(
+                current, {}, 9U, false, unused_editor, 0.5, &current_plan));
+            return studio::saved_scene_preview_binding_matches(captured, true, true, true,
+                true, current.project_generation, current.project_revision,
+                current_binding.state, extent, 2U, 3U);
+        };
+        require(matches(snapshot, plan), "unchanged plan capture must match");
+        auto changed_plan = plan;
+        require(changed_plan.pan_pixels({20.0, -10.0}, extent.y) &&
+            !matches(snapshot, changed_plan), "plan pan must invalidate capture");
+        changed_plan = plan;
+        require(changed_plan.zoom_at(1.0, extent * 0.5, {}, extent) &&
+            !matches(snapshot, changed_plan), "plan zoom must invalidate capture");
+        auto changed_request = request;
+        changed_request.camera = take(studio::scene_preview_camera_from_plan_camera(
+            changed_plan, scene, 0.5));
+        require(take(changed_request.digest()) != digest, "plan zoom must change request identity");
+        auto changed_snapshot = snapshot;
+        auto moved = scene.instances().front();
+        moved.world_transform.translation.y += 100.0;
+        take(changed_snapshot.viewport.scene.upsert(moved));
+        require(!matches(changed_snapshot, plan), "changed depth fit must invalidate capture");
+        const auto editor_binding = take(studio::scene_preview_camera_source_binding(snapshot,
+            {}, 9U, true, unused_editor, 0.5, &plan));
+        require(editor_binding.state != binding.state, "switching to 3D must invalidate plan pixels");
+        near(plan.target().x, original_target.x);
+        near(plan.target().y, original_target.y);
+        near(plan.view_height(), original_height);
+        require(document.serialize() == original, "plan preview must not mutate source");
+    }
+}
+
+void plan_camera_rejects_unsupported_source_bounds() {
+    editor::WorkSurfaceCamera plan;
+    const render::RenderScene empty;
+    require(studio::scene_preview_camera_from_plan_camera(plan, empty, 0.0).has_value(),
+        "empty source has a finite deterministic plan view");
+    const auto document = fixture();
+    const auto scene = compiled_scene(document);
+    auto instances = scene.instances();
+    instances.front().world_transform.scale.y = 1.0e8;
+    require(!studio::authoring_view_from_plan_camera(plan, instances, 1.0),
+        "unbounded depth span accepted");
+    instances = scene.instances();
+    instances.front().mesh.reset();
+    require(!studio::authoring_view_from_plan_camera(plan, instances, 1.0),
+        "missing source geometry accepted");
+    instances = scene.instances();
+    instances.front().world_transform.translation.y = std::numeric_limits<double>::infinity();
+    require(!studio::authoring_view_from_plan_camera(plan, instances, 1.0),
+        "nonfinite source transform accepted");
+    for (const double aspect : {0.0, -1.0, std::numeric_limits<double>::infinity()})
+        require(!studio::authoring_view_from_plan_camera(plan, scene.instances(), aspect),
+            "invalid aspect accepted");
+    require(!studio::scene_preview_camera_from_plan_camera(plan, scene, 21.0),
+        "invalid plan preview exposure accepted");
+    require(plan.frame({}, {1.0e8, 1.0e8}, {800.0, 600.0}), "large plan navigation frame");
+    require(!studio::scene_preview_camera_from_plan_camera(plan, scene, 0.0),
+        "unbounded plan view height accepted");
 }
 
 void unsupported_camera_values_fail_before_rendering() {
@@ -222,5 +354,7 @@ int main() {
     named_views_reach_saved_scene_requests();
     captured_named_view_invalidates_on_navigation_and_source_changes();
     authored_camera_selection_is_independent_of_navigation();
+    plan_view_reaches_saved_scene_with_matching_projection_and_clips();
+    plan_camera_rejects_unsupported_source_bounds();
     unsupported_camera_values_fail_before_rendering();
 }

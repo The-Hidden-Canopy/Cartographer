@@ -11837,10 +11837,11 @@ struct DesktopState {
                 viewport_view.spatial, geometry_visible);
             ImGui::TextDisabled("%s",
                 carto::studio::spatial_capability_label(capability).data());
-            if (viewport_view.view == carto::studio::ViewportViewKind::front_xy ||
+            if (viewport_view.view == carto::studio::ViewportViewKind::top_plan_xz ||
+                viewport_view.view == carto::studio::ViewportViewKind::front_xy ||
                 viewport_view.view == carto::studio::ViewportViewKind::right_zy) {
                 ImGui::TextDisabled(
-                    "Front and Right use the same orthographic camera for live material "
+                    "Top, Front and Right use the same orthographic projection for live material "
                     "rendering and saved-scene preview; Structure and Depth remain CPU projections.");
             }
         }
@@ -12205,17 +12206,19 @@ struct DesktopState {
         material_viewport_displayed = false;
         std::optional<carto::production::AuthoringView> navigation_view;
         std::string navigation_view_error;
-        if (perspective_camera_active && !material_viewport_authored_camera &&
+        if (material_viewport_enabled && !material_viewport_authored_camera &&
             extent.x > 0.0F && extent.y > 0.0F) {
-            auto converted = carto::studio::authoring_view_from_editor_camera(
-                perspective_camera, static_cast<double>(extent.x) / extent.y);
+            auto converted = perspective_camera_active
+                ? carto::studio::authoring_view_from_editor_camera(
+                    perspective_camera, static_cast<double>(extent.x) / extent.y)
+                : carto::studio::authoring_view_from_plan_camera(
+                    work_surface_camera, instances,
+                    static_cast<double>(extent.x) / extent.y);
             if (converted) navigation_view = std::move(converted.value());
             else navigation_view_error = converted.error().message;
         }
         const bool authoring_view_supported = material_viewport_authored_camera ||
-            navigation_view.has_value() ||
-            (!perspective_camera_active &&
-             viewport_view.view == carto::studio::ViewportViewKind::top_plan_xz);
+            navigation_view.has_value();
         // The upload format is selected for the main swapchain only. Platform
         // windows choose their own surface formats, which may not match it.
         const bool authoring_on_main_viewport =
@@ -12263,14 +12266,10 @@ struct DesktopState {
             const bool render_extent_capped = limit_scale < 1.0 ||
                 static_cast<double>(extent.x) * scale > max_readback_pixels ||
                 static_cast<double>(extent.y) * scale > max_readback_pixels;
-            request.view.position = {work_surface_camera.target().x,
-                std::isfinite(minimum.y) ? minimum.y - std::max(1.0, maximum.y-minimum.y) : -1000.0,
-                work_surface_camera.target().y};
-            request.view.orthographic_height = work_surface_camera.view_height();
-            request.view.aspect_ratio = static_cast<double>(extent.x) / extent.y;
-            request.view.far_plane = std::isfinite(maximum.y)
-                ? std::max(2.0, maximum.y-request.view.position.y+1.0) : 2000.0;
             if (navigation_view) request.view = *navigation_view;
+            // Authored cameras also retain the exact canvas aspect when the
+            // render target is downscaled, capped or rounded to whole pixels.
+            request.view.aspect_ratio = static_cast<double>(extent.x) / extent.y;
             request.exposure_ev = material_viewport_exposure;
             request.tone_mode = static_cast<carto::render::ToneMapMode>(material_viewport_tone);
             if (material_viewport_authored_camera) {
@@ -16193,7 +16192,9 @@ struct DesktopState {
         return carto::studio::scene_preview_camera_source_binding(snapshot,
             scene_preview_authored_camera,
             scene_preview_camera_project_generation, perspective_camera_active,
-            perspective_camera, scene_preview_exposure_ev);
+            perspective_camera, scene_preview_exposure_ev,
+            viewport_view.view == carto::studio::ViewportViewKind::top_plan_xz
+                ? &work_surface_camera : nullptr);
     }
 
     [[nodiscard]] bool scene_preview_render_settings_are_valid() const noexcept {
@@ -16348,8 +16349,11 @@ struct DesktopState {
                 }
                 camera = std::move(authored_camera).value();
             } else {
-                auto viewport_camera = carto::studio::scene_preview_camera_from_editor_camera(
-                    perspective_camera, exposure_ev_for_preview);
+                auto viewport_camera = perspective_camera_active
+                    ? carto::studio::scene_preview_camera_from_editor_camera(
+                        perspective_camera, exposure_ev_for_preview)
+                    : carto::studio::scene_preview_camera_from_plan_camera(
+                        work_surface_camera, snapshot.viewport.scene, exposure_ev_for_preview);
                 if (!viewport_camera) {
                     fail("Current editor camera is unavailable: " +
                         viewport_camera.error().message);

@@ -6,7 +6,7 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 
 ## 0.1 - current foundation
 
-- [x] Front/Right orthographic editor views feed saved-scene preview with preserved projection/scale, source-bound invalidation, bounded camera admission, and independent authored-camera selection; CPU request integration and desktop compilation verified, native pixel acceptance still open
+- [x] Top/Front/Right orthographic views feed saved-scene preview with preserved projection/scale, source-bound invalidation, bounded camera admission, conservative transformed-source depth fitting for Top, and independent authored-camera selection; CPU request integration and desktop compilation verified, native pixel acceptance still open
 
 - [x] create-only application saves protect CLI mesh imports from replacing existing projects or orphan journals under the shared writer lease
 - [x] repeatable headless CLI preparation acceptance for saved profiles, all four scopes, immutable replay, namespace/rollback refusal, relocation, and tamper detection; CPU bake suites remain independently runnable in D3D12 builds
