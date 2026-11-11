@@ -7010,7 +7010,8 @@ struct DesktopState {
             native_viewport_hits.sculpt_triangles_truncated ||
             native_viewport_hits.project_generation != expected_generation ||
             native_viewport_hits.project_revision != expected_revision ||
-            !edge.perspective_correct ||
+            edge.perspective_correct != carto::studio::viewport_uses_perspective_interpolation(
+                perspective_camera_active, perspective_camera) ||
             !std::isfinite(edge.camera_depth[0U]) ||
             !std::isfinite(edge.camera_depth[1U])) {
             diagnostic = "Perspective edge hit data is stale, incomplete, or invalid.";
@@ -7048,8 +7049,8 @@ struct DesktopState {
             return false;
         }
 
-        const auto edge_depth = carto::studio::perspective_edge_camera_depth(
-            edge.camera_depth[0U], edge.camera_depth[1U], along);
+        const auto edge_depth = carto::studio::projected_edge_camera_depth(
+            edge.camera_depth[0U], edge.camera_depth[1U], along, edge.perspective_correct);
         if (!edge_depth) {
             diagnostic = edge_depth.error().message;
             return false;
@@ -14037,7 +14038,8 @@ struct DesktopState {
                         triangle.camera_depth[corner] = fan[corner]->camera_depth;
                         triangle.screen_source_weights[corner] = fan[corner]->source_weights;
                     }
-                    triangle.perspective_correct = perspective_camera_active;
+                    triangle.perspective_correct = carto::studio::viewport_uses_perspective_interpolation(
+                        perspective_camera_active, perspective_camera);
                     native_viewport_hits.sculpt_triangles.push_back(std::move(triangle));
                 } else {
                     native_viewport_hits.sculpt_triangles_truncated = true;
@@ -14069,7 +14071,8 @@ struct DesktopState {
                     {static_cast<double>(first.x), static_cast<double>(first.y)},
                     {static_cast<double>(second.x), static_cast<double>(second.y)},
                     clipped_edge->camera_depth,
-                    perspective_camera_active});
+                    carto::studio::viewport_uses_perspective_interpolation(
+                        perspective_camera_active, perspective_camera)});
             }
         }
         if (!showing_agent_preview && (unmapped_triangles != 0U || untextured_authored_triangles != 0U ||

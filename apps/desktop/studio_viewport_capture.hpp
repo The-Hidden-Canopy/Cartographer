@@ -75,6 +75,15 @@ struct SavedScenePreviewRenderSettings {
 inline constexpr std::size_t kMaxPerspectiveStrokeSegmentSamples = 64U;
 inline constexpr std::size_t kMaxPerspectiveStrokeSegmentTriangleChecks = 1'000'000U;
 
+// Front/Right use EditorCamera too, but their screen-space weights are affine.
+// Choosing interpolation from camera ownership alone shifts source anchors and
+// can reverse the foreground ordering of overlapping sloped surfaces.
+[[nodiscard]] inline bool viewport_uses_perspective_interpolation(
+    bool editor_camera_active, const editor::EditorCamera& camera) noexcept {
+    return editor_camera_active &&
+        camera.projection() == editor::EditorProjection::perspective;
+}
+
 enum class LoopCutPickDisposition : unsigned char {
     ignore,
     keep_armed,
@@ -275,6 +284,24 @@ struct LoopCutPickTarget {
         return Result::failure(core::Diagnostic(core::ErrorCode::validation_failed,
             "Perspective edge depth is invalid."));
     }
+    return Result::success(depth);
+}
+
+[[nodiscard]] inline core::Result<double> projected_edge_camera_depth(
+    double first_camera_depth, double second_camera_depth, double along,
+    bool perspective_correct) {
+    if (perspective_correct)
+        return perspective_edge_camera_depth(first_camera_depth, second_camera_depth, along);
+    using Result = core::Result<double>;
+    if (!std::isfinite(first_camera_depth) || !std::isfinite(second_camera_depth) ||
+        !std::isfinite(along) || along < 0.0 || along > 1.0 ||
+        first_camera_depth >= 0.0 || second_camera_depth >= 0.0)
+        return Result::failure({core::ErrorCode::validation_failed,
+            "Orthographic edge depth is invalid."});
+    const double depth = first_camera_depth * (1.0 - along) + second_camera_depth * along;
+    if (!std::isfinite(depth))
+        return Result::failure({core::ErrorCode::validation_failed,
+            "Orthographic edge depth is invalid."});
     return Result::success(depth);
 }
 

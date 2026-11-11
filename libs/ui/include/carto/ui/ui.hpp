@@ -227,7 +227,8 @@ struct ProjectedEdgePickCandidate {
     geometry::EdgeId edge;
     core::Vec2d first;
     core::Vec2d second;
-    // Plan snapshots use world Y; perspective snapshots use negated view depth.
+    // Plan snapshots use world Y; editor-camera snapshots use negated view depth.
+    // Only perspective projection uses reciprocal-depth interpolation.
     std::array<double, 2U> camera_depth{};
     bool perspective_correct = false;
 };
@@ -256,8 +257,9 @@ struct ProjectedEdgePickResult {
     double ambiguity_margin_pixels = 1.0);
 
 // Triangle identity and source positions captured from one viewport snapshot.
-// In plan view, `camera_depth` stores world Y. Perspective snapshots store the
-// negated positive view depth and request perspective-correct source weights.
+// In plan view, `camera_depth` stores world Y. Editor-camera snapshots store
+// negated positive view depth. Perspective projection requests reciprocal
+// source weights; Front/Right orthographic projection keeps affine weights.
 struct SculptViewportTriangle {
     scene::ObjectId object;
     geometry::FaceId face;
