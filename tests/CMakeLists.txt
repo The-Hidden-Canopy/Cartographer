@@ -76,7 +76,9 @@ add_executable(cartographer_native_scene_import_tests
     application_native_import_sprint_tests.cpp
 )
 target_link_libraries(cartographer_native_scene_import_tests PRIVATE
-    carto_application carto_ui carto_io carto_editor carto_project carto_assets)
+    carto_application carto_ui carto_io carto_editor carto_project carto_assets carto_production)
+target_include_directories(cartographer_native_scene_import_tests
+    PRIVATE ${PROJECT_SOURCE_DIR}/apps/desktop)
 carto_target(cartographer_native_scene_import_tests)
 add_test(NAME cartographer_native_scene_import_tests
     COMMAND cartographer_native_scene_import_tests)

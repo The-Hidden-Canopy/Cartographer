@@ -26,6 +26,7 @@
 #include "bake_workflow.hpp"
 #include "carto_studio_dock.hpp"
 #include "interchange_export_feedback.hpp"
+#include "prepared_publication_feedback.hpp"
 #include "reference_image_decoder.hpp"
 #include "reference_image_projection.hpp"
 #include "studio_browser.hpp"
@@ -8956,8 +8957,8 @@ struct DesktopState {
             scope.kind = carto::production::PreparationScopeKind::scene;
         }
 
-        const std::filesystem::path output_root{
-            snapshot.project_path->string() + ".prepared"};
+        const std::filesystem::path output_root =
+            carto::desktop::prepared_publication_root(*snapshot.project_path);
         const auto current = carto::production::read_selected_prepared_scene(output_root);
         if (!current) {
             MessageBoxW(window, wide(current.error().message).c_str(),
@@ -9020,19 +9021,38 @@ struct DesktopState {
                         L"Cartographer preparation", MB_OK | icon);
             return;
         }
-        std::string message =
-            "Prepared " + std::to_string(report->resolved_scope->asset_ids.size()) +
-            " asset(s), " + std::to_string(report->resolved_scope->node_ids.size()) +
-            " node(s), and " + std::to_string(report->envelope->products.size()) +
-            " verified product(s).\n\nRevision " +
-            report->publication->prepared_scene_digest.hex() + "\n" +
-            report->publication->revision_path.string();
-        if (!report->diagnostics.empty()) {
-            message += "\n\nCompleted with " +
-                std::to_string(report->diagnostics.size()) + " warning(s).";
-        }
+        const std::string message =
+            carto::desktop::prepared_publication_receipt_feedback(*report);
         MessageBoxW(window, wide(message).c_str(),
                     L"Cartographer preparation complete", MB_OK | MB_ICONINFORMATION);
+    }
+
+    void show_prepared_publication_status(const UiSnapshot& snapshot) {
+        if (!snapshot.project_path.has_value()) {
+            MessageBoxW(window, L"Save the .carto project before inspecting its prepared publication.",
+                        L"Cartographer prepared publication", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        const auto document = carto::project::ProjectDocument::load(*snapshot.project_path);
+        if (!document) {
+            MessageBoxW(window, wide(document.error().message).c_str(),
+                        L"Cartographer prepared publication", MB_OK | MB_ICONERROR);
+            return;
+        }
+        const auto root = carto::desktop::prepared_publication_root(*snapshot.project_path);
+        const auto status = carto::production::inspect_prepared_publication(root, document.value());
+        if (!status) {
+            MessageBoxW(window, wide("The prepared publication failed verification: " +
+                                     status.error().message).c_str(),
+                        L"Cartographer prepared publication", MB_OK | MB_ICONERROR);
+            return;
+        }
+        const bool current = status.value().freshness ==
+            carto::production::PreparedPublicationFreshness::current;
+        const std::string message = carto::desktop::prepared_publication_status_feedback(
+            status.value(), root, snapshot.dirty);
+        MessageBoxW(window, wide(message).c_str(), L"Cartographer prepared publication",
+                    MB_OK | (current && !snapshot.dirty ? MB_ICONINFORMATION : MB_ICONWARNING));
     }
 
     void export_standard_mesh(const UiSnapshot& snapshot, StandardMeshExport format) {
@@ -10476,6 +10496,10 @@ struct DesktopState {
             if (ImGui::MenuItem("Cancel preparation", nullptr, false,
                                 preparation_active)) {
                 static_cast<void>(preparation_job->request_cancel());
+            }
+            if (ImGui::MenuItem("Prepared publication status...", nullptr, false,
+                                snapshot.project_path.has_value() && !preparation_active)) {
+                show_prepared_publication_status(snapshot);
             }
             if (ImGui::MenuItem("Export glTF", "Ctrl+Alt+E", false, can_export)) {
                 export_interchange(snapshot, false);

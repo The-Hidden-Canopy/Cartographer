@@ -34,6 +34,26 @@ foreach(format IN ITEMS gltf glb)
         message(FATAL_ERROR "Scene CLI import modified source asset")
     endif()
 endforeach()
+# Imported scenes with materials must prepare for runtime handoff and report
+# exact admission pins; a publication is refused for any other source project.
+set(published "${root}/imported-glb.carto.prepared")
+execute_process(COMMAND "${CARTO_CLI}" prepare "${root}/imported-glb.carto" "${published}" scene
+    RESULT_VARIABLE result OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT result EQUAL 0 OR NOT stdout MATCHES "nodes=3")
+    message(FATAL_ERROR "Imported scene with materials did not prepare: ${stdout}${stderr}")
+endif()
+execute_process(COMMAND "${CARTO_CLI}" inspect-prepared "${published}" --source "${root}/imported-glb.carto"
+    RESULT_VARIABLE result OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT result EQUAL 0 OR NOT stdout MATCHES "freshness=current" OR
+   NOT stdout MATCHES "pin source_digest=[0-9a-f]+" OR
+   NOT stdout MATCHES "pin profile_digest=[0-9a-f]+" OR NOT stdout MATCHES "bindings=1")
+    message(FATAL_ERROR "Prepared scene did not report current admission pins: ${stdout}${stderr}")
+endif()
+execute_process(COMMAND "${CARTO_CLI}" inspect-prepared "${published}" --source "${root}/imported-gltf.carto"
+    RESULT_VARIABLE result OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(result EQUAL 0 OR NOT stdout MATCHES "freshness=foreign_source")
+    message(FATAL_ERROR "Prepared scene was accepted for a different source project: ${stdout}${stderr}")
+endif()
 execute_process(COMMAND "${CARTO_CLI}" import-gltf "${root}/source.gltf" "${root}/missing-confirmation.carto"
     RESULT_VARIABLE result OUTPUT_QUIET ERROR_QUIET)
 if(result EQUAL 0 OR EXISTS "${root}/missing-confirmation.carto")
@@ -47,4 +67,4 @@ execute_process(COMMAND "${CARTO_CLI}" import-gltf "${root}/external.gltf" "${ro
 if(result EQUAL 0 OR EXISTS "${root}/unsafe.carto")
     message(FATAL_ERROR "External scene reference was not rejected before project creation")
 endif()
-message(STATUS "GLTF/GLB CLI import, managed reopen/export, source/target protection and rights checks passed")
+message(STATUS "GLTF/GLB CLI import, managed reopen/export, prepared handoff, source/target protection and rights checks passed")

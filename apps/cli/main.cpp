@@ -15,6 +15,7 @@
 #include <carto/production/bake_graph.hpp>
 #include <carto/production/preparation_operation.hpp>
 #include <carto/production/preparation_scope.hpp>
+#include <carto/production/prepared_publication.hpp>
 #include <carto/providers/registry.hpp>
 #include <carto/project/project.hpp>
 #include <carto/project/transaction.hpp>
@@ -31,6 +32,7 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -8825,7 +8827,17 @@ int bake_bent_normal_tiles_d3d12(char** argv) {
 }
 #endif
 
-int inspect_prepared(const std::filesystem::path& output_root) {
+int inspect_prepared(const std::filesystem::path& output_root,
+                     const std::optional<std::filesystem::path>& source_project = std::nullopt) {
+    std::optional<carto::project::ProjectDocument> source;
+    if (source_project.has_value()) {
+        auto loaded = carto::project::ProjectDocument::load(*source_project);
+        if (!loaded) {
+            print_error(loaded.error().with_context("prepared source project"));
+            return EXIT_FAILURE;
+        }
+        source.emplace(std::move(loaded.value()));
+    }
     const auto selected = carto::production::read_selected_prepared_scene(output_root);
     if (!selected) {
         print_error(selected.error());
@@ -8836,6 +8848,11 @@ int inspect_prepared(const std::filesystem::path& output_root) {
         return EXIT_FAILURE;
     }
     const auto& revision = selected.value().value();
+    std::optional<carto::production::PreparedPublicationFreshness> freshness;
+    if (source.has_value()) {
+        freshness = carto::production::prepared_publication_freshness(
+            revision.envelope, *source);
+    }
     std::cout << "prepared revision=" << revision.prepared_scene_digest.hex()
               << " source=" << revision.envelope.source_namespace
               << " source_revision=" << revision.envelope.source_revision.value()
@@ -8856,6 +8873,17 @@ int inspect_prepared(const std::filesystem::path& output_root) {
                   << " version=" << product.format_version
                   << " digest=" << product.content_digest.hex()
                   << " path=" << std::quoted(product.relative_path) << '\n';
+    }
+    std::istringstream pins(carto::production::prepared_publication_admission_pins(revision));
+    for (std::string line; std::getline(pins, line);) std::cout << "pin " << line << '\n';
+    if (freshness.has_value()) {
+        std::cout << "freshness="
+                  << carto::production::prepared_publication_freshness_name(*freshness) << '\n';
+        if (*freshness != carto::production::PreparedPublicationFreshness::current) {
+            std::cerr << "error: the selected prepared revision does not describe the saved "
+                         "source project; prepare it again before handing it off\n";
+            return EXIT_FAILURE;
+        }
     }
     return EXIT_SUCCESS;
 }
@@ -8902,7 +8930,7 @@ void usage(std::ostream& output) {
            << "  cartographer_cli prepare <project.carto> <output-directory> asset <mesh-asset-id>\n"
            << "  cartographer_cli prepare <project.carto> <output-directory> assembly <node-id>\n"
            << "  cartographer_cli prepare <project.carto> <output-directory> selection <node-id>...\n"
-           << "  cartographer_cli inspect-prepared <output-directory>\n"
+           << "  cartographer_cli inspect-prepared <output-directory> [--source <project.carto>] (prints admission pins; --source refuses a stale revision)\n"
            << "  cartographer_cli bake-ao <project.carto> <mesh-id> <uv-set-id> <width> <height> <tile-u> <tile-v> <samples> <max-distance> <seed> <output-directory> (mesh is both source and UV target; origin bias is 1e-4)\n"
            << "  cartographer_cli inspect-bake-ao <project.carto> <mesh-id> <output-directory>\n"
            << "  cartographer_cli bake-ao-tiles <project.carto> <mesh-id> <uv-set-id> <width> <height> <samples> <max-distance> <seed> <output-directory> (CPU; mesh is both source and UV target)\n"
@@ -9087,6 +9115,9 @@ int main(int argc, char** argv) {
     }
     if (command == "inspect-prepared" && argc == 3) {
         return inspect_prepared(argv[2]);
+    }
+    if (command == "inspect-prepared" && argc == 5 && std::string_view(argv[3]) == "--source") {
+        return inspect_prepared(argv[2], std::filesystem::path(argv[4]));
     }
     if (command == "bake-ao" && argc == 13) {
         return bake_ambient_occlusion(argv);

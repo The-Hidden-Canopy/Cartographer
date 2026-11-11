@@ -3,12 +3,14 @@
 #include <carto/assets/blob_store.hpp>
 #include <carto/core/result.hpp>
 #include <carto/production/prepared_scene.hpp>
+#include <carto/project/project.hpp>
 
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace carto::production {
@@ -54,5 +56,38 @@ struct SelectedPreparedScene {
 // included product digest. It does not follow current again during the read.
 [[nodiscard]] core::Result<std::optional<SelectedPreparedScene>>
 read_selected_prepared_scene(const std::filesystem::path& output_root);
+
+// Relationship between a selected publication and one saved source document.
+// `current` requires the same source namespace, revision and canonical source
+// digest; anything else means the publication no longer describes the work.
+enum class PreparedPublicationFreshness : std::uint8_t {
+    current,
+    stale_source,
+    foreign_source,
+};
+
+[[nodiscard]] std::string_view prepared_publication_freshness_name(
+    PreparedPublicationFreshness freshness) noexcept;
+
+[[nodiscard]] PreparedPublicationFreshness prepared_publication_freshness(
+    const PreparedSceneEnvelope& envelope, const project::ProjectDocument& document);
+
+// The exact identities a destination runtime pins before admitting the
+// selected revision, as canonical `key=value` lines in a fixed order. This is
+// descriptive evidence only; it grants no destination authority.
+[[nodiscard]] std::string prepared_publication_admission_pins(
+    const SelectedPreparedScene& selected);
+
+struct PreparedPublicationStatus {
+    // Empty when the publication root does not exist or selects no revision.
+    std::optional<SelectedPreparedScene> selected;
+    std::optional<PreparedPublicationFreshness> freshness;
+};
+
+// Reads and verifies the selected revision under output_root (a missing root
+// is an empty status, not an error) and compares it with the saved document.
+// Tampered, partial or ambiguous publications fail.
+[[nodiscard]] core::Result<PreparedPublicationStatus> inspect_prepared_publication(
+    const std::filesystem::path& output_root, const project::ProjectDocument& document);
 
 } // namespace carto::production

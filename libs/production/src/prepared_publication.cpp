@@ -713,4 +713,53 @@ core::Result<std::optional<SelectedPreparedScene>> read_selected_prepared_scene(
     return core::Result<std::optional<SelectedPreparedScene>>::success(revision.value());
 }
 
+std::string_view prepared_publication_freshness_name(
+    PreparedPublicationFreshness freshness) noexcept {
+    switch (freshness) {
+    case PreparedPublicationFreshness::current: return "current";
+    case PreparedPublicationFreshness::stale_source: return "stale_source";
+    case PreparedPublicationFreshness::foreign_source: return "foreign_source";
+    }
+    return "unknown";
+}
+
+PreparedPublicationFreshness prepared_publication_freshness(
+    const PreparedSceneEnvelope& envelope, const project::ProjectDocument& document) {
+    if (envelope.source_namespace != document.source_namespace()) {
+        return PreparedPublicationFreshness::foreign_source;
+    }
+    if (envelope.source_revision != document.revision() ||
+        envelope.source_digest != digest_text(document.serialize())) {
+        return PreparedPublicationFreshness::stale_source;
+    }
+    return PreparedPublicationFreshness::current;
+}
+
+std::string prepared_publication_admission_pins(const SelectedPreparedScene& selected) {
+    const auto& envelope = selected.envelope;
+    std::string pins;
+    pins += "source_namespace=" + envelope.source_namespace + "\n";
+    pins += "source_revision=" + std::to_string(envelope.source_revision.value()) + "\n";
+    pins += "source_digest=" + envelope.source_digest.hex() + "\n";
+    pins += "prepared_scene_digest=" + selected.prepared_scene_digest.hex() + "\n";
+    pins += "profile_identity=" + envelope.profile_identity + "\n";
+    pins += "profile_digest=" + envelope.profile_digest.hex() + "\n";
+    return pins;
+}
+
+core::Result<PreparedPublicationStatus> inspect_prepared_publication(
+    const std::filesystem::path& output_root, const project::ProjectDocument& document) {
+    auto selected = read_selected_prepared_scene(output_root);
+    if (!selected) {
+        return core::Result<PreparedPublicationStatus>::failure(selected.error());
+    }
+    PreparedPublicationStatus status;
+    if (selected.value().has_value()) {
+        status.freshness = prepared_publication_freshness(
+            selected.value()->envelope, document);
+        status.selected = std::move(selected.value());
+    }
+    return core::Result<PreparedPublicationStatus>::success(std::move(status));
+}
+
 } // namespace carto::production

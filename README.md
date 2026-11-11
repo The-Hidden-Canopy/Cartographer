@@ -289,6 +289,7 @@ build\default\apps\cli\cartographer_cli.exe inspect-preparation-profile portable
 build\default\apps\cli\cartographer_cli.exe prepare sample.carto sample.carto.prepared --profile portable.carto-prep scene
 build\default\apps\cli\cartographer_cli.exe prepare sample.carto sample.carto.prepared scene
 build\default\apps\cli\cartographer_cli.exe inspect-prepared sample.carto.prepared
+build\default\apps\cli\cartographer_cli.exe inspect-prepared sample.carto.prepared --source sample.carto
 ```
 
 `prepare` captures one saved project revision, explicit stable-ID scope, and
@@ -296,7 +297,11 @@ validated built-in or saved profile; compiles and verifies the closed product se
 selects one immutable prepared revision. Failed, stale, corrupt, or incomplete
 attempts, including cancellation before publication, leave the last valid
 revision selected. `inspect-prepared` verifies the
-manifest and every included product without loading a game engine or runtime.
+manifest and every included product without loading a game engine or runtime,
+and prints the source, prepared-scene and profile pins a runtime admits. With
+`--source` it refuses a revision that no longer matches the saved project. The
+desktop publishes beside the project (`<project>.carto.prepared`) and reports
+the same pins and freshness under File > Prepared publication status.
 
 `scientific-demo` creates a populated, deterministic authoring fixture covering
 morphology, field-linked growth domains, functional and sequence genome records, development, lineage,

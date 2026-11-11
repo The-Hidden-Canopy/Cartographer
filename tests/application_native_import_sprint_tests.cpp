@@ -3,7 +3,11 @@
 #include <carto/journal/journal.hpp>
 #include <carto/io/gltf_export.hpp>
 #include <carto/project/package.hpp>
+#include <carto/production/preparation_operation.hpp>
+#include <carto/production/prepared_publication.hpp>
 #include <carto/ui/ui.hpp>
+
+#include "prepared_publication_feedback.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -502,6 +506,206 @@ void ui_external_buffer_capture(const std::filesystem::path& root) {
             "source package identity survives reopen");
 }
 
+// The person-facing chain: import a glTF scene, author it, save, cold reopen,
+// prepare the runtime publication, and verify that the publication carries the
+// authored edits and is refused for handoff once the saved source moves on.
+void authoring_publication_workflow(const std::filesystem::path& root) {
+    using namespace application;
+    std::filesystem::create_directories(root);
+    const auto project_path = root / "workflow.carto";
+    const auto source_path = root / "workflow.glb";
+    write_source(source_path, fixture());
+    ApplicationSession session;
+    ui::UiController controller(session);
+    require(bool(controller.dispatch(NewProjectAction{"Workflow"})), "workflow project created");
+    require(bool(controller.dispatch(SaveProjectAction{project_path})), "workflow project saved");
+    const auto before = session.snapshot();
+    require(bool(controller.import_static_gltf_scene(source_path, before.project_generation,
+        before.project_revision, before.source_namespace, true, "Workflow source")),
+        "workflow glTF imported through the human scene action");
+    const auto named = [](const auto& snapshot, std::string_view name) {
+        const auto found = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+            [name](const auto& view) { return view.object.name == name; });
+        require(found != snapshot.objects.end(), "named imported node present");
+        return *found;
+    };
+
+    // Author: move one imported node and give the other a new material.
+    const auto imported = session.snapshot();
+    const auto first = named(imported, "first");
+    auto moved = first.object.local_transform;
+    moved.translation.x += 2.0;
+    require(bool(controller.dispatch(SetObjectTransformAction{first.object.id, moved,
+        imported.project_revision})), "imported node moved");
+    auto authored = session.snapshot();
+    require(!authored.materials.empty(), "imported materials present");
+    auto blue_definition = authored.materials.front().definition;
+    blue_definition.base_color_factor.x = 0.0;
+    blue_definition.base_color_factor.y = 0.0;
+    blue_definition.base_color_factor.z = 1.0;
+    require(bool(controller.dispatch(CreateMaterialAction{authored.project_revision, "blue",
+        blue_definition})), "authored material created");
+    authored = session.snapshot();
+    const auto blue = std::find_if(authored.materials.begin(), authored.materials.end(),
+        [](const auto& material) { return material.name == "blue"; });
+    require(blue != authored.materials.end(), "authored material visible");
+    const auto second = named(authored, "second");
+    require(second.object.mesh_asset.has_value(), "second node owns a mesh asset");
+    require(bool(controller.dispatch(AssignMaterialToMeshAction{authored.project_generation,
+        authored.project_revision, second.object.id, blue->id, blue->revision, {}, std::nullopt})),
+        "authored material assigned to imported mesh");
+    require(bool(controller.dispatch(SaveProjectAction{})), "authored project saved");
+
+    ApplicationSession reopened;
+    require(bool(HumanApplicationAccess::dispatch(reopened, OpenProjectAction{project_path})),
+            "authored project cold reopens");
+    const auto restored = reopened.snapshot();
+    require(named(restored, "first").object.local_transform.translation.x == moved.translation.x,
+            "authored transform survives reopen");
+    require(std::any_of(restored.material_assignments.begin(), restored.material_assignments.end(),
+        [&](const auto& assignment) {
+            return assignment.key.mesh_asset == *second.object.mesh_asset &&
+                assignment.material == blue->id;
+        }), "authored material assignment survives reopen");
+
+    // Prepare exactly where the desktop publishes, from a cold-loaded document.
+    const auto publication = carto::desktop::prepared_publication_root(project_path);
+    require(publication.filename() == "workflow.carto.prepared",
+            "desktop publication root sits beside the project");
+    const auto missing_status = production::inspect_prepared_publication(publication,
+        project::ProjectDocument::load(project_path).value());
+    require(missing_status && !missing_status.value().selected.has_value(),
+            "unpublished project has an empty publication status");
+    require(carto::desktop::prepared_publication_status_feedback(missing_status.value(),
+        publication, false).find("No prepared publication") != std::string::npos,
+        "desktop explains a missing publication");
+    const auto prepare = [&](const project::ProjectDocument& document,
+                             std::optional<assets::Sha256Digest> expected) {
+        production::PreparationScopeRequest scope;
+        scope.kind = production::PreparationScopeKind::scene;
+        scope.expected_source_revision = document.revision();
+        const production::PreparationOperationRequest request{
+            .scope = std::move(scope),
+            .profile = production::portable_preparation_profile(),
+            .source_root = root,
+            .output_root = publication,
+            .expected_selected_digest = expected,
+            .stop_token = {},
+        };
+        auto report = production::prepare_and_publish(document, request);
+        for (const auto& diagnostic : report.diagnostics) {
+            std::cerr << "preparation diagnostic " << diagnostic.code << ": "
+                      << diagnostic.message << '\n';
+        }
+        return report;
+    };
+    const auto saved = project::ProjectDocument::load(project_path);
+    require(bool(saved), "authored project document loads");
+    const auto report = prepare(saved.value(), std::nullopt);
+    require(report.succeeded(), "authored imported scene prepares and publishes");
+    require(carto::desktop::prepared_publication_receipt_feedback(report).find(
+                "source_digest=" + report.envelope->source_digest.hex()) != std::string::npos,
+            "desktop receipt carries runtime admission pins");
+
+    const auto reloaded = project::ProjectDocument::load(project_path);
+    require(bool(reloaded), "saved project reloads independently");
+    const auto status = production::inspect_prepared_publication(publication, reloaded.value());
+    require(status && status.value().selected.has_value() &&
+            status.value().freshness == production::PreparedPublicationFreshness::current,
+            "publication is current for the cold-loaded saved project");
+    const auto& envelope = status.value().selected->envelope;
+    const auto prepared_first = std::find_if(envelope.nodes.begin(), envelope.nodes.end(),
+        [&](const auto& node) { return node.id == first.object.id.value; });
+    require(prepared_first != envelope.nodes.end() &&
+            prepared_first->local_transform.translation.x == moved.translation.x,
+            "publication carries the authored node transform");
+    require(std::any_of(envelope.material_bindings.begin(), envelope.material_bindings.end(),
+        [&](const auto& binding) {
+            return binding.asset == *second.object.mesh_asset && binding.material == blue->id;
+        }), "publication carries the authored material binding");
+    const auto pins = production::prepared_publication_admission_pins(*status.value().selected);
+    require(pins == "source_namespace=" + reloaded.value().source_namespace() + "\n" +
+                    "source_revision=" + std::to_string(reloaded.value().revision().value()) + "\n" +
+                    "source_digest=" + envelope.source_digest.hex() + "\n" +
+                    "prepared_scene_digest=" +
+                        status.value().selected->prepared_scene_digest.hex() + "\n" +
+                    "profile_identity=" + envelope.profile_identity + "\n" +
+                    "profile_digest=" + envelope.profile_digest.hex() + "\n",
+            "admission pins are complete and canonical");
+    const auto current_text = carto::desktop::prepared_publication_status_feedback(
+        status.value(), publication, false);
+    require(current_text.find("matches the saved project") != std::string::npos &&
+            current_text.find(pins) != std::string::npos,
+            "desktop status reports a current publication with its pins");
+    require(carto::desktop::prepared_publication_status_feedback(status.value(), publication, true)
+                .find("Unsaved edits") != std::string::npos,
+            "desktop status warns that unsaved edits are not published");
+
+    // A later saved edit makes the selected publication stale for handoff.
+    const auto previous_digest = status.value().selected->prepared_scene_digest;
+    auto later = named(reopened.snapshot(), "first").object.local_transform;
+    later.translation.y += 1.0;
+    require(bool(HumanApplicationAccess::dispatch(reopened, SetObjectTransformAction{
+        first.object.id, later, reopened.snapshot().project_revision})), "later edit applied");
+    require(bool(HumanApplicationAccess::dispatch(reopened, SaveProjectAction{})), "later edit saved");
+    const auto edited = project::ProjectDocument::load(project_path);
+    require(bool(edited), "edited project reloads");
+    const auto stale = production::inspect_prepared_publication(publication, edited.value());
+    require(stale && stale.value().freshness ==
+                production::PreparedPublicationFreshness::stale_source,
+            "publication is stale after a saved edit");
+    require(carto::desktop::prepared_publication_status_feedback(stale.value(), publication, false)
+                .find("is stale") != std::string::npos, "desktop explains a stale publication");
+
+    // Republishing requires the exact current selection; a wrong expectation is refused.
+    require(!prepare(edited.value(), std::nullopt).succeeded(),
+            "republish with a stale selection expectation is refused");
+    const auto unchanged = production::read_selected_prepared_scene(publication);
+    require(unchanged && unchanged.value().has_value() &&
+            unchanged.value()->prepared_scene_digest == previous_digest,
+            "refused republish keeps the previous selection");
+    require(prepare(edited.value(), previous_digest).succeeded(), "edited project republishes");
+    const auto refreshed = production::inspect_prepared_publication(publication, edited.value());
+    require(refreshed && refreshed.value().freshness ==
+                production::PreparedPublicationFreshness::current &&
+            refreshed.value().selected->prepared_scene_digest != previous_digest,
+            "republished revision is current for the edited project");
+
+    // Another project's document never matches this publication.
+    ApplicationSession other;
+    require(bool(HumanApplicationAccess::dispatch(other, NewProjectAction{"Other"})) &&
+            bool(HumanApplicationAccess::dispatch(other, SaveProjectAction{root / "other.carto"})),
+            "other project saved");
+    const auto foreign_document = project::ProjectDocument::load(root / "other.carto");
+    require(bool(foreign_document), "other project loads");
+    const auto foreign = production::inspect_prepared_publication(publication, foreign_document.value());
+    require(foreign && foreign.value().freshness ==
+                production::PreparedPublicationFreshness::foreign_source,
+            "publication from another project is reported as foreign");
+
+    // The saved, edited project still exports a standard interchange asset.
+    const auto exported = io::export_gltf(edited.value(), root / "workflow-export.gltf",
+        io::GltfExportOptions{project_path, {}, 0U});
+    if (!exported) std::cerr << "workflow export: " << exported.error().message << '\n';
+    require(exported && exported.value().meshes == 2U, "authored project exports glTF");
+
+    // Tampered product bytes fail verification instead of reporting freshness.
+    const auto& selected = *refreshed.value().selected;
+    require(!selected.envelope.products.empty(), "publication declares products");
+    const auto product_path = selected.revision_path / selected.envelope.products.front().relative_path;
+    {
+        std::fstream product(product_path, std::ios::binary | std::ios::in | std::ios::out);
+        require(bool(product), "test-owned product opens");
+        char byte = 0;
+        product.read(&byte, 1);
+        product.seekp(0);
+        byte = static_cast<char>(byte ^ 0x5A);
+        product.write(&byte, 1);
+    }
+    require(!production::inspect_prepared_publication(publication, edited.value()),
+            "tampered publication fails verification");
+}
+
 void vanta_roundtrip(const std::filesystem::path& source, const std::filesystem::path& root) {
     using namespace application;
     require(!std::filesystem::exists(root), "round-trip output directory must be new");
@@ -551,6 +755,7 @@ int main(int argc, char** argv) {
         ui_import_and_retained_generation(root / "ui");
         ui_default_material_projection(root / "projection");
         ui_external_buffer_capture(root / "external");
+        authoring_publication_workflow(root / "workflow");
         std::filesystem::remove_all(root);
         std::cout << "import sprint regression source complete\n";
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
