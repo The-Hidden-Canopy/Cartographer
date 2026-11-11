@@ -11,6 +11,7 @@
 
 #include "link_test_support.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -89,7 +90,8 @@ void write_bytes(
     require(static_cast<bool>(output), "test binary writes completely");
 }
 
-carto::geometry::EditableMesh material_triangle() {
+carto::geometry::EditableMesh material_triangle(
+    const std::vector<std::string>& region_layers = {"condition.material_region"}) {
     using namespace carto;
     geometry::EditableMesh mesh;
     require(static_cast<bool>(mesh.insert_bulk(
@@ -110,11 +112,13 @@ carto::geometry::EditableMesh material_triangle() {
                 {core::Vec2d{0.0, 0.0}, core::Vec2d{1.0, 0.0},
                  core::Vec2d{0.0, 1.0}}})),
         "operation fixture UV layer is valid");
-    require(static_cast<bool>(attributes.add_layer(attributes::AttributeLayer{
-                {"condition.material_region", attributes::AttributeDomain::face,
-                 attributes::AttributeType::uint32},
-                {std::uint32_t{7U}}})),
-        "operation fixture material region is valid");
+    for (const auto& layer : region_layers) {
+        require(static_cast<bool>(attributes.add_layer(attributes::AttributeLayer{
+                    {layer, attributes::AttributeDomain::face,
+                     attributes::AttributeType::uint32},
+                    {std::uint32_t{7U}}})),
+            "operation fixture material region is valid");
+    }
     attributes::UvSetTable uv_sets;
     require(static_cast<bool>(uv_sets.add(attributes::UvSetDescriptor{
                 1U, "UV0", "uv0.corners", true, true, false, 1U})),
@@ -211,14 +215,15 @@ carto::project::ProjectDocument make_document(
     const std::filesystem::path& journal_path,
     const std::vector<std::uint8_t>& texture_bytes,
     carto::render::TextureInterpretation interpretation =
-        carto::render::TextureInterpretation::asset) {
+        carto::render::TextureInterpretation::asset,
+    const std::vector<std::string>& region_layers = {"condition.material_region"}) {
     using namespace carto;
     project::ProjectDocument document;
     journal::Journal journal(journal_path);
     auto transaction = project::ProjectTransaction::begin(
         document, journal, "preparation-operation-test");
     require(static_cast<bool>(transaction), "fixture transaction begins");
-    const auto mesh_asset = transaction.value().add_mesh(material_triangle());
+    const auto mesh_asset = transaction.value().add_mesh(material_triangle(region_layers));
     require(mesh_asset && mesh_asset.value() == 1U,
         "fixture mesh enters project with stable identity");
     require(static_cast<bool>(transaction.value().set_material_catalog(
@@ -818,10 +823,78 @@ void profile_v2_policies_and_v1_compatibility() {
         "future preparation profile versions fail closed");
 }
 
+// Import and human material assignment author regions as
+// cartographer.material_slot; the portable profile names the CONDITION alias.
+// Both aliases carry the same durable region keys, so either prepares, while a
+// profile naming any other layer still fails closed.
+void authoring_region_aliases_prepare_and_missing_regions_refuse() {
+    using namespace carto;
+    TempDirectory temp;
+    const auto source_root = temp.path() / "source";
+    const auto texture = one_pixel_tga(255U);
+    write_bytes(source_root / "textures" / "albedo.tga", texture);
+    const auto prepare = [&](const std::string& name, const std::vector<std::string>& layers,
+                             std::optional<std::string> profile_layer = std::nullopt) {
+        const auto document = make_document(temp.path() / (name + "-journal.log"), texture,
+            render::TextureInterpretation::asset, layers);
+        auto request = request_for(document, source_root, temp.path() / name, std::nullopt);
+        if (profile_layer.has_value()) {
+            request.profile.identity = "fixture.custom-region-profile.v1";
+            request.profile.material_region_layer = std::move(profile_layer);
+        }
+        return production::prepare_and_publish(document, request);
+    };
+    const auto report_failure = [](const production::PreparationOperationReport& report) {
+        for (const auto& diagnostic : report.diagnostics) {
+            std::cerr << diagnostic.code << ": " << diagnostic.message << '\n';
+        }
+    };
+    const auto bound_region = [](const production::PreparationOperationReport& report) {
+        return report.envelope.has_value() &&
+            std::any_of(report.envelope->material_bindings.begin(),
+                report.envelope->material_bindings.end(), [](const auto& binding) {
+                    return binding.asset == 1U && binding.region == 7U && binding.material == 71U;
+                });
+    };
+
+    const auto profile_layer = prepare("profile-layer", {"condition.material_region"});
+    if (!profile_layer.succeeded()) report_failure(profile_layer);
+    require(profile_layer.succeeded() && bound_region(profile_layer),
+        "profile-named region layer prepares its assignment");
+
+    const auto authoring_alias = prepare("authoring-alias", {"cartographer.material_slot"});
+    if (!authoring_alias.succeeded()) report_failure(authoring_alias);
+    require(authoring_alias.succeeded() && bound_region(authoring_alias),
+        "authoring material-slot alias prepares the same region binding");
+    require(authoring_alias.envelope->assets.size() == 1U &&
+            authoring_alias.envelope->assets.front().material_regions ==
+                profile_layer.envelope->assets.front().material_regions,
+        "alias and profile layer publish identical material regions");
+
+    const auto both = prepare("both-aliases",
+        {"condition.material_region", "cartographer.material_slot"});
+    require(both.succeeded() && bound_region(both),
+        "an exact profile layer remains authoritative beside the alias");
+
+    // A profile naming a different layer gets no alias substitution.
+    const auto missing = prepare("missing-regions", {"cartographer.material_slot"},
+        std::string("fixture.custom_regions"));
+    require(!missing.succeeded() && !missing.publication.has_value() &&
+            std::any_of(missing.diagnostics.begin(), missing.diagnostics.end(),
+                [](const auto& diagnostic) {
+                    return diagnostic.message.find("lacks the profile material-region layer") !=
+                        std::string::npos;
+                }),
+        "assignments without the profile's region layer fail before publication");
+    require(!std::filesystem::exists(temp.path() / "missing-regions" / "current"),
+        "refused preparation selects no revision");
+}
+
 } // namespace
 
 int main() {
     one_operation_is_shared_complete_and_last_valid();
+    authoring_region_aliases_prepare_and_missing_regions_refuse();
     invalid_or_stale_requests_fail_before_mutation();
     portable_source_meaning_survives_narrower_optional_lookdev();
     profiles_round_trip_and_hostile_inputs_fail_closed();

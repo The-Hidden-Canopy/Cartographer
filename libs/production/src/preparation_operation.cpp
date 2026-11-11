@@ -3,6 +3,7 @@
 #include <carto/assets/texture_source.hpp>
 #include <carto/production/lookdev_draw_package.hpp>
 #include <carto/production/material_artifact.hpp>
+#include <carto/production/material_binding.hpp>
 #include <carto/production/prepared_scene.hpp>
 #include <carto/production/render_mesh.hpp>
 #include <carto/project/project.hpp>
@@ -269,8 +270,24 @@ core::Result<RenderMeshCompileOptions> resolve_mesh_options(
         }
     }
     if (profile.material_region_layer.has_value()) {
-        if (mesh.attributes().find(profile.material_region_layer.value()) != nullptr) {
+        const auto& requested = profile.material_region_layer.value();
+        const bool authoring_alias = requested == "condition.material_region" ||
+            requested == "cartographer.material_slot";
+        if (mesh.attributes().find(requested) != nullptr) {
             options.material_slot_layer = profile.material_region_layer;
+        } else if (authoring_alias) {
+            // Import and human material assignment author regions under the
+            // other accepted alias; both name the same durable region keys.
+            auto alias = authoring_material_slot_layer(mesh);
+            if (!alias) {
+                return core::Result<RenderMeshCompileOptions>::failure(alias.error());
+            }
+            if (alias.value().has_value()) {
+                options.material_slot_layer = std::move(alias.value());
+            } else if (has_assignments) {
+                return core::Result<RenderMeshCompileOptions>::failure(validation(
+                    "mesh has durable material assignments but lacks the profile material-region layer"));
+            }
         } else if (has_assignments) {
             return core::Result<RenderMeshCompileOptions>::failure(validation(
                 "mesh has durable material assignments but lacks the profile material-region layer"));
