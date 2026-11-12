@@ -712,6 +712,29 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
                     validation("material range changed during UV projection"));
             const auto indices =
                 std::span(stream.artifact.indices).subspan(range->first_index, range->index_count);
+            // Validate only emitted primitive triangles, not unrelated faces
+            // in another material's UV stream. This also runs when tangent
+            // generation falls back to UV-only export.
+            if (stream.primitive.uv_accessor) {
+                for (std::size_t triangle = 0U; triangle < indices.size(); triangle += 3U) {
+                    std::array<core::Vec2d, 3U> source_uvs;
+                    std::array<core::Vec2d, 3U> projected_uvs;
+                    for (std::size_t corner = 0U; corner < 3U; ++corner) {
+                        const auto coordinate = *stream.artifact.vertices[indices[triangle + corner]].uv;
+                        source_uvs[corner] = coordinate;
+                        // These are the same finite float32 values already
+                        // encoded into this stream's TEXCOORD_0 accessor.
+                        projected_uvs[corner] = {
+                            static_cast<float>(coordinate.x), static_cast<float>(coordinate.y)};
+                    }
+                    const auto valid_projection = production::validate_uv_triangle_projection(
+                        source_uvs, projected_uvs);
+                    if (!valid_projection) {
+                        return core::Result<GltfExportReport>::failure(validation(
+                            "glTF float32 UV narrowing: " + valid_projection.error().message));
+                    }
+                }
+            }
             if(material.value().baked)for(auto index:indices) {
                 const auto& coord=stream.artifact.vertices.at(index).uv;
                 if(!coord||coord->x<0||coord->x>1||coord->y<0||coord->y>1)

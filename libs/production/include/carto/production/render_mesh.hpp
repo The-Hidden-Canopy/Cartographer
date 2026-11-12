@@ -100,6 +100,14 @@ struct RenderMeshCompileOptions {
     std::vector<attributes::UvSetId> additional_uv_sets;
 };
 
+// Shared fidelity gate for explicit UV projections such as native upload and
+// interchange narrowing. Checks finite coordinates/edges and preserves signed
+// triangle orientation, including proven zero area. Uncertain near-collinear
+// inputs fail closed. This does not impose an error budget on coordinate drift.
+[[nodiscard]] core::Result<void> validate_uv_triangle_projection(
+    const std::array<core::Vec2d, 3U>& source,
+    const std::array<core::Vec2d, 3U>& projected);
+
 // Float32 upload ABI consumed by the public native PBR vertex shader. The
 // derived artifact remains double precision; this is an explicit, validated
 // projection made only at the device boundary.

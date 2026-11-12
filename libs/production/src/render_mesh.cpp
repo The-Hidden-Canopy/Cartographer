@@ -344,6 +344,32 @@ core::Result<RenderMeshBounds> calculate_bounds(
 
 } // namespace
 
+core::Result<void> validate_uv_triangle_projection(
+    const std::array<core::Vec2d, 3U>& source,
+    const std::array<core::Vec2d, 3U>& projected) {
+    const auto finite_triangle = [](const auto& triangle) {
+        return std::all_of(triangle.begin(), triangle.end(),
+                   [](core::Vec2d uv) { return uv.finite(); }) &&
+            (triangle[1U] - triangle[0U]).finite() &&
+            (triangle[2U] - triangle[0U]).finite();
+    };
+    if (!finite_triangle(source) || !finite_triangle(projected)) {
+        return core::Result<void>::failure(validation(
+            "UV projection contains non-finite coordinates or edge differences"));
+    }
+    const auto source_orientation = uv_orientation(source[0U], source[1U], source[2U]);
+    const auto projected_orientation = uv_orientation(projected[0U], projected[1U], projected[2U]);
+    if (!source_orientation || !projected_orientation) {
+        return core::Result<void>::failure(validation(
+            "UV projection cannot certify authored UV orientation"));
+    }
+    if (*source_orientation != *projected_orientation) {
+        return core::Result<void>::failure(validation(
+            "UV projection collapses or changes authored UV orientation"));
+    }
+    return core::Result<void>::success();
+}
+
 core::Result<void> RenderMeshBounds::validate() const {
     if (!aabb.valid() || !sphere_center.finite() || !std::isfinite(sphere_radius) ||
         sphere_radius < 0.0 || sphere_center.x < aabb.minimum.x ||
@@ -992,15 +1018,11 @@ static core::Result<PbrMeshUpload> pack_pbr_mesh_upload_with_texture_policy(
                 const auto& value = upload.vertices[index].uv0;
                 return core::Vec2d{value[0U], value[1U]};
             };
-            const auto source_orientation = uv_orientation(*a.uv, *b.uv, *c.uv);
-            const auto packed_orientation = uv_orientation(uv(ia), uv(ib), uv(ic));
-            if (!source_orientation || !packed_orientation) {
-                return core::Result<PbrMeshUpload>::failure(validation(
-                    "float32 PBR conversion cannot certify authored UV orientation"));
-            }
-            if (*source_orientation != *packed_orientation) {
-                return core::Result<PbrMeshUpload>::failure(validation(
-                    "float32 PBR conversion collapses or changes authored UV orientation"));
+            const auto projected = validate_uv_triangle_projection(
+                {*a.uv, *b.uv, *c.uv}, {uv(ia), uv(ib), uv(ic)});
+            if (!projected) {
+                return core::Result<PbrMeshUpload>::failure(
+                    projected.error().with_context("float32 PBR conversion"));
             }
         }
     }

@@ -6,6 +6,8 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 
 ## 0.1 - current foundation
 
+- [ ] validate glTF/GLB float32 UV preservation using the shared orientation gate: code and regression cases are implemented; build, format-level tests, consumer import, and visual acceptance remain pending ([scope and evidence](verification/gltf-float32-uv-fidelity.md))
+
 - [ ] validate native PBR float32 geometry/UV orientation preservation: fail-closed upload checks and regression cases are implemented, with build, CTest, and GPU/visual acceptance pending ([scope and evidence](verification/pbr-float32-fidelity.md))
 
 - [ ] validate mirrored-UV generated tangent-domain preservation: source and regression cases are implemented, but build, CTest, and normal-map visual acceptance remain pending ([scope and evidence](verification/mirrored-uv-tangent-domains.md))

@@ -1,5 +1,10 @@
 # Capability matrix
 
+Code-only continuation (2026-11-12): glTF/GLB applies the shared native UV
+orientation certificate to each emitted primitive's actual float32 coordinates,
+including UV-only fallback. Refusal and exact-payload regression cases are
+authored but unrun; see [interchange UV fidelity](verification/gltf-float32-uv-fidelity.md).
+
 Code-only continuation (2026-11-12): native PBR float32 projection refuses
 collapsed/reversed geometry and changed primary-UV orientation instead of
 accepting finite coordinates alone. Regression cases are authored but unrun;

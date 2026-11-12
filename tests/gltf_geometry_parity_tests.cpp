@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <array>
 #include <locale>
+#include <limits>
 #include <carto/io/gltf_material_import.hpp>
 #include <carto/io/gltf_scene_import.hpp>
 #include "../apps/desktop/interchange_export_feedback.hpp"
@@ -477,6 +478,112 @@ void material_export_locale_pressure(const std::filesystem::path& root) {
     check(scene.doc.serialize() == before_source, "locale export does not mutate source");
 }
 
+using UvTriangle = std::array<core::Vec2d, 3U>;
+
+geometry::EditableMesh uv_projection_fixture(const UvTriangle& coordinates, bool authored_frames) {
+    geometry::EditableMesh mesh;
+    okay(mesh.insert_bulk(
+        {{{1}, {0, 0, 0}}, {{2}, {1, 0, 0}}, {{3}, {0, 1, 0}}},
+        {{{1}, {{1}, {2}, {3}}}}));
+    attributes::AttributeSet payload({{attributes::AttributeDomain::corner, 3U}});
+    std::vector<attributes::AttributeValue> values;
+    for (const auto coordinate : coordinates) values.emplace_back(coordinate);
+    okay(payload.add_layer({{"uv.export", attributes::AttributeDomain::corner,
+        attributes::AttributeType::vec2}, values}));
+    if (authored_frames) {
+        okay(payload.add_layer({{"cartographer.tangent.7", attributes::AttributeDomain::corner,
+            attributes::AttributeType::vec4},
+            std::vector<attributes::AttributeValue>(3U, core::Vec4d{1.0, 0.0, 0.0, 1.0})}));
+        okay(payload.add_layer({{"cartographer.tangent_uv.7", attributes::AttributeDomain::corner,
+            attributes::AttributeType::vec2}, values}));
+    }
+    attributes::UvSetTable sets;
+    okay(sets.add({7U, "Render UV", "uv.export", true, true, false, 1U}));
+    okay(mesh.set_attribute_payload(std::move(payload), std::move(sets)));
+    return mesh;
+}
+
+void gltf_float32_uv_projection_preserves_fidelity(const std::filesystem::path& root) {
+    const UvTriangle unit_uvs{{{0, 0}, {1, 0}, {0, 1}}};
+    okay(production::validate_uv_triangle_projection(unit_uvs, unit_uvs));
+    auto nonfinite = unit_uvs;
+    nonfinite[0].x = std::numeric_limits<double>::quiet_NaN();
+    check(!production::validate_uv_triangle_projection(nonfinite, unit_uvs) &&
+          !production::validate_uv_triangle_projection(unit_uvs, nonfinite),
+        "shared UV projection gate refuses non-finite source or projected coordinates");
+    const double maximum = std::numeric_limits<double>::max();
+    const UvTriangle overflowing_edges{{{-maximum, 0}, {maximum, 0}, {0, 1}}};
+    check(!production::validate_uv_triangle_projection(overflowing_edges, unit_uvs),
+        "shared UV projection gate refuses non-finite edge differences");
+
+    const auto baseline_root = root / "baseline";
+    std::filesystem::create_directory(baseline_root);
+    const auto baseline = make_scene(uv_projection_fixture(unit_uvs, false), baseline_root);
+    const auto good_gltf = root / "baseline.gltf";
+    const auto good_glb = root / "baseline.glb";
+    static_cast<void>(take(io::export_gltf(baseline.doc, good_gltf)));
+    static_cast<void>(take(io::export_glb(baseline.doc, good_glb)));
+    const auto gltf_before = read(good_gltf);
+    const auto glb_before = read(good_glb);
+    const double unit = std::ldexp(1.0, -23);
+    struct Case { std::string name; UvTriangle coordinates; };
+    const std::vector<Case> rejected{
+        {"collapsed", {{{1e8, 0}, {1e8 + 1, 0}, {1e8, 1}}}},
+        {"reversed", {{{0, 0}, {1 + 0.6 * unit, 1 + 0.4 * unit},
+            {2 + 0.98 * unit, 2 - 0.98 * unit}}}},
+        {"underflow", {{{0, 0}, {1e-170, 0}, {0, 1e-170}}}},
+        {"anisotropic", {{{0, 0}, {1e-10, 1e-320}, {2e-10, 1e-320}}}},
+        {"subtraction-loss", {{{1, 1}, {1e-170, 0}, {0, 1e-170}}}},
+        {"invented-area", {{{0, 0}, {1 + unit, 1 + 2 * unit},
+            {3 + 3 * unit, 3 + 6 * unit}}}},
+    };
+    for (const auto& item : rejected) {
+        for (const bool authored_frames : {false, true}) {
+            const auto case_root = root / (item.name + (authored_frames ? "-authored" : "-derived"));
+            std::filesystem::create_directory(case_root);
+            const auto scene = make_scene(
+                uv_projection_fixture(item.coordinates, authored_frames), case_root);
+            const auto before_source = scene.doc.serialize();
+            const auto gltf = io::export_gltf(scene.doc, good_gltf);
+            const auto glb = io::export_glb(scene.doc, good_glb);
+            check(!gltf && !glb &&
+                  gltf.error().message.find("glTF float32 UV narrowing") != std::string::npos &&
+                  glb.error().message.find("glTF float32 UV narrowing") != std::string::npos,
+                "both formats reject UV fidelity loss with or without authored tangent frames");
+            check(read(good_gltf) == gltf_before && read(good_glb) == glb_before &&
+                  scene.doc.serialize() == before_source,
+                "refused UV narrowing preserves both prior artifacts and the complete source document");
+            const auto new_gltf = case_root / "refused.gltf";
+            const auto new_glb = case_root / "refused.glb";
+            check(!io::export_gltf(scene.doc, new_gltf) && !std::filesystem::exists(new_gltf) &&
+                  !io::export_glb(scene.doc, new_glb) && !std::filesystem::exists(new_glb),
+                "refused UV projection never publishes a new partial artifact");
+        }
+    }
+    const std::vector<Case> accepted{
+        {"ordinary", unit_uvs},
+        {"mirrored", {{{0, 0}, {-1, 0}, {0, 1}}}},
+        {"tiny-valid", {{{0, 0}, {1e-8, 0}, {0, 1e-8}}}},
+        {"constant", {{{0.25, 0.25}, {0.25, 0.25}, {0.25, 0.25}}}},
+    };
+    for (const auto& item : accepted) {
+        for (const bool authored_frames : {false, true}) {
+            const auto case_root = root / (item.name + (authored_frames ? "-authored" : "-derived"));
+            std::filesystem::create_directory(case_root);
+            const auto scene = make_scene(
+                uv_projection_fixture(item.coordinates, authored_frames), case_root);
+            const auto payload = exported(scene, case_root, "preserved");
+            const auto coordinates = payload.attribute("TEXCOORD_0");
+            check(coordinates.size() == 6U, "accepted projection retains all three UV corners");
+            for (std::size_t i = 0U; i < 3U; ++i) {
+                check(coordinates[i * 2U] == static_cast<float>(item.coordinates[i].x) &&
+                      coordinates[i * 2U + 1U] == static_cast<float>(item.coordinates[i].y),
+                    "accepted export preserves the exact requested float32 UV projection");
+            }
+        }
+    }
+}
+
 } // namespace
 int main(int argc, char** argv) {
     try {
@@ -501,6 +608,9 @@ int main(int argc, char** argv) {
              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         check(!std::filesystem::exists(root), "fixture directory must be new; prior artifacts are preserved");
         std::filesystem::create_directories(root);
+        const auto uv_projection_root = root / "uv-float32-projection";
+        std::filesystem::create_directory(uv_projection_root);
+        gltf_float32_uv_projection_preserves_fidelity(uv_projection_root);
         vanta_metadata_export(root);
         const auto scalar_root = root / "constant-material";
         std::filesystem::create_directory(scalar_root);
