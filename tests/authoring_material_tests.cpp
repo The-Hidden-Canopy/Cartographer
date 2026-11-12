@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 
 namespace {
 using Kind = project::MaterialGraphNodeKind;
@@ -315,6 +316,56 @@ void pixels_and_lifecycle() {
         "graph edit/rebind survives redo and disk save/reopen without changing "
         "appearance");
 }
+void material_bake_domains_preserve_sampling_and_admission() {
+    const auto f = fixture();
+    auto graph = authoring_graph_fixture();
+    node(graph, 6).parameter_name = "uv.u";
+    const auto catalog = bound_catalog(f, graph);
+    const auto before = catalog.serialize();
+    const auto program = take(production::compile_authoring_material(catalog, 1));
+    const production::AuthoringMaterialBakeDomain domain{{0.25, 0.2}, {0.5, 0.3}};
+    constexpr std::uint32_t resolution = 16;
+    const auto baked = take(production::bake_authoring_material(program, resolution, domain));
+    check(baked.domain.origin.x == domain.origin.x && baked.domain.origin.y == domain.origin.y &&
+            baked.domain.span.x == domain.span.x && baked.domain.span.y == domain.span.y,
+        "bake products retain their exact explicit UV domain");
+    for (unsigned y = 0; y < resolution; ++y) {
+        for (unsigned x = 0; x < resolution; ++x) {
+            const double u = domain.origin.x + (x + 0.5) * domain.span.x / resolution;
+            const double v = domain.origin.y + (y + 0.5) * domain.span.y / resolution;
+            const auto sample = take(program.evaluate({{u, v},
+                {domain.span.x / resolution, 0}, {0, domain.span.y / resolution}}));
+            const auto expected = static_cast<std::uint8_t>(std::lround(sample.material.roughness * 255));
+            check(baked.maps[1].pixels[(std::size_t(y) * resolution + x) * 4 + 1] == expected,
+                "subregion bake evaluates authored UV positions with domain-scaled derivatives");
+        }
+    }
+    const auto default_bake = take(production::bake_authoring_material(program, resolution));
+    const auto explicit_default = take(production::bake_authoring_material(program, resolution, {}));
+    check(default_bake.program_digest == baked.program_digest &&
+            default_bake.maps[1].pixels != baked.maps[1].pixels,
+        "same executable source can produce different domain-specific rasters");
+    for (std::size_t map = 0; map < default_bake.maps.size(); ++map)
+        check(default_bake.maps[map].pixels == explicit_default.maps[map].pixels,
+            "legacy unit-square overload remains exactly equivalent");
+    const auto plain = take(production::compile_authoring_material(f.document.material_catalog(), 1));
+    const auto tile = take(production::bake_authoring_material(plain, resolution, {{2, -3}, {1, 1}}));
+    const auto unit = take(production::bake_authoring_material(plain, resolution));
+    for (std::size_t map = 0; map < unit.maps.size(); ++map)
+        check(tile.maps[map].pixels == unit.maps[map].pixels,
+            "constant material tiles retain their appearance outside the unit square");
+    using Domain = production::AuthoringMaterialBakeDomain;
+    for (const auto invalid : {
+            Domain{{0, 0}, {0, 1}}, Domain{{0, 0}, {-1, 1}},
+            Domain{{1e6, 0}, {1, 1}}, Domain{{0, 0}, {1, 2e6}},
+            Domain{{1, 0}, {1e-20, 1}}, Domain{{0, 0}, {std::numeric_limits<double>::denorm_min(), 1}},
+            Domain{{std::numeric_limits<double>::quiet_NaN(), 0}, {1, 1}},
+            Domain{{0, 0}, {1, std::numeric_limits<double>::infinity()}}}) {
+        check(!production::bake_authoring_material(plain, resolution, invalid),
+            "invalid or numerically collapsed UV domains fail before publication");
+    }
+    check(catalog.serialize() == before, "domain baking never rewrites authored UVs or material sources");
+}
 void material_bake_matches_two_pass_reference() {
     const auto f = fixture();
     auto graph = authoring_graph_fixture();
@@ -378,6 +429,7 @@ void material_bake_matches_two_pass_reference() {
 } // namespace
 int main() {
     try {
+        material_bake_domains_preserve_sampling_and_admission();
         material_bake_matches_two_pass_reference();
         factors_parameters_and_variants();
         stale_source_order_and_ranges();

@@ -5,7 +5,8 @@
 #include <vector>
 namespace carto::production {
 core::Result<AuthoringMaterialBake> bake_authoring_material(
-    const AuthoringMaterialProgram& program, std::uint32_t resolution) {
+    const AuthoringMaterialProgram& program, std::uint32_t resolution,
+    AuthoringMaterialBakeDomain domain) {
     using Result=core::Result<AuthoringMaterialBake>;
     try {
         if(!authoring_material_bake_fits_budget(resolution))
@@ -15,12 +16,36 @@ core::Result<AuthoringMaterialBake> bake_authoring_material(
         if(!program.executable())
             return Result::failure({core::ErrorCode::invalid_argument,
                 "material bake requires a compiled material program"});
+        const auto coordinates=[&](double origin,double span) {
+            const double end=origin+span;
+            if(!std::isfinite(origin)||!std::isfinite(span)||span<=0.0||
+                !std::isfinite(end)||std::abs(origin)>1e6||std::abs(end)>1e6||end<=origin)
+                throw std::runtime_error("material bake domain requires bounded increasing finite UV endpoints");
+            const double step=span/resolution;
+            if(!std::isfinite(step)||step<=0.0)
+                throw std::runtime_error("material bake domain has an unrepresentable UV derivative");
+            std::vector<double> centers;
+            centers.reserve(resolution);
+            double previous=origin;
+            for(unsigned i=0;i<resolution;++i) {
+                const double center=origin+(i+.5)*step;
+                if(!std::isfinite(center)||center<=previous||center>=end)
+                    throw std::runtime_error("material bake domain collapses distinct UV pixel centers");
+                centers.push_back(center);
+                previous=center;
+            }
+            return centers;
+        };
+        const auto u=coordinates(domain.origin.x,domain.span.x);
+        const auto v=coordinates(domain.origin.y,domain.span.y);
         const auto packet=program.gpu_packet();
         if(!packet)return Result::failure(packet.error());
-        const double step=1./resolution;
-        const auto sample=[&](unsigned x,unsigned y){return program.evaluate({{(x+.5)*step,(y+.5)*step},{step,0},{0,step}});};
+        const double step_u=domain.span.x/resolution;
+        const double step_v=domain.span.y/resolution;
+        const auto sample=[&](unsigned x,unsigned y){return program.evaluate({{u[x],v[y]},{step_u,0},{0,step_v}});};
         AuthoringMaterialBake result;
         result.program_digest=packet.value().digest;
+        result.domain=domain;
         result.uv=program.uv_set().value_or(1);
         result.normal_mapping=program.normal_mapping();
         const auto texels=std::size_t(resolution)*resolution;
@@ -78,5 +103,9 @@ core::Result<AuthoringMaterialBake> bake_authoring_material(
     } catch(const std::exception& e) {
         return Result::failure({core::ErrorCode::validation_failed,std::string("material bake: ")+e.what()});
     }
+}
+core::Result<AuthoringMaterialBake> bake_authoring_material(
+    const AuthoringMaterialProgram& program, std::uint32_t resolution) {
+    return bake_authoring_material(program,resolution,{});
 }
 } // namespace carto::production
