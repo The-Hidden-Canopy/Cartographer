@@ -311,6 +311,13 @@ core::Result<void> CompiledMaterialArtifact::refresh_digest() {
 core::Result<CompiledMaterialArtifact> compile_material_artifact(
     std::string source_identity,
     const render::MaterialAsset& material) {
+    return compile_material_artifact(std::move(source_identity), material, {});
+}
+
+core::Result<CompiledMaterialArtifact> compile_material_artifact(
+    std::string source_identity,
+    const render::MaterialAsset& material,
+    const DefaultSamplerEquivalence& default_equivalent_sampler) {
     if (!safe_identity(source_identity)) {
         return core::Result<CompiledMaterialArtifact>::failure(invalid(
             "compiled material requires a bounded stable source identity"));
@@ -319,7 +326,18 @@ core::Result<CompiledMaterialArtifact> compile_material_artifact(
     if (!source_digest) {
         return core::Result<CompiledMaterialArtifact>::failure(source_digest.error());
     }
-    const auto gpu_constants = render::pack_material_for_gpu(material.definition);
+    // Only the packing copy is normalized; identity stays bound to `material`.
+    render::StandardMaterial packed = material.definition;
+    if (default_equivalent_sampler) {
+        for (render::TextureRef* binding : {
+                 &packed.base_color, &packed.metallic_roughness, &packed.normal,
+                 &packed.occlusion, &packed.emissive}) {
+            if (*binding && binding->sampler != 0U &&
+                default_equivalent_sampler(binding->sampler))
+                binding->sampler = 0U;
+        }
+    }
+    const auto gpu_constants = render::pack_material_for_gpu(packed);
     if (!gpu_constants) {
         return core::Result<CompiledMaterialArtifact>::failure(gpu_constants.error());
     }

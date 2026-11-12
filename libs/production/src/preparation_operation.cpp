@@ -343,8 +343,19 @@ core::Result<LookdevDrawPackage> compile_scoped_lookdev(
             source_identity = "material." + std::to_string(material.id) +
                 ".variant." + std::to_string(variant->second.id);
         }
+        // Importers record an omitted source sampler as an explicit catalog
+        // entry with default parameters; that is the reserved default sampler.
+        const DefaultSamplerEquivalence default_sampler = [&catalog](render::SamplerId id) {
+            const auto sampler = catalog.samplers().find(id);
+            if (sampler == catalog.samplers().end()) return false;
+            const project::SamplerIntent defaults{};
+            const auto& intent = sampler->second;
+            return intent.address_u == defaults.address_u && intent.address_v == defaults.address_v &&
+                intent.address_w == defaults.address_w && intent.minification == defaults.minification &&
+                intent.magnification == defaults.magnification && intent.mip == defaults.mip;
+        };
         const auto compiled = compile_material_artifact(
-            std::move(source_identity), material);
+            std::move(source_identity), material, default_sampler);
         if (!compiled) {
             return core::Result<LookdevDrawPackage>::failure(
                 compiled.error().with_context("material region " +

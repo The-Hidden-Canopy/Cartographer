@@ -50,13 +50,15 @@ core::Result<std::array<float, 4U>> narrow_vec4(
         x.value(), y.value(), z.value(), w.value()});
 }
 
-bool native_binding_is_supported(const TextureRef& binding) {
+// Normal convention only changes how a tangent-space normal map is decoded,
+// so it is checked on the normal slot alone; other slots never read it.
+bool native_binding_is_supported(const TextureRef& binding, bool normal_slot) {
     if (!binding) return true;
     return binding.uv_set == kUv0 && binding.sampler == 0U &&
         binding.transform == TextureTransform{} &&
         binding.channels == ChannelMapping{} &&
         binding.interpretation == TextureInterpretation::asset &&
-        binding.normal_convention == NormalConvention::directx_y_minus;
+        (!normal_slot || binding.normal_convention == NormalConvention::directx_y_minus);
 }
 
 } // namespace
@@ -179,7 +181,7 @@ core::Result<GpuMaterialConstants> pack_material_for_gpu(
              &material.normal,
              &material.occlusion,
              &material.emissive}) {
-        if (!native_binding_is_supported(*binding)) {
+        if (!native_binding_is_supported(*binding, binding == &material.normal)) {
             return core::Result<GpuMaterialConstants>::failure(
                 core::Diagnostic(core::ErrorCode::unsupported,
                     "native PBR material packing does not yet support non-UV0 bindings, "

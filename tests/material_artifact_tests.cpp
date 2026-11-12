@@ -151,12 +151,54 @@ void stale_and_unsupported_sources_fail_closed() {
             "unsafe material source identity is rejected");
 }
 
+// Imported glTF bindings: an explicit catalog sampler with default parameters
+// and an OpenGL tag on non-normal slots. Only provably default samplers pack;
+// identity stays bound to the authored material and normal maps stay strict.
+void imported_default_sampler_bindings_pack_without_changing_identity() {
+    using namespace carto::production;
+    auto material = material_fixture();
+    for (carto::render::TextureRef* binding : {
+             &material.definition.base_color, &material.definition.metallic_roughness,
+             &material.definition.occlusion, &material.definition.emissive}) {
+        binding->sampler = 5U;
+        binding->normal_convention = carto::render::NormalConvention::opengl_y_plus;
+    }
+    material.definition.normal.sampler = 5U;
+    const DefaultSamplerEquivalence sampler_five_is_default = [](carto::render::SamplerId id) {
+        return id == 5U;
+    };
+    require(!compile_material_artifact("project/public-fixture/material/71", material),
+            "without equivalence evidence a non-zero sampler stays unsupported");
+    const auto packed = compile_material_artifact(
+        "project/public-fixture/material/71", material, sampler_five_is_default);
+    require(static_cast<bool>(packed), "a default-equivalent sampler packs as the reserved default sampler");
+    const auto authored_digest = material_source_digest(material);
+    require(authored_digest && packed.value().source_digest == authored_digest.value() &&
+                packed.value().source_revision == material.revision &&
+                static_cast<bool>(validate_material_artifact_source(
+                    packed.value(), "project/public-fixture/material/71", material)),
+            "packed artifact still binds the authored material's digest and revision");
+    require(packed.value().gpu_constants.texture_asset_ids[0U] == 1001U,
+            "packed artifact keeps the authored base-color texture asset");
+    require(packed.value().gpu_constants.alpha_factors[2U] == 0.0F,
+            "a DirectX normal map keeps the DirectX decode flag");
+    require(!compile_material_artifact("project/public-fixture/material/71", material,
+                [](carto::render::SamplerId) { return false; }),
+            "a sampler not proven default stays unsupported");
+    auto opengl_normal = material;
+    opengl_normal.definition.normal.normal_convention = carto::render::NormalConvention::opengl_y_plus;
+    require(!compile_material_artifact("project/public-fixture/material/71", opengl_normal,
+                sampler_five_is_default),
+            "an OpenGL normal map stays unsupported by generic packing");
+}
+
 } // namespace
 
 int main() {
     supported_material_compiles_deterministically();
     material_artifact_round_trip_and_tamper_rejection();
     stale_and_unsupported_sources_fail_closed();
+    imported_default_sampler_bindings_pack_without_changing_identity();
     std::cout << "material artifact tests passed\n";
     return EXIT_SUCCESS;
 }

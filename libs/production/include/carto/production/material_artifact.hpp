@@ -7,6 +7,7 @@
 #include <carto/render/material.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -53,6 +54,16 @@ struct CompiledMaterialArtifact {
 [[nodiscard]] core::Result<CompiledMaterialArtifact> compile_material_artifact(
     std::string source_identity,
     const render::MaterialAsset& material);
+
+// Same as above, but a binding whose sampler the caller proves equivalent to
+// the reserved default sampler (repeat addressing, linear filtering and mips)
+// is packed as sampler 0. The artifact's source digest and revision still bind
+// the authored material unchanged; every other sampler stays unsupported.
+using DefaultSamplerEquivalence = std::function<bool(render::SamplerId)>;
+[[nodiscard]] core::Result<CompiledMaterialArtifact> compile_material_artifact(
+    std::string source_identity,
+    const render::MaterialAsset& material,
+    const DefaultSamplerEquivalence& default_equivalent_sampler);
 
 // Revalidates immediately before use. Revision and content must both match;
 // callers cannot reuse an artifact after an authored edit or identity swap.
