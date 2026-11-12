@@ -1073,11 +1073,11 @@ void project_scene_texture_loader_binds_verified_sources_and_fails_closed() {
             "fixture authors three additional corner-domain UV streams");
         auto multi_uv_sets = multi_uv_mesh.uv_sets();
         require(static_cast<bool>(multi_uv_sets.add(
-                {2U, "Material UV 2", "uv.material1", false, true, false, 1U})) &&
+                {2U, "Material UV 2", "uv.material1", false, false, false, 1U})) &&
             static_cast<bool>(multi_uv_sets.add(
-                {3U, "Material UV 3", "uv.material2", false, true, false, 1U})) &&
+                {3U, "Material UV 3", "uv.material2", false, false, false, 1U})) &&
             static_cast<bool>(multi_uv_sets.add(
-                {4U, "Material UV 4", "uv.material3", false, true, false, 1U})) &&
+                {4U, "Material UV 4", "uv.material3", false, false, false, 1U})) &&
             static_cast<bool>(multi_uv_mesh.set_attribute_payload(
                 std::move(multi_uv_payload), std::move(multi_uv_sets))) &&
             static_cast<bool>(project::testing::access(multi_uv_document).replace_mesh(
@@ -1811,16 +1811,16 @@ void project_scene_adapter_wires_unambiguous_authored_colors() {
     const auto vertex_mesh_asset = *vertex_scene_objects.front().mesh_asset;
     auto vertex_mesh = vertex_document.meshes().at(vertex_mesh_asset);
     auto vertex_payload = vertex_mesh.attributes();
+    take(vertex_payload.set_domain_count(attributes::AttributeDomain::vertex,
+        vertex_mesh.vertices_sorted().size()));
     std::vector<attributes::AttributeValue> vertex_colors(
         vertex_mesh.vertices_sorted().size(), authored_color);
-    require(static_cast<bool>(vertex_payload.add_layer({
-            {"color.vertex.fixture", attributes::AttributeDomain::vertex,
-                attributes::AttributeType::color4}, std::move(vertex_colors)})) &&
-        static_cast<bool>(vertex_mesh.set_attribute_payload(
-            std::move(vertex_payload), vertex_mesh.uv_sets())) &&
-        static_cast<bool>(project::testing::access(vertex_document).replace_mesh(
-            vertex_mesh_asset, std::move(vertex_mesh))),
-        "fixture binds an authored vertex-domain color layer");
+    take(vertex_payload.add_layer({
+        {"color.vertex.fixture", attributes::AttributeDomain::vertex,
+            attributes::AttributeType::color4}, std::move(vertex_colors)}));
+    take(vertex_mesh.set_attribute_payload(std::move(vertex_payload), vertex_mesh.uv_sets()));
+    take(project::testing::access(vertex_document).replace_mesh(
+        vertex_mesh_asset, std::move(vertex_mesh)));
     const auto vertex_colored = take(d3d12::prepare_project_scene_render(
         "fixture-room", vertex_document, {}, 64U, 64U));
     const auto vertex_colored_object = std::find_if(vertex_colored.objects.begin(),
@@ -1856,6 +1856,8 @@ void project_scene_adapter_wires_unambiguous_authored_colors() {
     auto invalid_domain_document = document;
     auto invalid_domain_mesh = invalid_domain_document.meshes().at(mesh_asset);
     auto invalid_domain_payload = invalid_domain_mesh.attributes();
+    take(invalid_domain_payload.set_domain_count(attributes::AttributeDomain::face,
+        invalid_domain_mesh.faces_sorted().size()));
     std::vector<attributes::AttributeValue> face_colors(
         invalid_domain_mesh.faces_sorted().size(), core::Vec4d{1.0, 1.0, 1.0, 1.0});
     require(static_cast<bool>(invalid_domain_payload.add_layer({
@@ -1884,6 +1886,7 @@ void authored_project_camera_resolves_world_pose_and_projection() {
     project::AuthoredCamera authored;
     authored.object = camera_object;
     authored.identity = "fixture-perspective-camera";
+    authored.bookmark_identity = "fixture-perspective-bookmark";
     authored.vertical_fov_radians = 0.9;
     authored.near_plane = 0.02;
     authored.far_plane = 500.0;
@@ -1896,8 +1899,9 @@ void authored_project_camera_resolves_world_pose_and_projection() {
     const auto resolved = take(d3d12::resolve_project_scene_render_camera(
         document, camera_object, 1.25));
     require(resolved.position.x == 3.0 && resolved.position.y == 2.0 &&
-        resolved.position.z == 1.0 && resolved.target.x == 2.0 &&
-        resolved.target.y == 2.0 && resolved.target.z == 1.0 &&
+        resolved.position.z == 1.0 && std::abs(resolved.target.x - 2.0) < 1.0e-12 &&
+        std::abs(resolved.target.y - 2.0) < 1.0e-12 &&
+        std::abs(resolved.target.z - 1.0) < 1.0e-12 &&
         resolved.up.x == 0.0 && resolved.up.y == 1.0 && resolved.up.z == 0.0 &&
         resolved.vertical_fov == authored.vertical_fov_radians &&
         resolved.near_plane == authored.near_plane &&
@@ -1915,6 +1919,7 @@ void authored_project_camera_resolves_world_pose_and_projection() {
     project::AuthoredCamera orthographic;
     orthographic.object = orthographic_object;
     orthographic.identity = "fixture-orthographic-camera";
+    orthographic.bookmark_identity = "fixture-orthographic-bookmark";
     orthographic.projection = project::CameraProjection::orthographic;
     orthographic.orthographic_height = 4.5;
     orthographic.revision = core::Revision{1U};
@@ -2089,6 +2094,7 @@ void project_scene_adapter_wires_supported_authored_lights_and_refuses_fallbacks
     project::AuthoredLight second = key;
     second.object = second_object;
     second.identity = "fixture.renderer-light-secondary";
+    second.range = 0.0;
     auto divergent_catalog = divergent.presentation_catalog();
     require(static_cast<bool>(divergent_catalog.insert_light(std::move(second))) &&
             static_cast<bool>(divergent.set_presentation_catalog(
@@ -3490,7 +3496,8 @@ void scene_depth_exposure_material_camera_and_lifetimes(d3d12::D3D12Device& devi
     require(first.device.backend == device::BackendKind::d3d12 && !first.device.adapter_name.empty() &&
             !first.shader_digests[0U].is_zero() && !first.shader_digests[2U].is_zero() &&
             !first.shader_digests[4U].is_zero() &&
-            !first.shader_digests[6U].is_zero() && first.limitations.size() == 3U,
+            !first.shader_digests[6U].is_zero() && first.limitations.size() == 4U &&
+            first.limitations[2U].find("Straight-alpha blended submeshes") != std::string::npos,
         "hardware, PBR/shadow/tone/temporal shader evidence and limitations retained");
     std::reverse(input.objects.begin(), input.objects.end());
     const auto reversed = capture(device, input);
@@ -5257,6 +5264,16 @@ int main(int argc, char** argv) {
             scene_anisotropy_frame_transport_preserves_orientation();
             project_graph_anisotropic_normal_maps_preserve_source_boundaries();
             std::cout << "PASS graph anisotropy reference and tangent boundaries (no GPU)\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--colors-only") {
+            project_scene_adapter_wires_unambiguous_authored_colors();
+            std::cout << "PASS authored colors\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--camera-only") {
+            authored_project_camera_resolves_world_pose_and_projection();
+            std::cout << "PASS authored camera pose and projection\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--environment-only") {
