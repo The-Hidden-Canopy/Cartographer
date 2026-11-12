@@ -93,14 +93,13 @@ core::Result<void> apply_evaluated_material_graph(
     const project::MaterialGraph& graph,
     const project::MaterialGraphEvaluation& evaluation,
     render::StandardMaterial& material,
-    double& sheen_weight) {
+    double& sheen_weight, double& anisotropy) {
     const auto& outputs = graph.outputs;
     if (outputs.normal != 0U || outputs.transmission != 0U ||
-        outputs.subsurface != 0U ||
-        outputs.anisotropy != 0U || outputs.displacement != 0U) {
+        outputs.subsurface != 0U || outputs.displacement != 0U) {
         return core::Result<void>::failure({core::ErrorCode::unsupported,
             "native scene rendering cannot lower normal, transmission, subsurface, "
-            "anisotropy, or displacement material graph outputs"});
+            "or displacement material graph outputs"});
     }
 
     const auto& base_color = evaluation.node_values.at(outputs.base_color);
@@ -124,6 +123,12 @@ core::Result<void> apply_evaluated_material_graph(
     if (!coverage_in_range(sheen_weight)) {
         return core::Result<void>::failure({core::ErrorCode::validation_failed,
             "native scene material graph sheen must be in [0, 1]"});
+    }
+    anisotropy = outputs.anisotropy == 0U ? 0.0 :
+        evaluation.node_values.at(outputs.anisotropy).components[0U];
+    if (!std::isfinite(anisotropy) || anisotropy < -1.0 || anisotropy > 1.0) {
+        return core::Result<void>::failure({core::ErrorCode::validation_failed,
+            "native scene material graph anisotropy must be in [-1, 1]"});
     }
     material.base_color_factor = {base_color.components[0U], base_color.components[1U],
         base_color.components[2U], alpha.components[0U] * opacity};
@@ -404,6 +409,7 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
         render::StandardMaterial definition;
         assets::Sha256Digest digest;
         double sheen_weight = 0.0;
+        double anisotropy = 0.0;
     };
     std::size_t project_graph_evaluation_nodes = 0U;
     std::map<render::MaterialId, GraphMaterialFactors> graph_material_factors;
@@ -465,6 +471,7 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
             auto material = catalog.materials().at(authored.material);
             material.definition = resolved.value();
             double sheen_weight = 0.0;
+            double anisotropy = 0.0;
             std::string identity = "project/" + std::string(project_identity) + "/material/" + std::to_string(material.id);
             if (authored.variant.has_value()) identity += "/variant/" + std::to_string(*authored.variant);
 
@@ -524,7 +531,7 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
                     }
                     if (auto applied = apply_evaluated_material_graph(
                             graph->second, evaluation.value(), material.definition,
-                            sheen_weight); !applied) {
+                            sheen_weight, anisotropy); !applied) {
                         return Output::failure(applied.error());
                     }
                     const std::string graph_context =
@@ -536,10 +543,11 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
                         graph_context.size()});
                     factors = graph_material_factors.emplace(authored.material,
                         GraphMaterialFactors{material.definition, evaluated_graph_digest,
-                            sheen_weight}).first;
+                            sheen_weight, anisotropy}).first;
                 } else {
                     material.definition = factors->second.definition;
                     sheen_weight = factors->second.sheen_weight;
+                    anisotropy = factors->second.anisotropy;
                 }
                 identity += "/graph/" + factors->second.digest.hex();
             }
@@ -561,13 +569,15 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
             const auto artifact = compile_scene_render_material_artifact(identity, material);
             if (!artifact) return Output::failure(artifact.error());
             rendered.materials.push_back({submesh.material_slot, identity, material,
-                artifact.value(), sheen_weight});
+                artifact.value(), sheen_weight, anisotropy});
             bindings.push_back({submesh.material_slot, artifact.value()});
         }
         std::set<render::UvSetId> requested_uv_sets;
         std::optional<render::UvSetId> normal_uv_set;
+        bool requires_anisotropy_frame = false;
         for (const auto& binding : rendered.materials) {
             const auto& material = binding.current_material.definition;
+            requires_anisotropy_frame |= binding.anisotropy != 0.0;
             const std::array<const render::TextureRef*, 5U> texture_slots{
                 &material.base_color, &material.metallic_roughness,
                 &material.normal, &material.occlusion, &material.emissive};
@@ -584,6 +594,14 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
                 }
             }
         }
+        if (requires_anisotropy_frame) {
+            if (normal_uv_set.has_value() && *normal_uv_set != render::kUv0) {
+                return Output::failure({core::ErrorCode::unsupported,
+                    "scene anisotropy requires UV0 tangents; another material's normal map "
+                    "cannot select a different shared tangent stream"});
+            }
+            requested_uv_sets.insert(render::kUv0);
+        }
         if (requested_uv_sets.size() > production::kMaxRenderMeshArtifactUvStreams) {
             return Output::failure({core::ErrorCode::unsupported,
                 "native scene mesh artifacts exceed the authored UV-stream bound"});
@@ -596,7 +614,9 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
             }
         }
         std::optional<render::UvSetId> primary_uv_set;
-        if (normal_uv_set.has_value()) {
+        if (requires_anisotropy_frame) {
+            primary_uv_set = render::kUv0;
+        } else if (normal_uv_set.has_value()) {
             primary_uv_set = normal_uv_set;
         } else if (!requested_uv_sets.empty()) {
             primary_uv_set = *requested_uv_sets.begin();

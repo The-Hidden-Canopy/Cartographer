@@ -170,6 +170,7 @@ struct SceneMaterialUvState {
     std::array<render::UvSetId, 5U> uv_sets{};
     std::array<std::array<float, 4U>, 5U> channel_mappings{};
     float sheen_weight = 0.0F;
+    float anisotropy = 0.0F;
 };
 
 Result<UvAffine> texture_uv_affine(const render::TextureTransform& transform) {
@@ -638,6 +639,7 @@ assets::Sha256Digest request_digest(const SceneRenderRequest& request) {
             append_u64(data, binding.material_slot.has_value()
                 ? static_cast<std::uint64_t>(*binding.material_slot) + 1U : 0U);
             append_double(data, binding.sheen_weight);
+            append_double(data, binding.anisotropy);
             for (const auto sampler : material_draw_samplers(
                      binding.current_material.definition))
                 append_u64(data, sampler);
@@ -703,7 +705,7 @@ assets::Sha256Digest request_digest(const SceneRenderRequest& request) {
 }
 
 assets::Sha256Digest mesh_cache_identity(const SceneRenderRequest& request) {
-    constexpr std::string_view domain = "carto.d3d12.scene-mesh-cache.v8";
+    constexpr std::string_view domain = "carto.d3d12.scene-mesh-cache.v9";
     std::vector<std::uint8_t> data(domain.begin(), domain.end());
     append_u64(data, request.source_revision.value());
     append_digest(data, request.source_digest);
@@ -735,6 +737,7 @@ assets::Sha256Digest mesh_cache_identity(const SceneRenderRequest& request) {
             append_u64(data, binding.material_slot.has_value()
                 ? static_cast<std::uint64_t>(*binding.material_slot) + 1U : 0U);
             append_double(data, binding.sheen_weight);
+            append_double(data, binding.anisotropy);
             for (const auto& mapping : material_draw_channel_mappings(
                      binding.current_material.definition)) {
                 for (const float selector : mapping)
@@ -1659,6 +1662,23 @@ Result<void> SceneRenderRequest::validate() const {
                     binding.material, binding.source_identity,
                     binding.current_material); !valid) return valid;
             const auto& definition = binding.current_material.definition;
+            if (!std::isfinite(binding.anisotropy) || binding.anisotropy < -1.0 ||
+                binding.anisotropy > 1.0) {
+                return Result<void>::failure(invalid(
+                    "scene anisotropy must be finite and in [-1, 1]"));
+            }
+            if (binding.anisotropy != 0.0) {
+                if (environment.has_value() || static_cast<bool>(definition.normal)) {
+                    return Result<void>::failure({core::ErrorCode::unsupported,
+                        "scene anisotropy currently refuses environment lighting and normal maps"});
+                }
+                if (object.uv0_set != render::kUv0 || object.mesh.vertices.empty() ||
+                    !object.mesh.vertices.front().uv.has_value() ||
+                    !object.mesh.vertices.front().tangent.has_value()) {
+                    return Result<void>::failure({core::ErrorCode::unsupported,
+                        "scene anisotropy requires an explicit authored UV0 tangent frame"});
+                }
+            }
             const auto alpha_selector =
                 definition.base_color.channels.rgba[3U];
             const bool alpha_coverage_is_required =
@@ -1827,7 +1847,8 @@ Result<SceneRenderImage> render_scene_impl(
                         material_draw_uv_sets(binding.current_material.definition),
                         material_draw_channel_mappings(
                             binding.current_material.definition),
-                        static_cast<float>(binding.sheen_weight)}).second) {
+                        static_cast<float>(binding.sheen_weight),
+                        static_cast<float>(binding.anisotropy)}).second) {
                 return Result<SceneRenderImage>::failure(invalid(
                     "scene material UV transforms contain a duplicate slot"));
             }
@@ -2032,6 +2053,19 @@ Result<SceneRenderImage> render_scene_impl(
             "Scalar base-tinted Charlie/Neubelt sheen uses a metallic-suppressed base mixture "
             "for analytic direct lights only; shared surface roughness, no sheen IBL, "
             "independent sheen texture/color, or measured cloth/energy acceptance");
+    }
+    const bool uses_anisotropy = std::any_of(request.objects.begin(), request.objects.end(),
+        [](const SceneRenderObject& object) {
+            return std::any_of(object.materials.begin(), object.materials.end(),
+                [](const SceneRenderMaterialBinding& binding) {
+                    return binding.anisotropy != 0.0;
+                });
+        });
+    if (uses_anisotropy) {
+        result.limitations.push_back(
+            "Signed UV0-tangent anisotropy mixes legacy specular with anisotropic GGX/Smith "
+            "for analytic direct lights only; no normal maps, anisotropic IBL, "
+            "independent direction/roughness texture, or measured energy/appearance acceptance");
     }
     const std::array<std::string, 7U> shader_names{
         "cartographer_scene_pbr.hlsl", "cartographer_scene_pbr.hlsl",
@@ -2476,7 +2510,7 @@ Result<SceneRenderImage> render_scene_impl(
                     channel_mappings[3U][0U], channel_mappings[4U][0U]};
                 const std::array<float, 4U> channel_mapping_c{
                     channel_mappings[4U][1U], channel_mappings[4U][2U],
-                    transforms.value().sheen_weight, 0.0F};
+                    transforms.value().sheen_weight, transforms.value().anisotropy};
                 if (draw.first_index > mesh.value().indices.size() ||
                     draw.index_count > mesh.value().indices.size() - draw.first_index) {
                     return Result<SceneRenderImage>::failure({core::ErrorCode::stale_data,

@@ -1,6 +1,7 @@
 #include "project_document_access.hpp"
 
 #include <carto/d3d12/scene_renderer.hpp>
+#include <carto/d3d12/scene_anisotropy.hpp>
 #include <carto/d3d12/scene_sheen.hpp>
 #include <carto/d3d12/scene_camera_navigation.hpp>
 #include <carto/d3d12/temporal_sampling.hpp>
@@ -53,6 +54,9 @@ void take(core::Result<void> result) {
     if (!result) throw std::runtime_error(result.error().message);
 }
 d3d12::SceneRenderRequest request();
+void rebind(d3d12::SceneRenderObject& object);
+d3d12::SceneRenderTexture texture(std::uint64_t id, std::array<std::uint8_t, 4U> rgba,
+    assets::TextureSemantic semantic);
 assets::Sha256Digest hash(std::string_view text) {
     return assets::sha256({reinterpret_cast<const std::uint8_t*>(text.data()), text.size()});
 }
@@ -360,7 +364,7 @@ void project_graph_opacity_preserves_coverage_policy_and_source() {
     using OutputMember = std::uint64_t project::MaterialGraphOutputs::*;
     for (const OutputMember output : {&project::MaterialGraphOutputs::transmission,
             &project::MaterialGraphOutputs::subsurface,
-            &project::MaterialGraphOutputs::anisotropy, &project::MaterialGraphOutputs::displacement}) {
+            &project::MaterialGraphOutputs::displacement}) {
         auto document = opacity_graph_project(1.0, 0.5, render::AlphaMode::blended);
         auto unsupported_catalog = document.material_catalog();
         auto unsupported_graph = unsupported_catalog.material_graphs().at("fixture/opacity");
@@ -493,6 +497,211 @@ void project_graph_sheen_binds_source_and_refuses_missing_ibl() {
     const auto stale = prepare(stale_document);
     require(!stale && stale.error().code == core::ErrorCode::stale_data,
         "sheen graph changes require an explicit source rebind");
+}
+
+project::ProjectDocument anisotropy_graph_project(double strength) {
+    auto document = opacity_graph_project(1.0, std::nullopt, render::AlphaMode::opaque);
+    auto catalog = document.material_catalog();
+    auto graph = catalog.material_graphs().at("fixture/opacity");
+    graph.revision = graph.revision.next();
+    project::MaterialGraphNode anisotropy;
+    anisotropy.id = 5U;
+    anisotropy.constants[0U] = strength;
+    graph.nodes.push_back(anisotropy);
+    graph.outputs.anisotropy = anisotropy.id;
+    take(catalog.replace_material_graph(graph));
+    take(catalog.bind_material_graph(1U, graph.identity));
+    take(document.set_material_catalog(std::move(catalog)));
+    return document;
+}
+
+void scene_anisotropy_reference_preserves_axes_and_zero_boundary() {
+    const core::Vec3d view{0.0, 0.0, 1.0};
+    const core::Vec3d light{0.6, 0.0, 0.8};
+    const auto zero = take(d3d12::evaluate_scene_anisotropy_reference(0.5, 0.0, view, light));
+    const auto near_zero = take(d3d12::evaluate_scene_anisotropy_reference(0.5, 1.0e-8, view, light));
+    require(zero.mixed_kernel == zero.legacy_kernel &&
+            std::abs(near_zero.mixed_kernel - zero.mixed_kernel) < 1.0e-6,
+        "anisotropy preserves legacy zero and approaches it continuously");
+    const auto tangent = take(d3d12::evaluate_scene_anisotropy_reference(0.5, 1.0, view, light));
+    const auto bitangent = take(d3d12::evaluate_scene_anisotropy_reference(0.5, -1.0, view, light));
+    const auto swapped = take(d3d12::evaluate_scene_anisotropy_reference(
+        0.5, -1.0, view, {0.0, 0.6, 0.8}));
+    require(tangent.mixed_kernel > bitangent.mixed_kernel &&
+            std::abs(tangent.mixed_kernel - swapped.mixed_kernel) < 1.0e-12,
+        "signed anisotropy swaps broad and narrow authored tangent axes");
+    const auto normal = take(d3d12::evaluate_scene_anisotropy_reference(0.5, 1.0, view, view));
+    require(std::abs(normal.mixed_kernel - 4.0 / std::acos(-1.0)) < 1.0e-12,
+        "normal-incidence anisotropic GGX matches its analytical distribution and visibility");
+    for (const double roughness : {0.0, 0.5, 1.0}) {
+        for (const double strength : {-1.0, -0.5, 0.0, 0.5, 1.0}) {
+            for (const core::Vec3d grazing : {core::Vec3d{1.0, 0.0, 1.0e-10}.normalized(),
+                    core::Vec3d{0.3, 0.4, std::sqrt(0.75)}}) {
+                const auto forward = take(d3d12::evaluate_scene_anisotropy_reference(
+                    roughness, strength, grazing, light));
+                const auto reverse = take(d3d12::evaluate_scene_anisotropy_reference(
+                    roughness, strength, light, grazing));
+                require(std::isfinite(forward.mixed_kernel) && forward.mixed_kernel >= 0.0 &&
+                        std::abs(forward.mixed_kernel - reverse.mixed_kernel) < 1.0e-10,
+                    "anisotropic kernel remains finite and reciprocal across roughness and grazing probes");
+            }
+        }
+    }
+    require(take(d3d12::evaluate_scene_anisotropy_reference(
+                0.5, 1.0, view, {0.0, 0.0, -1.0})).mixed_kernel == 0.0,
+        "anisotropic direct reflection does not leak into the opposite hemisphere");
+    for (const double bad : {-1.1, 1.1, std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::quiet_NaN()})
+        require(!d3d12::evaluate_scene_anisotropy_reference(0.5, bad, view, light),
+            "invalid signed anisotropy refuses rather than clamping");
+    for (const double bad : {-0.1, 1.1, std::numeric_limits<double>::quiet_NaN()})
+        require(!d3d12::evaluate_scene_anisotropy_reference(bad, 0.5, view, light),
+            "invalid anisotropic roughness refuses");
+    for (const auto bad : {core::Vec3d{}, core::Vec3d{0.0, 0.0, 2.0},
+            core::Vec3d{std::numeric_limits<double>::quiet_NaN(), 0.0, 1.0}})
+        require(!d3d12::evaluate_scene_anisotropy_reference(0.5, 0.5, bad, light) &&
+                !d3d12::evaluate_scene_anisotropy_reference(0.5, 0.5, view, bad),
+            "the numerical reference never invents missing or invalid directions");
+}
+
+void project_graph_anisotropy_requires_source_bound_tangents() {
+    const auto prepare = [](const project::ProjectDocument& document) {
+        return d3d12::prepare_project_scene_render("graph-anisotropy", document, {}, 97U, 97U);
+    };
+    for (const double strength : {-1.0, -0.5, 0.0, 0.5, 1.0}) {
+        const auto document = anisotropy_graph_project(strength);
+        const auto before = document.serialize();
+        const auto prepared = take(prepare(document));
+        std::size_t affected = 0U;
+        for (const auto& object : prepared.objects) {
+            for (const auto& binding : object.materials) {
+                if (binding.current_material.id == 1U) {
+                    ++affected;
+                    require(binding.anisotropy == strength && object.uv0_set == render::kUv0 &&
+                            object.mesh.vertices.front().uv.has_value() &&
+                            object.mesh.vertices.front().tangent.has_value(),
+                        "shared graph anisotropy uses the explicit primary UV0 tangent frame");
+                } else {
+                    require(binding.anisotropy == 0.0, "anisotropy does not bleed to unrelated materials");
+                }
+            }
+        }
+        require(affected == 3U && document.serialize() == before,
+            "anisotropic preparation preserves all authored source bytes");
+        const auto reopened = take(project::ProjectDocument::deserialize(before));
+        require(take(take(prepare(reopened)).digest()) == take(prepared.digest()),
+            "anisotropy and tangent selection survive exact saved-project replay");
+    }
+    for (const double strength : {0.0, -1.0, 1.0}) {
+        auto missing_uv = anisotropy_graph_project(strength);
+        const auto mesh_id = missing_uv.meshes().begin()->first;
+        auto mesh = missing_uv.meshes().begin()->second;
+        auto payload = mesh.attributes();
+        take(payload.remove_layer("uv.fixture"));
+        take(mesh.set_attribute_payload(std::move(payload), {}));
+        take(project::testing::access(missing_uv).replace_mesh(mesh_id, mesh));
+        const auto result = prepare(missing_uv);
+        require(strength == 0.0 ? static_cast<bool>(result) :
+                (!result && result.error().code == core::ErrorCode::not_found),
+            "only nonzero anisotropy requires authored UV0 instead of neutral upload fallback");
+    }
+    for (const double strength : {-1.01, 1.01}) {
+        const auto result = prepare(anisotropy_graph_project(strength));
+        require(!result && result.error().code == core::ErrorCode::validation_failed,
+            "graph anisotropy outside [-1, 1] refuses before rendering");
+    }
+    const auto valid = take(prepare(anisotropy_graph_project(0.5)));
+    auto changed = valid;
+    changed.objects.front().materials.front().anisotropy = -0.5;
+    require(take(changed.digest()) != take(valid.digest()),
+        "anisotropy sign participates in exact request identity");
+    for (const double bad : {-1.01, 1.01, std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::quiet_NaN()}) {
+        changed.objects.front().materials.front().anisotropy = bad;
+        require(!changed.validate() && !changed.digest(), "raw requests retain signed anisotropy admission");
+    }
+    auto no_tangents = valid;
+    for (auto& vertex : no_tangents.objects.front().mesh.vertices) vertex.tangent.reset();
+    rebind(no_tangents.objects.front());
+    const auto tangent_refusal = no_tangents.validate();
+    require(!tangent_refusal && tangent_refusal.error().code == core::ErrorCode::unsupported,
+        "direct requests cannot replace authored anisotropic tangents with neutral upload axes");
+    auto wrong_uv = valid;
+    wrong_uv.objects.front().uv0_set = 2U;
+    require(!wrong_uv.validate(), "non-UV0 primary streams cannot silently rotate the anisotropy convention");
+    auto with_environment = valid;
+    d3d12::SceneRenderEnvironment environment;
+    environment.source_digest = hash("anisotropy-environment-refusal");
+    with_environment.environment = environment;
+    const auto environment_refusal = with_environment.validate();
+    require(!environment_refusal && environment_refusal.error().code == core::ErrorCode::unsupported,
+        "isotropic environment prefilters cannot silently stand in for anisotropic IBL");
+    auto with_normal = valid;
+    with_normal.objects.front().materials.front().current_material.definition.normal.asset = 99U;
+    rebind(with_normal.objects.front());
+    const auto normal_refusal = with_normal.validate();
+    require(!normal_refusal && normal_refusal.error().code == core::ErrorCode::unsupported,
+        "normal-map and anisotropy combinations fail before accepting unsupported shading frames");
+
+    const auto normal_texture = texture(99U, {128U, 128U, 255U, 255U}, assets::TextureSemantic::normal);
+    for (const bool same_object : {false, true}) {
+        auto document = take(project::ProjectDocument::create("Anisotropy tangent-scope fixture"));
+        auto access = project::testing::access(document);
+        auto mesh = authored_box();
+        auto payload = mesh.attributes();
+        const auto primary_uv_values = payload.find("uv.fixture")->values;
+        take(payload.add_layer({{"uv.second", attributes::AttributeDomain::corner,
+            attributes::AttributeType::vec2}, primary_uv_values}));
+        auto uv_sets = mesh.uv_sets();
+        take(uv_sets.add({2U, "Second UV", "uv.second", false, true, false, 1U}));
+        take(mesh.set_attribute_payload(payload, uv_sets));
+        const auto separate_mesh = mesh;
+        if (same_object) {
+            auto regions = *payload.find("cartographer.material_slot");
+            regions.values.back() = std::uint32_t{2U};
+            take(payload.remove_layer("cartographer.material_slot"));
+            take(payload.add_layer(std::move(regions)));
+            take(mesh.set_attribute_payload(std::move(payload), uv_sets));
+        }
+        const auto first_mesh = take(access.add_mesh(mesh));
+        const auto first_object = take(access.create_object("Anisotropic object"));
+        take(access.attach_mesh(first_object, first_mesh));
+        auto second_mesh = first_mesh;
+        if (!same_object) {
+            second_mesh = take(access.add_mesh(separate_mesh));
+            const auto second_object = take(access.create_object("Unrelated normal-mapped object"));
+            take(access.attach_mesh(second_object, second_mesh));
+        }
+        project::MaterialCatalog catalog;
+        render::MaterialAsset anisotropic{1U, "Anisotropic fixture", {}, core::Revision{1U}};
+        render::MaterialAsset normal_mapped{2U, "Normal-mapped fixture", {}, core::Revision{1U}};
+        normal_mapped.definition.normal.asset = normal_texture.asset;
+        normal_mapped.definition.normal.uv_set = 2U;
+        project::TextureSourceRecord source;
+        source.id = normal_texture.asset;
+        source.name = "Normal source fixture";
+        source.relative_locator = "fixtures/normal.tga";
+        source.content_digest = normal_texture.current_source_digest;
+        source.format = assets::TextureSourceFormat::tga;
+        source.width = 1U;
+        source.height = 1U;
+        source.provenance = "Synthetic tangent-scope regression source";
+        take(catalog.insert_texture(source));
+        take(catalog.insert_material(anisotropic));
+        take(catalog.insert_material(normal_mapped));
+        const auto graph = anisotropy_graph_project(1.0).material_catalog()
+            .material_graphs().at("fixture/opacity");
+        take(catalog.insert_material_graph(graph));
+        take(catalog.bind_material_graph(1U, graph.identity));
+        take(catalog.insert_assignment({{first_mesh, 1U}, 1U, {}}));
+        take(catalog.insert_assignment({{second_mesh, same_object ? 2U : 1U}, 2U, {}}));
+        take(document.set_material_catalog(std::move(catalog)));
+        const auto result = d3d12::prepare_project_scene_render(
+            "tangent-scope", document, {}, 97U, 97U, {normal_texture});
+        require(same_object ? (!result && result.error().code == core::ErrorCode::unsupported) :
+                static_cast<bool>(result),
+            "UV1 normal-map conflict is scoped to another material on the same anisotropic object");
+    }
 }
 
 void project_scene_texture_loader_binds_verified_sources_and_fails_closed() {
@@ -4400,6 +4609,95 @@ void sheen_direct_lights_match_reference_and_invalidate_mesh_cache(
         "native sheen receipt discloses the missing environment integration");
 }
 
+void anisotropy_direct_lights_match_reference_and_authored_axes(
+    d3d12::D3D12Device& device) {
+    auto scene = request();
+    scene.width = 97U;
+    scene.height = 97U;
+    scene.antialiasing = d3d12::SceneRenderAntialiasing::none;
+    scene.light = {{0.6, 0.0, 0.8}, {3.0, 3.0, 3.0}};
+    auto& binding = scene.objects.front().materials.front();
+    binding.current_material.definition.base_color_factor = {0.6, 0.4, 0.2, 1.0};
+    binding.current_material.definition.metallic = 1.0;
+    rebind(scene.objects.front());
+    d3d12::SceneRenderCache cache;
+    const auto render_cached = [&](const d3d12::SceneRenderRequest& input) {
+        return take(d3d12::render_scene_cached(device, cache, input, CARTO_D3D12_SHADER_DIR));
+    };
+    const auto isotropic = render_cached(scene);
+    const auto source_digest = scene.source_digest;
+    const auto generic_material_digest = binding.material.artifact_digest;
+    const std::size_t center = (48U * 97U + 48U) * 4U;
+    const std::array<double, 3U> base{0.6, 0.4, 0.2};
+    const double fresnel_power = std::pow(1.0 - std::sqrt(0.9), 5.0);
+    for (const double strength : {-1.0, -0.5, 0.0, 0.5, 1.0}) {
+        binding.anisotropy = strength;
+        const auto image = render_cached(scene);
+        const auto reference = take(d3d12::evaluate_scene_anisotropy_reference(
+            0.65, strength, {0.0, 0.0, 1.0}, {0.6, 0.0, 0.8}));
+        require(image.depth[center / 4U] < 1.0F, "anisotropy reference sample covers actual geometry");
+        for (std::size_t channel = 0U; channel < base.size(); ++channel) {
+            const double fresnel = base[channel] + (1.0 - base[channel]) * fresnel_power;
+            const double expected = 0.03 * base[channel] +
+                fresnel * reference.mixed_kernel * 0.8 * 3.0;
+            require(std::abs(image.linear_hdr_rgba[center + channel] - expected) < 2.0e-4,
+                "native signed anisotropy matches the declared mixed specular kernel");
+        }
+        if (strength == 0.0)
+            require(image.linear_hdr_rgba == isotropic.linear_hdr_rgba,
+                "returning to zero anisotropy restores the exact legacy cached rendering");
+    }
+    const auto positive = render_cached(scene);
+    binding.anisotropy = -1.0;
+    const auto negative = render_cached(scene);
+    const auto fresh = capture(device, scene);
+    require(negative.linear_hdr_rgba == fresh.linear_hdr_rgba && negative.depth == fresh.depth &&
+            std::abs(negative.linear_hdr_rgba[center] - positive.linear_hdr_rgba[center]) > 0.001F &&
+            scene.source_digest == source_digest && binding.material.artifact_digest == generic_material_digest,
+        "anisotropy-only sign changes invalidate uploaded axes without relying on generic artifact changes");
+    auto rotated_frame = scene;
+    rotated_frame.objects.front().materials.front().anisotropy = 1.0;
+    for (auto& vertex : rotated_frame.objects.front().mesh.vertices)
+        vertex.tangent = core::Vec4d{0.0, 1.0, 0.0, 1.0};
+    rebind(rotated_frame.objects.front());
+    const auto rotated = render_cached(rotated_frame);
+    for (std::size_t channel = 0U; channel < base.size(); ++channel)
+        require(std::abs(rotated.linear_hdr_rgba[center + channel] -
+                negative.linear_hdr_rgba[center + channel]) < 2.0e-5,
+            "rotating the authored tangent frame swaps the anisotropic highlight axes");
+
+    auto local = scene;
+    local.light.radiance = {};
+    d3d12::SceneRenderLocalLight light;
+    light.object = {902U};
+    light.position = {3.0, 0.0, 4.0};
+    light.emission_direction = {-0.6, 0.0, -0.8};
+    light.radiance = {3.0, 3.0, 3.0};
+    light.range = 10.0;
+    light.inner_cone_radians = 0.2;
+    light.outer_cone_radians = 0.6;
+    light.casts_shadows = false;
+    const auto reference = take(d3d12::evaluate_scene_anisotropy_reference(
+        0.65, -1.0, {0.0, 0.0, 1.0}, {0.6, 0.0, 0.8}));
+    const double range_attenuation = (1.0 - 0.0625) * (1.0 - 0.0625) / 25.0;
+    for (const auto kind : {d3d12::SceneRenderLocalLightKind::point,
+            d3d12::SceneRenderLocalLightKind::spot}) {
+        light.kind = kind;
+        local.local_lights = {light};
+        const auto image = render_cached(local);
+        for (std::size_t channel = 0U; channel < base.size(); ++channel) {
+            const double fresnel = base[channel] + (1.0 - base[channel]) * fresnel_power;
+            const double expected = 0.03 * base[channel] +
+                fresnel * reference.mixed_kernel * 0.8 * 3.0 * range_attenuation;
+            require(std::abs(image.linear_hdr_rgba[center + channel] - expected) < 2.0e-4,
+                "point and spot paths use the same anisotropic kernel and existing attenuation");
+        }
+    }
+    require(std::any_of(positive.limitations.begin(), positive.limitations.end(),
+            [](const std::string& limitation) { return limitation.find("anisotropic IBL") != std::string::npos; }),
+        "native anisotropy receipts disclose absent environment integration");
+}
+
 void viewport_camera_rebuilds_pan_from_immutable_base_and_resets_home() {
     d3d12::SceneRenderCamera base;
     base.position = {0.0, 0.0, 10.0};
@@ -4579,6 +4877,12 @@ int main(int argc, char** argv) {
             std::cout << "PASS graph sheen reference and source boundaries (no GPU)\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--graph-anisotropy-only") {
+            scene_anisotropy_reference_preserves_axes_and_zero_boundary();
+            project_graph_anisotropy_requires_source_bound_tangents();
+            std::cout << "PASS graph anisotropy reference and tangent boundaries (no GPU)\n";
+            return 0;
+        }
         temporal_sampling_is_deterministic_and_memory_bounded();
         std::cout << "PASS shared temporal sampling bounds and texture budget\n";
         viewport_camera_rebuilds_pan_from_immutable_base_and_resets_home();
@@ -4600,6 +4904,9 @@ int main(int argc, char** argv) {
             scene_sheen_reference_is_bounded_and_reciprocal();
             project_graph_sheen_binds_source_and_refuses_missing_ibl();
             std::cout << "PASS graph sheen reference, source identity and environment refusal\n";
+            scene_anisotropy_reference_preserves_axes_and_zero_boundary();
+            project_graph_anisotropy_requires_source_bound_tangents();
+            std::cout << "PASS graph anisotropy reference, source and tangent boundaries\n";
             authored_project_camera_resolves_world_pose_and_projection();
             std::cout << "PASS authored camera world-pose resolution and projection binding\n";
             project_scene_adapter_wires_supported_authored_lights_and_refuses_fallbacks();
@@ -4648,6 +4955,8 @@ int main(int argc, char** argv) {
         std::cout << "PASS material graph opacity reaches native masked and blended coverage\n";
         sheen_direct_lights_match_reference_and_invalidate_mesh_cache(*device);
         std::cout << "PASS direct sheen reference pixels and mesh-cache invalidation\n";
+        anisotropy_direct_lights_match_reference_and_authored_axes(*device);
+        std::cout << "PASS direct anisotropy reference pixels, axes and cache invalidation\n";
         transformed_normals_match_baked_geometry(*device);
         require(device->debug_receipts().empty() && !device->device_lost(), "complete scene suite preserves clean native device state");
         std::cout << "PASS nonuniform and mirrored normal/tangent GPU parity\n";

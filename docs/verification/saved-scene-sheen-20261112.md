@@ -4,6 +4,10 @@ Date: 2026-11-12. Based on opacity commit `92fc08e` in the isolated
 `codex/saved-scene-opacity-20261112` branch. No shared integration checkout,
 exporter, private repository, build lease, or runtime was changed.
 
+This note records the sheen commit. The later
+[anisotropy candidate](saved-scene-anisotropy-20261112.md) separately expands
+the direct specular path and records its own stricter tangent admission.
+
 ## Capability gained
 
 The saved-document adapter lowers the existing scalar graph `sheen` output

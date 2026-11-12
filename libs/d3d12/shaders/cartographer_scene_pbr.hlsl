@@ -348,6 +348,36 @@ float sheen_charlie_neubelt(float roughness, float n_dot_l, float n_dot_v,
     return distribution * visibility;
 }
 
+// GGX distribution with height-correlated Smith visibility in an orthonormal
+// shading frame. The caller blends this kernel with the unchanged legacy
+// kernel by abs(strength), rather than jumping geometry models near zero.
+float anisotropic_ggx_kernel(float roughness, float strength, float3 normal,
+    float3 tangent, float3 bitangent, float3 view, float3 light)
+{
+    const float n_dot_l = saturate(dot(normal, light));
+    const float n_dot_v = saturate(dot(normal, view));
+    if (n_dot_l <= 0.0 || n_dot_v <= 0.0)
+        return 0.0;
+    const float3 half_vector = normalize_or(view + light, normal);
+    const float alpha = max(0.045, roughness * roughness);
+    const float aspect = sqrt(1.0 - 0.9 * abs(strength));
+    const float2 axes = strength < 0.0
+        ? float2(alpha * aspect, alpha / aspect)
+        : float2(alpha / aspect, alpha * aspect);
+    const float3 local_half = float3(dot(tangent, half_vector),
+        dot(bitangent, half_vector), saturate(dot(normal, half_vector)));
+    const float2 scaled_half = local_half.xy / axes;
+    const float ellipse = dot(scaled_half, scaled_half) + local_half.z * local_half.z;
+    const float distribution = 1.0 /
+        (3.14159265 * axes.x * axes.y * ellipse * ellipse);
+    const float2 scaled_view = axes * float2(dot(tangent, view), dot(bitangent, view));
+    const float2 scaled_light = axes * float2(dot(tangent, light), dot(bitangent, light));
+    const float visibility = 0.5 / max(1.0e-5,
+        n_dot_l * sqrt(dot(scaled_view, scaled_view) + n_dot_v * n_dot_v) +
+        n_dot_v * sqrt(dot(scaled_light, scaled_light) + n_dot_l * n_dot_l));
+    return distribution * visibility;
+}
+
 float4 PSMain(VertexOutput input) : SV_TARGET
 {
     const float3 geometric_normal = normalize_or(input.world_normal, float3(0.0, 0.0, 1.0));
@@ -396,8 +426,20 @@ float4 PSMain(VertexOutput input) : SV_TARGET
         mapped_channel(sampled_metallic_roughness, input.channel_mapping_a.y));
     const float roughness = saturate(input.material_surface_factors.y *
         mapped_channel(sampled_metallic_roughness, input.channel_mapping_a.z));
-    // z is a scene-only lobe factor in the spare channel-mapping payload.
+    // z/w are scene-only factors in the spare channel-mapping payload.
     const float sheen_weight = saturate(input.channel_mapping_c.z) * (1.0 - metallic);
+    const float anisotropy = clamp(input.channel_mapping_c.w, -1.0, 1.0);
+    float3 anisotropic_tangent = tangent;
+    float3 anisotropic_bitangent = bitangent;
+    if (anisotropy != 0.0)
+    {
+        // The anisotropic distribution requires a frame around the final
+        // shading normal, including float normalization effects.
+        anisotropic_tangent = normalize_or(tangent - normal * dot(normal, tangent),
+            fallback_tangent);
+        anisotropic_bitangent = normalize_or(cross(normal, anisotropic_tangent),
+            bitangent) * tangent_sign;
+    }
     const float dielectric_f0 = saturate(emissive_radiance_and_f0.w);
     const float clearcoat = saturate(input.camera_clearcoat.w);
     const float coat_roughness = saturate(clearcoat_roughness);
@@ -412,8 +454,15 @@ float4 PSMain(VertexOutput input) : SV_TARGET
     const float distribution = distribution_ggx(n_dot_h, roughness);
     const float geometry = geometry_schlick_ggx(n_dot_l, roughness) *
         geometry_schlick_ggx(n_dot_v, roughness);
-    const float3 specular = fresnel * distribution * geometry * base_attenuation /
+    float3 specular = fresnel * distribution * geometry * base_attenuation /
         max(4.0 * n_dot_l * n_dot_v, 1e-5);
+    if (anisotropy != 0.0)
+    {
+        const float3 anisotropic_specular = fresnel * base_attenuation *
+            anisotropic_ggx_kernel(roughness, anisotropy, normal,
+                anisotropic_tangent, anisotropic_bitangent, view, light_direction);
+        specular = lerp(specular, anisotropic_specular, abs(anisotropy));
+    }
     const float3 diffuse_weight = (1.0 - fresnel) * (1.0 - metallic);
     const float3 diffuse = diffuse_weight * base_color * base_attenuation / 3.14159265;
     const float clearcoat_distribution = distribution_ggx(n_dot_h, coat_roughness);
@@ -510,9 +559,16 @@ float4 PSMain(VertexOutput input) : SV_TARGET
         const float local_geometry =
             geometry_schlick_ggx(local_n_dot_l, roughness) *
             geometry_schlick_ggx(local_n_dot_v, roughness);
-        const float3 local_specular = local_fresnel * local_distribution *
+        float3 local_specular = local_fresnel * local_distribution *
             local_geometry * local_base_attenuation /
             max(4.0 * local_n_dot_l * local_n_dot_v, 1e-5);
+        if (anisotropy != 0.0)
+        {
+            const float3 anisotropic_specular = local_fresnel * local_base_attenuation *
+                anisotropic_ggx_kernel(roughness, anisotropy, normal,
+                    anisotropic_tangent, anisotropic_bitangent, view, local_light_direction);
+            local_specular = lerp(local_specular, anisotropic_specular, abs(anisotropy));
+        }
         const float3 local_diffuse_weight =
             (1.0 - local_fresnel) * (1.0 - metallic);
         const float3 local_diffuse = local_diffuse_weight * base_color *
