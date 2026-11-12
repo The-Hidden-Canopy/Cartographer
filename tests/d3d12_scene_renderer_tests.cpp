@@ -726,7 +726,7 @@ void project_graph_anisotropy_requires_source_bound_tangents() {
             take(payload.add_layer({{"uv.second", attributes::AttributeDomain::corner,
                 attributes::AttributeType::vec2}, primary_uv_values}));
             auto uv_sets = mesh.uv_sets();
-            take(uv_sets.add({2U, "Second UV", "uv.second", false, true, false, 1U}));
+            take(uv_sets.add({2U, "Second UV", "uv.second", false, false, false, 1U}));
             take(mesh.set_attribute_payload(payload, uv_sets));
             const auto separate_mesh = mesh;
             if (same_object) {
@@ -4705,9 +4705,15 @@ void graph_opacity_reaches_native_coverage(d3d12::D3D12Device& device) {
             opacity_graph_project(0.5, 1.0, mode)));
         const std::size_t center = (48U * 96U + 48U) * 4U;
         if (mode == render::AlphaMode::opaque) {
-            require(actual.depth[center / 4U] < 1.0F &&
-                    actual.linear_hdr_rgba == full_opacity.linear_hdr_rgba,
-                "authored opaque policy remains opaque rather than inferring a blend mode");
+            require(actual.depth[center / 4U] < 1.0F && actual.depth == full_opacity.depth,
+                "authored opaque policy retains full depth coverage");
+            // Opaque blending ignores alpha for coverage, but the HDR target
+            // still records authored alpha. Compare RGB, not that payload.
+            for (std::size_t pixel = 0; pixel < actual.linear_hdr_rgba.size(); pixel += 4U)
+                for (std::size_t channel = 0; channel < 3U; ++channel)
+                    require(actual.linear_hdr_rgba[pixel + channel] ==
+                            full_opacity.linear_hdr_rgba[pixel + channel],
+                        "opaque alpha does not blend or attenuate native RGB");
         } else if (mode == render::AlphaMode::masked) {
             require(actual.depth[center / 4U] == 1.0F &&
                     full_opacity.depth[center / 4U] < 1.0F,
@@ -4754,7 +4760,8 @@ void sheen_direct_lights_match_reference_and_invalidate_mesh_cache(
     for (std::size_t channel = 0U; channel < base.size(); ++channel) {
         const double expected = base[channel] * (0.03 + reference.sheen_brdf * 0.8 * 3.0);
         require(std::abs(full.linear_hdr_rgba[center + channel] - expected) < 2.0e-4,
-            "native directional sheen matches the CPU direct BRDF plus declared ambient");
+            "native directional sheen matches the CPU direct BRDF plus declared ambient: actual=" +
+                std::to_string(full.linear_hdr_rgba[center + channel]) + " expected=" + std::to_string(expected));
     }
     binding.sheen_weight = 0.5;
     const auto half = render_cached(scene);
@@ -4779,6 +4786,8 @@ void sheen_direct_lights_match_reference_and_invalidate_mesh_cache(
     for (const auto kind : {d3d12::SceneRenderLocalLightKind::point,
             d3d12::SceneRenderLocalLightKind::spot}) {
         light.kind = kind;
+        light.inner_cone_radians = kind == d3d12::SceneRenderLocalLightKind::spot ? 0.2 : 0.0;
+        light.outer_cone_radians = kind == d3d12::SceneRenderLocalLightKind::spot ? 0.6 : 0.0;
         local.local_lights = {light};
         const auto image = render_cached(local);
         const double range_attenuation = (1.0 - 0.0625) * (1.0 - 0.0625) / 25.0;
@@ -4902,6 +4911,8 @@ void anisotropy_direct_lights_match_reference_and_authored_axes(
     for (const auto kind : {d3d12::SceneRenderLocalLightKind::point,
             d3d12::SceneRenderLocalLightKind::spot}) {
         light.kind = kind;
+        light.inner_cone_radians = kind == d3d12::SceneRenderLocalLightKind::spot ? 0.2 : 0.0;
+        light.outer_cone_radians = kind == d3d12::SceneRenderLocalLightKind::spot ? 0.6 : 0.0;
         local.local_lights = {light};
         const auto image = render_cached(local);
         for (std::size_t channel = 0U; channel < base.size(); ++channel) {
@@ -5043,6 +5054,8 @@ void anisotropic_normal_maps_match_transported_reference_and_cache(
     light.outer_cone_radians = 0.6;
     for (const auto kind : {d3d12::SceneRenderLocalLightKind::point, d3d12::SceneRenderLocalLightKind::spot}) {
         light.kind = kind;
+        light.inner_cone_radians = kind == d3d12::SceneRenderLocalLightKind::spot ? 0.2 : 0.0;
+        light.outer_cone_radians = kind == d3d12::SceneRenderLocalLightKind::spot ? 0.6 : 0.0;
         scene.local_lights = {light};
         for (const double strength : {-1.0, 1.0}) {
             binding.anisotropy = strength;
@@ -5241,6 +5254,26 @@ int main(int argc, char** argv) {
             scene_anisotropy_frame_transport_preserves_orientation();
             project_graph_anisotropic_normal_maps_preserve_source_boundaries();
             std::cout << "PASS graph anisotropy reference and tangent boundaries (no GPU)\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--material-gpu-only") {
+            auto device = take(d3d12::D3D12Device::create({{}, false, true}));
+            graph_occlusion_values_reach_native_pixels(*device);
+            std::cout << "PASS focused graph occlusion pixels\n";
+            graph_opacity_reaches_native_coverage(*device);
+            std::cout << "PASS focused graph opacity pixels\n";
+            sheen_direct_lights_match_reference_and_invalidate_mesh_cache(*device);
+            std::cout << "PASS focused sheen reference pixels and cache invalidation\n";
+            anisotropy_direct_lights_match_reference_and_authored_axes(*device);
+            std::cout << "PASS focused anisotropy reference pixels and cache invalidation\n";
+            anisotropic_normal_maps_match_transported_reference_and_cache(*device);
+            std::cout << "PASS focused anisotropic-normal pixels and cache invalidation\n";
+            local_point_spot_lights_reach_native_pixels(*device);
+            std::cout << "PASS focused local-light pixels and occluded spotlight receiver\n";
+            transformed_normals_match_baked_geometry(*device);
+            std::cout << "PASS focused transformed normal and tangent parity\n";
+            require(device->debug_receipts().empty() && !device->device_lost(),
+                "focused material checks preserve a clean native device");
             return 0;
         }
         temporal_sampling_is_deterministic_and_memory_bounded();

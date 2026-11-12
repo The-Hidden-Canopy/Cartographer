@@ -162,7 +162,28 @@ float3 fresnel_schlick(float cos_theta, float3 f0)
     return f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
 }
 
-float shadow_visibility(float4 light_position, float3 normal, float3 light_direction)
+// Compute outside light/visibility branches so pixel-quad derivatives remain
+// defined. Depth is compared on the receiver plane at each PCF sample center,
+// not at the center receiver depth for all nine taps.
+float2 shadow_receiver_gradient(float4 light_position)
+{
+    const float3 projected = light_position.xyz / max(light_position.w, 1e-5);
+    const float3 uv_depth = float3(projected.x * 0.5 + 0.5,
+        0.5 - projected.y * 0.5, projected.z);
+    const float3 dx = ddx(uv_depth);
+    const float3 dy = ddy(uv_depth);
+    const float determinant = dx.x * dy.y - dx.y * dy.x;
+    const float scale = max(abs(dx.x * dy.y), abs(dx.y * dy.x));
+    if (!all(isfinite(dx)) || !all(isfinite(dy)) || !isfinite(determinant) ||
+        abs(determinant) <= max(1e-20, 1e-6 * scale))
+        return float2(0.0, 0.0);
+    const float2 gradient = float2(dx.z * dy.y - dy.z * dx.y,
+        dx.x * dy.z - dy.x * dx.z) / determinant;
+    return all(isfinite(gradient)) ? gradient : float2(0.0, 0.0);
+}
+
+float shadow_visibility(float4 light_position, float3 normal, float3 light_direction,
+    float2 receiver_gradient)
 {
     if (!all(isfinite(light_position)) || light_position.w <= 1e-5)
         return 1.0;
@@ -197,7 +218,9 @@ float shadow_visibility(float4 light_position, float3 normal, float3 light_direc
                 continue;
             }
             const float closest = shadow_depth_texture.Load(int3(pixel, 0)).r;
-            visibility += projected.z - bias <= closest ? 1.0 : 0.0;
+            const float2 sample_uv = (float2(pixel) + 0.5) / float2(width, height);
+            const float receiver_depth = projected.z + dot(receiver_gradient, sample_uv - uv);
+            visibility += receiver_depth - bias <= closest ? 1.0 : 0.0;
         }
     }
     return visibility / 9.0;
@@ -406,6 +429,7 @@ float3 transport_anisotropy_tangent(float3 geometric_normal, float3 tangent,
 
 float4 PSMain(VertexOutput input) : SV_TARGET
 {
+    const float2 receiver_gradient = shadow_receiver_gradient(input.light_position);
     const float3 geometric_normal = normalize_or(input.world_normal, float3(0.0, 0.0, 1.0));
     const float3 tangent_axis = abs(geometric_normal.z) < 0.999
         ? float3(0.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0);
@@ -496,7 +520,7 @@ float4 PSMain(VertexOutput input) : SV_TARGET
     const float3 clearcoat_specular = clearcoat * clearcoat_fresnel *
         clearcoat_distribution * clearcoat_geometry /
         max(4.0 * n_dot_l * n_dot_v, 1e-5);
-    const float shadow = shadow_visibility(input.light_position, normal, light_direction);
+    const float shadow = shadow_visibility(input.light_position, normal, light_direction, receiver_gradient);
     const bool has_occlusion_map = input.material_flags.x > 0.5;
     const float occlusion_parameter = input.material_surface_factors.w;
     const float occlusion = has_occlusion_map
@@ -557,7 +581,7 @@ float4 PSMain(VertexOutput input) : SV_TARGET
 
         const float local_shadow = outer_cone.y > 0.5
             ? shadow_visibility(
-                input.light_position, normal, local_light_direction)
+                input.light_position, normal, local_light_direction, receiver_gradient)
             : 1.0;
 
         const float range_ratio = distance_to_light / position_range.w;

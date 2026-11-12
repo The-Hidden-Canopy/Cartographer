@@ -1096,6 +1096,17 @@ if(CARTO_ENABLE_D3D12)
         CARTO_D3D12_SHADER_DIR="${PROJECT_SOURCE_DIR}/libs/d3d12/shaders")
     carto_target(cartographer_d3d12_scene_renderer_tests)
     add_test(NAME cartographer_d3d12_scene_renderer_tests COMMAND cartographer_d3d12_scene_renderer_tests)
+    # Focused material gates remain separate from full scene acceptance.
+    add_test(NAME cartographer_d3d12_material_opacity_tests
+        COMMAND cartographer_d3d12_scene_renderer_tests --graph-opacity-only)
+    add_test(NAME cartographer_d3d12_material_sheen_tests
+        COMMAND cartographer_d3d12_scene_renderer_tests --graph-sheen-only)
+    add_test(NAME cartographer_d3d12_material_anisotropy_tests
+        COMMAND cartographer_d3d12_scene_renderer_tests --graph-anisotropy-only)
+    add_test(NAME cartographer_d3d12_material_gpu_tests
+        COMMAND cartographer_d3d12_scene_renderer_tests --material-gpu-only)
+    set_tests_properties(cartographer_d3d12_material_gpu_tests PROPERTIES RUN_SERIAL TRUE)
+
     if(TARGET cartographer_scene_render)
         add_test(NAME cartographer_scene_render_cli_tests COMMAND "${CMAKE_COMMAND}"
             "-DFIXTURE=$<TARGET_FILE:cartographer_d3d12_scene_renderer_tests>"
