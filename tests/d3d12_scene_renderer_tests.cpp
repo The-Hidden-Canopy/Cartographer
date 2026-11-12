@@ -369,13 +369,85 @@ void project_graph_opacity_preserves_coverage_policy_and_source() {
         auto unsupported_catalog = document.material_catalog();
         auto unsupported_graph = unsupported_catalog.material_graphs().at("fixture/opacity");
         unsupported_graph.revision = unsupported_graph.revision.next();
-        unsupported_graph.outputs.*output = 4U;
+        unsupported_graph.outputs.*output = 5U;
         take(unsupported_catalog.replace_material_graph(unsupported_graph));
         take(unsupported_catalog.bind_material_graph(1U, unsupported_graph.identity));
         take(document.set_material_catalog(std::move(unsupported_catalog)));
         const auto refused = prepare(document);
         require(!refused && refused.error().code == core::ErrorCode::unsupported,
             "opacity never silently substitutes for unsupported physical material outputs");
+    }
+}
+
+void project_graph_neutral_physical_outputs_preserve_source() {
+    using OutputMember = std::uint64_t project::MaterialGraphOutputs::*;
+    const auto prepare = [](const project::ProjectDocument& document) {
+        return d3d12::prepare_project_scene_render(
+            "graph-neutral-physical", document, {}, 96U, 96U);
+    };
+    for (const OutputMember output : {&project::MaterialGraphOutputs::transmission,
+            &project::MaterialGraphOutputs::subsurface,
+            &project::MaterialGraphOutputs::displacement}) {
+        for (const double value : {0.0, -0.0, 0.5, -0.5, 1.0e-100}) {
+            auto document = opacity_graph_project(1.0, 1.0, render::AlphaMode::opaque);
+            const auto baseline = take(prepare(document));
+            auto catalog = document.material_catalog();
+            auto graph = catalog.material_graphs().at("fixture/opacity");
+            graph.revision = graph.revision.next();
+            project::MaterialGraphNode physical;
+            physical.id = 6U;
+            physical.constants[0U] = value;
+            graph.nodes.push_back(physical);
+            graph.outputs.*output = physical.id;
+            take(catalog.replace_material_graph(graph));
+            take(catalog.bind_material_graph(1U, graph.identity));
+            take(document.set_material_catalog(catalog));
+            const auto before = document.serialize();
+            const auto result = prepare(document);
+            require(document.serialize() == before, "physical output admission never edits authored graphs");
+            if (value != 0.0) {
+                require(!result && result.error().code == core::ErrorCode::unsupported,
+                    "even sub-float32 nonzero physical effects require real implementation");
+                continue;
+            }
+            const auto& prepared = take(result);
+            require(take(prepared.digest()) != take(baseline.digest()),
+                "neutral explicit physical outputs retain their own graph provenance");
+            const auto reopened = take(project::ProjectDocument::deserialize(before));
+            require(take(take(prepare(reopened)).digest()) == take(prepared.digest()),
+                "neutral physical output identities survive exact saved-project replay");
+            require(prepared.objects.front().materials.front().current_material.definition
+                    .base_color_factor.w == 1.0,
+                "zero transmission is not substituted with transparency");
+
+            // A durable zero-valued parameter is admissible, but a transient
+            // nonzero override must still refuse even after that preparation.
+            graph.revision = graph.revision.next();
+            graph.nodes.back().kind = project::MaterialGraphNodeKind::parameter_scalar;
+            graph.nodes.back().constants = {};
+            graph.nodes.back().parameter_name = "physical";
+            take(catalog.replace_material_graph(graph));
+            take(catalog.bind_material_graph(1U, graph.identity));
+            take(document.set_material_catalog(catalog));
+            require(!prepare(document), "missing neutral parameters cannot be invented as zero");
+            project::MaterialGraphEvaluationInputs inputs;
+            project::MaterialGraphValue input;
+            input.components[0U] = 0.0;
+            inputs.parameters.emplace("physical", input);
+            const auto digest = take(graph.canonical_digest());
+            take(catalog.set_material_graph_inputs(1U, graph.identity, graph.revision, digest, inputs));
+            take(document.set_material_catalog(catalog));
+            take(prepare(document));
+            inputs.parameters.at("physical").components[0U] = 1.0e-100;
+            d3d12::SceneRenderMaterialGraphInputs override_inputs;
+            override_inputs.emplace(graph.identity,
+                d3d12::SceneRenderMaterialGraphInputBinding{graph.revision, digest, inputs});
+            const auto changed = d3d12::prepare_project_scene_render(
+                "graph-neutral-physical", document, {}, 96U, 96U, {},
+                {{0.3, 0.7, 1.0}, {3.0, 3.0, 3.0}}, override_inputs);
+            require(!changed && changed.error().code == core::ErrorCode::unsupported,
+                "nonzero transient physical output cannot reuse neutral admission");
+        }
     }
 }
 
@@ -5156,6 +5228,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--graph-sheen-only") {
+            project_graph_neutral_physical_outputs_preserve_source();
+            std::cout << "PASS exact-neutral physical outputs and nonzero refusal\n";
             scene_sheen_reference_is_bounded_and_reciprocal();
             project_graph_sheen_binds_source_and_refuses_missing_ibl();
             std::cout << "PASS graph sheen reference and source boundaries (no GPU)\n";
@@ -5187,6 +5261,8 @@ int main(int argc, char** argv) {
             std::cout << "PASS saved-project scene preparation, immutable source and reopen identity\n";
             project_graph_opacity_preserves_coverage_policy_and_source();
             std::cout << "PASS graph opacity composition, authored alpha policy and source pinning\n";
+            project_graph_neutral_physical_outputs_preserve_source();
+            std::cout << "PASS exact-neutral physical outputs and nonzero refusal\n";
             scene_sheen_reference_is_bounded_and_reciprocal();
             project_graph_sheen_binds_source_and_refuses_missing_ibl();
             std::cout << "PASS graph sheen reference, source identity and environment refusal\n";

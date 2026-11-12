@@ -95,11 +95,27 @@ core::Result<void> apply_evaluated_material_graph(
     render::StandardMaterial& material,
     double& sheen_weight, double& anisotropy) {
     const auto& outputs = graph.outputs;
-    if (outputs.normal != 0U || outputs.transmission != 0U ||
-        outputs.subsurface != 0U || outputs.displacement != 0U) {
+    if (outputs.normal != 0U) {
         return core::Result<void>::failure({core::ErrorCode::unsupported,
-            "native scene rendering cannot lower normal, transmission, subsurface, "
-            "or displacement material graph outputs"});
+            "native scene rendering cannot lower normal material graph outputs"});
+    }
+    // A fully populated PBR graph may explicitly disable an unavailable lobe.
+    // Admit exactly neutral evaluated values, never a tolerance or a clamp:
+    // even tiny nonzero displacement or transmission needs real execution.
+    // Graph and input digests still bind these outputs below.
+    for (const auto id : {outputs.transmission, outputs.subsurface,
+            outputs.displacement}) {
+        if (id == 0U) continue;
+        const double value = evaluation.node_values.at(id).components[0U];
+        if (!std::isfinite(value)) {
+            return core::Result<void>::failure({core::ErrorCode::validation_failed,
+                "native scene material graph physical outputs must be finite"});
+        }
+        if (value != 0.0) {
+            return core::Result<void>::failure({core::ErrorCode::unsupported,
+                "native scene rendering cannot lower nonzero transmission, "
+                "subsurface, or displacement material graph outputs"});
+        }
     }
 
     const auto& base_color = evaluation.node_values.at(outputs.base_color);
