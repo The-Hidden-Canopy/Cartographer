@@ -204,6 +204,20 @@ if(CARTO_BUILD_D3D12_DESKTOP)
     add_subdirectory(apps/d3d12_desktop)
 endif()
 
+# Explicit opt-in: a private linked-scene provider is never fetched or assumed.
+# The directory's provider.cmake must define carto_linked_scene_provider, which
+# exposes <carto/linked_scene_provider_factory.hpp>.
+set(CARTO_LINKED_SCENE_PROVIDER_ROOT "" CACHE PATH "Private linked-scene provider directory")
+if(CARTO_LINKED_SCENE_PROVIDER_ROOT)
+    if(NOT EXISTS "${CARTO_LINKED_SCENE_PROVIDER_ROOT}/provider.cmake")
+        message(FATAL_ERROR "CARTO_LINKED_SCENE_PROVIDER_ROOT must contain provider.cmake")
+    endif()
+    include("${CARTO_LINKED_SCENE_PROVIDER_ROOT}/provider.cmake")
+    if(NOT TARGET carto_linked_scene_provider)
+        message(FATAL_ERROR "provider.cmake must define the carto_linked_scene_provider target")
+    endif()
+endif()
+
 if(CARTO_BUILD_DESKTOP)
     if(NOT WIN32)
         message(FATAL_ERROR "CARTO_BUILD_DESKTOP=ON requires the Windows platform")

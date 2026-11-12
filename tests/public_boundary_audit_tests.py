@@ -500,6 +500,35 @@ class PublicBoundaryAuditTests(unittest.TestCase):
                 "private out-of-tree integration build reference", history.stdout
             )
 
+    def test_private_provider_root_may_only_supply_provider_cmake(self) -> None:
+        with self.make_repo() as temporary:
+            repo = Path(temporary)
+            path = repo / "CMakeLists.txt"
+            root = "${CARTO_EXAMPLE_" + "PROVIDER_ROOT}"
+            path.write_text(f'include("{root}/provider.cmake")\n', encoding="utf-8")
+            allowed = audit(repo)
+            self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
+
+            path.write_text(f'add_library(example STATIC "{root}/private_source.cpp")\n',
+                encoding="utf-8")
+            current = audit(repo)
+            self.assertEqual(current.returncode, 1, current.stdout + current.stderr)
+            self.assertIn(
+                "current file CMakeLists.txt: private out-of-tree integration build reference",
+                current.stdout,
+            )
+
+            git(repo, "add", "CMakeLists.txt")
+            git(repo, "commit", "-q", "-m", "private provider source fixture")
+            path.write_text(f'include("{root}/provider.cmake")\n', encoding="utf-8")
+            git(repo, "add", "CMakeLists.txt")
+            git(repo, "commit", "-q", "-m", "use the generic provider fragment")
+            history = audit(repo, "--ref", "HEAD")
+            self.assertEqual(history.returncode, 1, history.stdout + history.stderr)
+            self.assertIn(
+                "private out-of-tree integration build reference", history.stdout
+            )
+
     def test_private_adaptive_representation_paths_fail_current_staged_and_history(self) -> None:
         with self.make_repo() as temporary:
             repo = Path(temporary)
@@ -1125,7 +1154,7 @@ class PublicBoundaryAuditTests(unittest.TestCase):
     def test_deleted_workstation_path_is_caught_in_history(self) -> None:
         with self.make_repo() as temporary:
             repo = Path(temporary)
-            leaked_path = "C:" + r"\Users\envyn\private-cache"
+            leaked_path = "C:" + r"\Users\example-user\private-cache"
             notes = repo / "notes.md"
             notes.write_text(f"cache: {leaked_path}\n", encoding="utf-8")
             git(repo, "add", "notes.md")

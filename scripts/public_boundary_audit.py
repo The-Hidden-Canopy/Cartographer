@@ -231,7 +231,8 @@ HISTORY_CONTENT_MARKER_PATTERN = re.compile(
     r"private_extensions\.cmake|"
     r"libs[/\\](?:anatomy|owh|gmib|simulation)[/\\]|"
     r"carto_(?:anatomy|owh|gmib)|"
-    r"cartographer_(?:anatomy_catalog|owh_model)_tests",
+    r"cartographer_(?:anatomy_catalog|owh_model)_tests|"
+    r"PROVIDER[A-Z0-9_]*_ROOT\}[/\\]",
     re.IGNORECASE,
 )
 HISTORY_CONTENT_PATTERN = (
@@ -268,7 +269,10 @@ PRIVATE_INTEGRATION_CMAKE_REFERENCE_PATTERN = re.compile(
     r"\bCARTO_BUILD_GMIB_(?:GRAPHICS|GAME)\b|\bCARTO_GMIB_ROOT\b|"
     r"private_extensions\.cmake|libs[/\\](?:anatomy|owh|gmib|simulation)[/\\]|"
     r"\bcarto_(?:anatomy|owh|gmib)\b|"
-    r"\bcartographer_(?:anatomy_catalog|owh_model)_tests\b)",
+    r"\bcartographer_(?:anatomy_catalog|owh_model)_tests\b|"
+    # A private provider root may only supply its generic provider.cmake;
+    # public CMake never names the private sources behind it.
+    r"\$\{CARTO_[A-Z0-9_]*PROVIDER[A-Z0-9_]*_ROOT\}[/\\](?!provider\.cmake\b))",
     re.IGNORECASE,
 )
 PRIVATE_BUILD_FILE_SUFFIXES = frozenset({
