@@ -4614,7 +4614,6 @@ core::Result<DispatchReceipt> ApplicationSession::open_project(const OpenProject
             opened_condition_link_companions_ = false;
             linked_scene_identity_.reset();
             linked_viewport_.reset();
-    linked_viewport_.reset();
             journal_ = std::move(prepared_journal.value().journal);
             reset_editor_state();
             saved_revision_ = document_.revision();
@@ -13710,23 +13709,33 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
         }
     }
     if (!result.viewport.error.has_value() && linked_viewport_) {
+        // A linked part that can no longer be shown is reported and skipped.
+        // The rest of the project and the other linked parts stay visible.
         for (const auto& part : linked_viewport_->parts) {
+            const std::string part_label =
+                "linked part for scene object " + std::to_string(part.scene_object);
+            if (!part.mesh) {
+                append_problem(core::Diagnostic(core::ErrorCode::invalid_argument,
+                    part_label + " has no compiled mesh"));
+                continue;
+            }
             const auto* object = document_.scene().find(scene::ObjectId{part.scene_object});
             if (object == nullptr || object->mesh_asset.has_value()) {
-                result.viewport.error = core::Diagnostic(core::ErrorCode::stale_data,
-                    "linked part no longer matches its scene placement");
-                break;
+                append_problem(core::Diagnostic(core::ErrorCode::stale_data,
+                    part_label + " no longer matches its scene placement; "
+                    "reopen the linked scene to refresh it"));
+                continue;
             }
             if (!object->visible) continue;
             const auto world = document_.scene().world_transform(object->id);
             if (!world) {
-                result.viewport.error = world.error().with_context("linked part transform");
-                break;
+                append_problem(world.error().with_context(part_label + " transform"));
+                continue;
             }
             if (auto inserted = viewport_scene.upsert({object->id, part.mesh, world.value(),
                     part.mesh->source_revision, std::nullopt}); !inserted) {
-                result.viewport.error = inserted.error().with_context("linked viewport snapshot");
-                break;
+                append_problem(inserted.error().with_context(part_label));
+                continue;
             }
         }
     }

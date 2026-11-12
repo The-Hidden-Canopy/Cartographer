@@ -323,6 +323,32 @@ void viewport_transform_snap_policy_is_shared_and_source_bound() {
     REQUIRE(default_alignment && default_alignment.value().candidate.has_value());
     REQUIRE(default_alignment.value().candidate->object == slightly_misaligned_object);
 
+    // Front hides Z: a vertex aligned in X/Y but deeper in Z is a visible
+    // target. Plan and perspective still require Z alignment.
+    core::Transform deeper_transform;
+    deeper_transform.translation = {1.2, 0.0, 0.3};
+    const scene::ObjectId deeper_object{34U};
+    render::RenderScene deeper_scene;
+    REQUIRE(deeper_scene.upsert({deeper_object, compiled, deeper_transform,
+        compiled->source_revision, 11U}));
+    core::Transform front_preview;
+    front_preview.translation = {1.15, 0.0, 0.0};
+    editor::SnapSession front_session;
+    const auto front = editor::snap_viewport_transform_preview(
+        front_preview, editor::ViewportTranslateAxis::world_x, deeper_scene, revision,
+        false, true, front_session, std::nullopt, 0.05, editor::SnapHiddenAxis::z);
+    REQUIRE(front && front.value().candidate.has_value() &&
+        front.value().candidate->object == deeper_object);
+    REQUIRE(std::abs(front.value().transform.translation.x - 1.2) < 1e-12);
+    REQUIRE(front.value().transform.translation.z == 0.0);
+    for (const auto hidden : {editor::SnapHiddenAxis::y, editor::SnapHiddenAxis::none}) {
+        editor::SnapSession depth_session;
+        const auto depth_checked = editor::snap_viewport_transform_preview(
+            front_preview, editor::ViewportTranslateAxis::world_x, deeper_scene, revision,
+            false, true, depth_session, std::nullopt, 0.05, hidden);
+        REQUIRE(depth_checked && !depth_checked.value().candidate.has_value());
+    }
+
     editor::SnapSession invalid_tolerance_session;
     const auto nonfinite_tolerance = editor::snap_viewport_transform_preview(
         preview, editor::ViewportTranslateAxis::world_x, scene, revision,
@@ -413,16 +439,19 @@ void y_translation_and_spatial_snapping_preserve_unchanged_axes() {
         auto elevated = target;
         elevated.translation.y = 20.0;
         const auto spatial = editor::snap_viewport_transform_preview(elevated,
-            axis, scene, revision, false, true, snap, std::nullopt, 0.05, true);
+            axis, scene, revision, false, true, snap, std::nullopt, 0.05,
+            editor::SnapHiddenAxis::none);
         REQUIRE(spatial && !spatial.value().candidate);
         // Nearby but off-axis candidates must also fail alignment, not just distance.
         elevated.translation.y = 4.2;
         const auto off_axis = editor::snap_viewport_transform_preview(elevated,
-            axis, scene, revision, false, true, snap, std::nullopt, 0.05, true);
+            axis, scene, revision, false, true, snap, std::nullopt, 0.05,
+            editor::SnapHiddenAxis::none);
         REQUIRE(off_axis && !off_axis.value().candidate);
         elevated.translation.y = 4.0;
         const auto aligned = editor::snap_viewport_transform_preview(elevated,
-            axis, scene, revision, false, true, snap, std::nullopt, 0.05, true);
+            axis, scene, revision, false, true, snap, std::nullopt, 0.05,
+            editor::SnapHiddenAxis::none);
         REQUIRE(aligned && aligned.value().candidate);
         snap.reset();
     }

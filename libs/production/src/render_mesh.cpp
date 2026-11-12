@@ -1392,18 +1392,12 @@ core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
                 }
                 triangle_uvs[corner] = uv->second;
             }
-            const core::Vec2d uv_one{
-                triangle_uvs[1].x - triangle_uvs[0].x,
-                triangle_uvs[1].y - triangle_uvs[0].y};
-            const core::Vec2d uv_two{
-                triangle_uvs[2].x - triangle_uvs[0].x,
-                triangle_uvs[2].y - triangle_uvs[0].y};
-            const double determinant = uv_one.x * uv_two.y - uv_one.y * uv_two.x;
-            if (!std::isfinite(determinant) || std::abs(determinant) <= 1e-12) {
-                return core::Result<RenderMeshArtifact>::failure(validation(
-                    "tangent generation rejects degenerate UV triangles"));
+            const auto determinant = render::tangent_uv_determinant(
+                triangle_uvs[0], triangle_uvs[1], triangle_uvs[2]);
+            if (!determinant) {
+                return core::Result<RenderMeshArtifact>::failure(determinant.error());
             }
-            const bool mirrored = determinant < 0.0;
+            const bool mirrored = determinant.value() < 0.0;
             for (std::size_t corner = 0U; corner < 3U; ++corner) {
                 const std::uint32_t source_index = compiled.indices[triangle * 3U + corner];
                 const geometry::VertexId source_vertex = compiled.vertex_ids[source_index];

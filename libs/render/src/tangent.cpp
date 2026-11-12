@@ -20,6 +20,19 @@ core::Result<std::vector<core::Vec4d>> validation(std::string message) {
 
 } // namespace
 
+core::Result<double> tangent_uv_determinant(
+    core::Vec2d a, core::Vec2d b, core::Vec2d c) {
+    const core::Vec2d uv_one{b.x - a.x, b.y - a.y};
+    const core::Vec2d uv_two{c.x - a.x, c.y - a.y};
+    const double determinant = uv_one.x * uv_two.y - uv_one.y * uv_two.x;
+    if (!std::isfinite(determinant) || std::abs(determinant) <= 1e-12) {
+        return core::Result<double>::failure(core::Diagnostic(
+            core::ErrorCode::validation_failed,
+            "tangent generation rejects degenerate UV triangles"));
+    }
+    return core::Result<double>::success(determinant);
+}
+
 core::Result<std::vector<core::Vec4d>> generate_tangents(
     std::span<const TangentVertex> vertices,
     std::span<const std::uint32_t> indices) {
@@ -52,11 +65,11 @@ core::Result<std::vector<core::Vec4d>> generate_tangents(
         const core::Vec3d edge_two = c.position - a.position;
         const core::Vec2d uv_one{b.uv.x - a.uv.x, b.uv.y - a.uv.y};
         const core::Vec2d uv_two{c.uv.x - a.uv.x, c.uv.y - a.uv.y};
-        const double determinant = uv_one.x * uv_two.y - uv_one.y * uv_two.x;
-        if (!std::isfinite(determinant) || std::abs(determinant) <= 1e-12) {
-            return validation("tangent generation rejects degenerate UV triangles");
+        const auto determinant = tangent_uv_determinant(a.uv, b.uv, c.uv);
+        if (!determinant) {
+            return core::Result<std::vector<core::Vec4d>>::failure(determinant.error());
         }
-        const double reciprocal = 1.0 / determinant;
+        const double reciprocal = 1.0 / determinant.value();
         const core::Vec3d tangent =
             (edge_one * uv_two.y - edge_two * uv_one.y) * reciprocal;
         const core::Vec3d bitangent =

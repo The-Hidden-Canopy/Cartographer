@@ -299,6 +299,41 @@ void region_limit_pressure(const std::filesystem::path& root) {
     }
 }
 
+void edge_sharp_marks_export_as_source_only(const std::filesystem::path& root) {
+    const auto marked = [](attributes::AttributeType type) {
+        auto mesh = fixture(true, false);
+        auto payload = mesh.attributes();
+        okay(payload.set_domain_count(attributes::AttributeDomain::edge, mesh.edge_count()));
+        std::vector<attributes::AttributeValue> values;
+        for (std::size_t index = 0U; index < mesh.edge_count(); ++index) {
+            if (type == attributes::AttributeType::boolean) values.emplace_back(index == 0U);
+            else values.emplace_back(static_cast<std::uint32_t>(index == 0U));
+        }
+        okay(payload.add_layer({{"cartographer.edge_sharp", attributes::AttributeDomain::edge,
+                                 type}, std::move(values)}));
+        okay(mesh.set_attribute_payload(std::move(payload), mesh.uv_sets()));
+        return mesh;
+    };
+    auto baseline = make_scene(fixture(true, false), root / "unmarked");
+    auto scene = make_scene(marked(attributes::AttributeType::boolean), root / "marked");
+    const auto unmarked_path = root / "unmarked.gltf";
+    const auto marked_path = root / "marked.gltf";
+    const auto unmarked_report = take(io::export_gltf(baseline.doc, unmarked_path));
+    const auto report = take(io::export_gltf(scene.doc, marked_path));
+    check(std::any_of(report.warnings.begin(), report.warnings.end(), [](const auto& warning) {
+              return warning.find("Edge sharp marks") != std::string::npos;
+          }) && std::none_of(unmarked_report.warnings.begin(), unmarked_report.warnings.end(),
+              [](const auto& warning) { return warning.find("Edge sharp marks") != std::string::npos; }),
+          "editor edge sharp marks export with a source-only warning");
+    check(report.vertices == unmarked_report.vertices &&
+              report.triangles == unmarked_report.triangles,
+          "edge sharp marks do not change exported geometry");
+    auto malformed = make_scene(marked(attributes::AttributeType::uint32), root / "malformed");
+    const auto malformed_path = root / "malformed.gltf";
+    check(!io::export_gltf(malformed.doc, malformed_path) && !std::filesystem::exists(malformed_path),
+          "a non-boolean edge sharp layer is still refused");
+}
+
 void polygon_region_export(const std::filesystem::path& root) {
     geometry::EditableMesh mesh;
     okay(mesh.insert_bulk({{{1}, {0, 0, 0}}, {{2}, {1, 0, 0}}, {{3}, {1, 1, 0}},
@@ -724,6 +759,11 @@ int main(int argc, char** argv) {
         std::filesystem::create_directory(position_projection_root);
         gltf_float32_position_projection_preserves_fidelity(position_projection_root);
         vanta_metadata_export(root);
+        const auto edge_sharp_root = root / "edge-sharp";
+        std::filesystem::create_directories(edge_sharp_root / "unmarked");
+        std::filesystem::create_directories(edge_sharp_root / "marked");
+        std::filesystem::create_directories(edge_sharp_root / "malformed");
+        edge_sharp_marks_export_as_source_only(edge_sharp_root);
         const auto scalar_root = root / "constant-material";
         std::filesystem::create_directory(scalar_root);
         constant_material_export_roundtrip(scalar_root);

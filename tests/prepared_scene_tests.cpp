@@ -957,6 +957,71 @@ void extension_bindings_are_digest_bound_and_fail_closed() {
 
 } // namespace
 
+void linked_parts_from_different_authorities_never_share_ids() {
+    using namespace carto;
+    const Fixture parent = make_fixture();
+    const Fixture linked = make_fixture(workshop_world_model());
+    require(linked.render_mesh.source_digest != parent.render_mesh.source_digest,
+        "linked fixture is a separate source authority");
+    render::MaterialAsset material = linked.document.material_catalog().materials().at(71U);
+    for (auto* binding : {&material.definition.base_color, &material.definition.metallic_roughness,
+             &material.definition.normal, &material.definition.occlusion,
+             &material.definition.emissive}) {
+        binding->asset = 0U;
+        binding->sampler = 0U;
+    }
+    const auto with_placements = [&parent]() {
+        auto scene = compose(parent);
+        std::uint64_t next = 1U;
+        for (const auto& node : scene.nodes) next = std::max(next, node.id + 1U);
+        for (std::uint64_t index = 0U; index < 2U; ++index) {
+            production::PreparedSceneNode node;
+            node.id = next + index;
+            node.name = "Linked placement " + std::to_string(index);
+            scene.correspondences.push_back(production::PreparedSourceCorrespondence{
+                production::PreparedSourceEntityKind::scene_node, node.id, 0U,
+                production::PreparedEntityKind::node, node.id, 0U});
+            scene.nodes.push_back(std::move(node));
+        }
+        return scene;
+    };
+    const auto part = [&](const production::PreparedSceneEnvelope& scene, std::size_t index,
+                          std::string source_namespace) {
+        production::PreparedLinkedPartInput input;
+        input.scene_node = scene.nodes[scene.nodes.size() - 2U + index].id;
+        input.source_namespace = std::move(source_namespace);
+        input.source_revision = linked.render_mesh.source_revision;
+        input.source_digest = linked.render_mesh.source_digest;
+        input.source_asset = 5U;
+        input.source_mesh = 1U;
+        input.render_mesh = &linked.render_mesh;
+        input.material = material;
+        return input;
+    };
+
+    auto shared_scene = with_placements();
+    production::PreparedLinkedSceneInput shared;
+    shared.parts = {part(shared_scene, 0U, "linked.alpha"), part(shared_scene, 1U, "linked.alpha")};
+    shared.provenance = "linked.alpha only";
+    const auto shared_result = production::append_prepared_linked_parts(
+        shared_scene, parent.document.material_catalog(), shared);
+    require(static_cast<bool>(shared_result) &&
+            shared_scene.nodes[shared_scene.nodes.size() - 2U].asset ==
+                shared_scene.nodes.back().asset,
+        "parts of one source authority share their namespaced asset");
+
+    auto conflicting_scene = with_placements();
+    production::PreparedLinkedSceneInput conflicting;
+    conflicting.parts = {part(conflicting_scene, 0U, "linked.alpha"),
+        part(conflicting_scene, 1U, "linked.beta")};
+    conflicting.provenance = "linked.alpha and linked.beta";
+    const auto refused = production::append_prepared_linked_parts(
+        conflicting_scene, parent.document.material_catalog(), conflicting);
+    require(!refused && refused.error().message.find("two linked source authorities") !=
+            std::string::npos,
+        "two source authorities reusing one source asset and mesh ID are refused, not merged");
+}
+
 int main() {
     exact_products_compose_and_round_trip();
     stale_and_incomplete_composition_fails_closed();
@@ -965,6 +1030,7 @@ int main() {
     malformed_envelopes_fail_closed();
     world_primitives_compose_with_stable_correspondence();
     extension_bindings_are_digest_bound_and_fail_closed();
+    linked_parts_from_different_authorities_never_share_ids();
     std::cout << "prepared scene tests passed\n";
     return EXIT_SUCCESS;
 }

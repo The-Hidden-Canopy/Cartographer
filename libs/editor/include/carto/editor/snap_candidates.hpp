@@ -54,6 +54,16 @@ struct SnapCandidate {
     const SnapSettings& settings,
     double radius);
 
+// The world axis an orthographic viewport cannot show. Snap distance and
+// alignment ignore it: Plan hides Y, Front hides Z and Right hides X. A
+// perspective view hides no axis and measures in 3D.
+enum class SnapHiddenAxis : unsigned char {
+    none,
+    x,
+    y,
+    z,
+};
+
 // Builds deterministic, world-space candidates from visible project objects.
 // The document revision binds every result across both mesh and transform
 // changes; mesh_revision preserves the narrower topology provenance. This is
@@ -67,14 +77,14 @@ struct SnapCandidate {
 // Queries an already-compiled viewport snapshot. Results bind the snapshot's
 // project revision and each compiled mesh revision, avoiding per-pointer-move
 // mesh recompilation in native transform interactions. Missing mesh-asset
-// identities are not eligible snap targets. Plan queries ignore elevation;
-// spatial queries measure all three axes for editor-camera translation.
+// identities are not eligible snap targets. Distance ignores the viewport's
+// hidden axis; Plan (the default) ignores elevation.
 [[nodiscard]] core::Result<std::vector<SnapCandidate>> find_snap_candidates(
     const render::RenderScene& scene,
     core::Vec3d origin,
     std::span<const SnapKind> kinds,
     core::Revision source_revision,
     double radius,
-    bool spatial_distance = false);
+    SnapHiddenAxis hidden_axis = SnapHiddenAxis::y);
 
 } // namespace carto::editor

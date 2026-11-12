@@ -13,6 +13,8 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <optional>
+#include <string_view>
 #include <set>
 #include <span>
 #include <sstream>
@@ -1626,6 +1628,18 @@ core::Result<PreparedLinkedComposition> append_prepared_linked_parts(
     const auto namespaced = [](std::uint64_t source_asset, std::uint64_t local) {
         return kPreparedLinkedIdBase | (source_asset << 20U) | local;
     };
+    // Namespaced IDs carry the source asset and local ID only. Each ID is
+    // claimed by the one source authority that first produced it; another
+    // authority reusing it is refused rather than silently merged.
+    std::map<std::uint64_t, std::string> id_authority;
+    const auto claim = [&id_authority](std::uint64_t id, const std::string& authority,
+            std::string_view what) -> std::optional<core::Diagnostic> {
+        const auto [owner, inserted] = id_authority.emplace(id, authority);
+        if (inserted || owner->second == authority) return std::nullopt;
+        return core::Diagnostic(core::ErrorCode::validation_failed,
+            "linked " + std::string(what) + " ID " + std::to_string(id) +
+            " is reused by two linked source authorities; their parts cannot share it");
+    };
     std::vector<std::pair<std::string, core::Revision>> new_products;
 
     for (const auto& part : input.parts) {
@@ -1660,10 +1674,14 @@ core::Result<PreparedLinkedComposition> append_prepared_linked_parts(
         }
         authorities.insert(part.source_namespace + " r" + std::to_string(part.source_revision.value()) +
             " sha256:" + part.source_digest.hex());
+        const std::string authority = part.source_namespace + " sha256:" + part.source_digest.hex();
 
         const std::uint64_t prepared_asset = namespaced(part.source_asset, part.source_mesh);
         if (parent_assets.contains(prepared_asset)) {
             return Result::failure(validation("linked prepared asset ID collides with a parent asset"));
+        }
+        if (auto conflict = claim(prepared_asset, authority, "mesh asset")) {
+            return Result::failure(std::move(*conflict));
         }
         const auto regions = infer_material_regions(render_mesh);
         if (created_assets.insert(prepared_asset).second) {
@@ -1687,8 +1705,12 @@ core::Result<PreparedLinkedComposition> append_prepared_linked_parts(
             asset.channel_mask = infer_channel_mask(render_mesh);
             asset.material_regions = regions;
             scene.assets.push_back(std::move(asset));
+            // Keyed by the namespaced ID, like the linked material-region
+            // records below: it is unique across linked authorities and never
+            // collides with parent mesh IDs. linked.provenance keeps the
+            // original source asset and mesh IDs.
             scene.correspondences.push_back(PreparedSourceCorrespondence{
-                PreparedSourceEntityKind::mesh_asset, part.source_mesh, part.source_asset,
+                PreparedSourceEntityKind::mesh_asset, prepared_asset, 0U,
                 PreparedEntityKind::asset, prepared_asset, 0U});
         }
         node->asset = prepared_asset;
@@ -1700,6 +1722,9 @@ core::Result<PreparedLinkedComposition> append_prepared_linked_parts(
                 return Result::failure(invalid("linked texture ID is outside the namespaced range"));
             }
             const auto mapped = namespaced(part.source_asset, texture.id);
+            if (auto conflict = claim(mapped, authority, "texture")) {
+                return Result::failure(std::move(*conflict));
+            }
             texture_ids.emplace(texture.id, mapped);
             if (catalog.textures().contains(mapped)) continue;
             project::TextureSourceRecord record = texture;
@@ -1721,6 +1746,9 @@ core::Result<PreparedLinkedComposition> append_prepared_linked_parts(
             out.textures_to_capture.emplace_back(identity, record);
         }
         const auto mapped_material = namespaced(part.source_asset, part.material.id);
+        if (auto conflict = claim(mapped_material, authority, "material")) {
+            return Result::failure(std::move(*conflict));
+        }
         if (!catalog.materials().contains(mapped_material)) {
             render::MaterialAsset material = part.material;
             material.id = mapped_material;

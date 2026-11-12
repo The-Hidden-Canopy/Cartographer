@@ -18,6 +18,12 @@ struct TangentVertex {
     core::Vec2d uv{};
 };
 
+// Signed UV-space area term for one triangle's corners. Fails with the shared
+// degeneracy rule that generate_tangents applies, so callers that only need the
+// mirroring sign admit exactly the triangles tangent generation admits.
+[[nodiscard]] core::Result<double> tangent_uv_determinant(
+    core::Vec2d a, core::Vec2d b, core::Vec2d c);
+
 // Returns tangent.xyz plus a handedness sign in tangent.w, suitable for the
 // bounded native PBR vertex ABI.
 [[nodiscard]] core::Result<std::vector<core::Vec4d>> generate_tangents(

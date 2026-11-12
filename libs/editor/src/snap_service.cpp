@@ -163,24 +163,23 @@ core::Result<SnapDecision> acquire_snap(
         }
         const core::Vec3d delta = candidate.position - origin;
         double distance = delta.length();
-        if (constraint.axis == SnapConstraintAxis::world_x) {
-            if (std::abs(delta.z) > constraint.perpendicular_tolerance ||
-                (constraint.spatial_alignment &&
-                    std::abs(delta.y) > constraint.perpendicular_tolerance)) {
+        if (constraint.axis != SnapConstraintAxis::none) {
+            const auto moving = constraint.axis == SnapConstraintAxis::world_x
+                ? SnapHiddenAxis::x : constraint.axis == SnapConstraintAxis::world_y
+                    ? SnapHiddenAxis::y : SnapHiddenAxis::z;
+            const auto hidden = constraint.hidden_axis == moving
+                ? SnapHiddenAxis::none : constraint.hidden_axis;
+            const auto misaligned = [&](SnapHiddenAxis axis, double offset) {
+                return axis != moving && axis != hidden &&
+                    std::abs(offset) > constraint.perpendicular_tolerance;
+            };
+            if (misaligned(SnapHiddenAxis::x, delta.x) ||
+                misaligned(SnapHiddenAxis::y, delta.y) ||
+                misaligned(SnapHiddenAxis::z, delta.z)) {
                 continue;
             }
-            distance = std::abs(delta.x);
-        } else if (constraint.axis == SnapConstraintAxis::world_z) {
-            if (std::abs(delta.x) > constraint.perpendicular_tolerance ||
-                (constraint.spatial_alignment &&
-                    std::abs(delta.y) > constraint.perpendicular_tolerance)) {
-                continue;
-            }
-            distance = std::abs(delta.z);
-        } else if (constraint.axis == SnapConstraintAxis::world_y) {
-            if (std::abs(delta.x) > constraint.perpendicular_tolerance ||
-                std::abs(delta.z) > constraint.perpendicular_tolerance) continue;
-            distance = std::abs(delta.y);
+            distance = std::abs(moving == SnapHiddenAxis::x ? delta.x
+                : moving == SnapHiddenAxis::y ? delta.y : delta.z);
         }
         if (!std::isfinite(distance)) {
             return core::Result<SnapDecision>::failure(invalid(

@@ -262,7 +262,7 @@ snap_viewport_transform_preview(
     SnapSession& session,
     std::optional<scene::ObjectId> excluded_object = std::nullopt,
     double perpendicular_tolerance = 0.05,
-    bool spatial_alignment = false);
+    SnapHiddenAxis hidden_axis = SnapHiddenAxis::y);
 
 // UI-only orthographic camera for Cartographer's current X/Z plan view. It
 // does not represent a scene camera and cannot mutate project state.

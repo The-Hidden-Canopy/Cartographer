@@ -577,7 +577,7 @@ core::Result<ViewportTransformSnapResult> snap_viewport_transform_preview(
     SnapSession& session,
     std::optional<scene::ObjectId> excluded_object,
     double perpendicular_tolerance,
-    bool spatial_alignment) {
+    SnapHiddenAxis hidden_axis) {
     if (!preview.finite() || (axis != ViewportTranslateAxis::world_x &&
             axis != ViewportTranslateAxis::world_z &&
             axis != ViewportTranslateAxis::world_y) ||
@@ -621,9 +621,15 @@ core::Result<ViewportTransformSnapResult> snap_viewport_transform_preview(
     constexpr std::array<SnapKind, 3> kSnapKinds{
         SnapKind::vertex, SnapKind::edge_midpoint, SnapKind::face_center};
     SnapProfile profile;
-    spatial_alignment = spatial_alignment || axis == ViewportTranslateAxis::world_y;
+    // Candidate distance follows the alignment rule: moving along the hidden
+    // axis is measured in 3D.
+    const auto moving_axis = axis == ViewportTranslateAxis::world_x
+        ? SnapHiddenAxis::x : axis == ViewportTranslateAxis::world_y
+            ? SnapHiddenAxis::y : SnapHiddenAxis::z;
+    const auto query_hidden_axis =
+        hidden_axis == moving_axis ? SnapHiddenAxis::none : hidden_axis;
     auto candidates = find_snap_candidates(scene, preview.translation, kSnapKinds,
-        source_revision, profile.break_radius, spatial_alignment);
+        source_revision, profile.break_radius, query_hidden_axis);
     if (!candidates) {
         return core::Result<ViewportTransformSnapResult>::failure(candidates.error());
     }
@@ -637,7 +643,7 @@ core::Result<ViewportTransformSnapResult> snap_viewport_transform_preview(
             ? SnapConstraintAxis::world_y : SnapConstraintAxis::world_z;
     const auto decision = acquire_snap(candidates.value(), preview.translation,
         source_revision, profile, session,
-        {constraint, perpendicular_tolerance, spatial_alignment});
+        {constraint, perpendicular_tolerance, hidden_axis});
     if (!decision) {
         return core::Result<ViewportTransformSnapResult>::failure(decision.error());
     }

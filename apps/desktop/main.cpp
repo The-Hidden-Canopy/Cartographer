@@ -2513,7 +2513,7 @@ struct NativeTranslateGizmo {
 struct NativeTransformDragCapture {
     std::uint64_t project_generation = 0U;
     carto::studio::ViewportViewKind view_kind = carto::studio::ViewportViewKind::top_plan_xz;
-    bool spatial_alignment = false;
+    carto::editor::SnapHiddenAxis snap_hidden_axis = carto::editor::SnapHiddenAxis::y;
     carto::editor::ViewportTransformSession session;
     carto::editor::SnapSession geometry_snap_session;
     std::optional<carto::editor::SnapCandidate> geometry_snap_candidate;
@@ -7365,7 +7365,18 @@ struct DesktopState {
         NativeTransformDragCapture capture;
         capture.project_generation = snapshot.project_generation;
         capture.view_kind = viewport_view.view;
-        capture.spatial_alignment = perspective_camera_active;
+        // Snap only on the axes this view shows: Plan hides Y, the
+        // orthographic Front and Right views hide Z and X, and a perspective
+        // camera hides none.
+        capture.snap_hidden_axis = !perspective_camera_active
+            ? carto::editor::SnapHiddenAxis::y
+            : perspective_camera.projection() != carto::editor::EditorProjection::orthographic
+                ? carto::editor::SnapHiddenAxis::none
+                : viewport_view.view == carto::studio::ViewportViewKind::front_xy
+                    ? carto::editor::SnapHiddenAxis::z
+                    : viewport_view.view == carto::studio::ViewportViewKind::right_zy
+                        ? carto::editor::SnapHiddenAxis::x
+                        : carto::editor::SnapHiddenAxis::none;
         if (auto result = capture.session.begin_projected(gizmo.object, initial_transform,
                 snapshot.project_revision, axis, pointer,
                 screen_axis_per_world_unit); !result) {
@@ -7439,7 +7450,7 @@ struct DesktopState {
             std::optional<carto::scene::ObjectId>{
                 native_transform_drag->session.object()},
             native_transform_drag->snap_perpendicular_tolerance,
-            native_transform_drag->spatial_alignment);
+            native_transform_drag->snap_hidden_axis);
         if (!snapped_preview) {
             cancel_native_transform_drag(snapped_preview.error().message);
             return true;
@@ -7485,7 +7496,7 @@ struct DesktopState {
             committed_transform.value(), capture.axis, snapshot.viewport.scene,
             snapshot.project_revision, grid_snap, geometry_snap,
             capture.geometry_snap_session, std::optional<carto::scene::ObjectId>{object},
-            capture.snap_perpendicular_tolerance, capture.spatial_alignment);
+            capture.snap_perpendicular_tolerance, capture.snap_hidden_axis);
         if (!final_preview) {
             action_feedback = final_preview.error().message;
             action_feedback_error = true;

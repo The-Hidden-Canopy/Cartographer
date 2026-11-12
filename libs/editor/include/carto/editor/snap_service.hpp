@@ -57,13 +57,13 @@ enum class SnapConstraintAxis : std::uint8_t {
 
 struct SnapConstraint final {
     SnapConstraintAxis axis = SnapConstraintAxis::none;
-    // For X/Z work-surface moves, candidates must remain within this tolerance
-    // on the other screen-plane axis. Elevation is intentionally ignored by
-    // the top-down viewport; it remains unchanged by the active gizmo handle.
+    // Candidates must stay within this tolerance on every unchanged world
+    // axis the viewport shows. The hidden axis is ignored; it remains
+    // unchanged by the active gizmo handle.
     double perpendicular_tolerance = 0.05;
-    // Editor-camera translation also checks the other unchanged world axis.
-    // Y translation always checks X and Z, regardless of this flag.
-    bool spatial_alignment = false;
+    // Plan hides Y. Moving along the hidden axis itself checks both other
+    // axes, because the view cannot show that motion's alignment.
+    SnapHiddenAxis hidden_axis = SnapHiddenAxis::y;
 };
 
 // Applies a revision-bound priority/hysteresis policy to already compiled

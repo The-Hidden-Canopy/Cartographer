@@ -76,7 +76,7 @@ core::Result<void> append_viewport_candidates(
     std::uint64_t mesh_asset,
     core::Revision source_revision,
     std::vector<SnapCandidate>& candidates,
-    bool spatial_distance) {
+    SnapHiddenAxis hidden_axis) {
     constexpr std::size_t kMaxViewportSnapCandidates = 65'536U;
     const auto consider = [&](SnapCandidate candidate) -> core::Result<void> {
         candidate.position = transform_point(transform, candidate.position);
@@ -84,10 +84,12 @@ core::Result<void> append_viewport_candidates(
             return core::Result<void>::failure(invalid(
                 "compiled viewport snap target has a non-finite world position"));
         }
-        // Preserve the plan query while bounding editor-camera targets in 3D.
+        // Measure on the axes the viewport can show.
         const auto delta = candidate.position - origin;
-        const double distance = spatial_distance
-            ? std::hypot(delta.x, delta.y, delta.z) : std::hypot(delta.x, delta.z);
+        const double distance = std::hypot(
+            hidden_axis == SnapHiddenAxis::x ? 0.0 : delta.x,
+            hidden_axis == SnapHiddenAxis::y ? 0.0 : delta.y,
+            hidden_axis == SnapHiddenAxis::z ? 0.0 : delta.z);
         if (!std::isfinite(distance)) {
             return core::Result<void>::failure(invalid(
                 "compiled viewport snap distance is non-finite"));
@@ -395,7 +397,7 @@ core::Result<std::vector<SnapCandidate>> find_snap_candidates(
     std::span<const SnapKind> kinds,
     core::Revision source_revision,
     double radius,
-    bool spatial_distance) {
+    SnapHiddenAxis hidden_axis) {
     if (!origin.finite() || !std::isfinite(radius) || radius < 0.0) {
         return core::Result<std::vector<SnapCandidate>>::failure(invalid(
             "compiled snap scene origin or radius is invalid"));
@@ -439,7 +441,7 @@ core::Result<std::vector<SnapCandidate>> find_snap_candidates(
         for (const SnapKind kind : kinds) {
             if (auto result = append_viewport_candidates(
                     *instance.mesh, origin, radius, kind, instance.world_transform,
-                    instance.object, *instance.mesh_asset, source_revision, candidates, spatial_distance);
+                    instance.object, *instance.mesh_asset, source_revision, candidates, hidden_axis);
                 !result) {
                 return core::Result<std::vector<SnapCandidate>>::failure(
                     result.error().with_context("compiled viewport snap query"));

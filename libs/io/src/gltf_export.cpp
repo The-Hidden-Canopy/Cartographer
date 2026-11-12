@@ -363,6 +363,7 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
             "glTF export cannot preserve the authored rig or deformation records"));
     }
     std::map<std::uint64_t, std::set<attributes::UvSetId>> authored_tangent_sets;
+    bool has_edge_sharp_marks = false;
     for (const auto& [mesh_id, mesh] : document.meshes()) {
         for (const auto& [id, layer] : mesh.attributes().layers()) {
             if (id.starts_with("cartographer.tangent.") || id.starts_with("cartographer.tangent_uv.")) {
@@ -412,7 +413,13 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
             return core::Result<GltfExportReport>::failure(validation(
                 "glTF export cannot preserve all authored UV sets on mesh " + std::to_string(mesh_id)));
         for (const auto& [id, layer] : mesh.attributes().layers()) {
-            static_cast<void>(layer);
+            // Edge sharp marks are editor annotations. Exported normals come
+            // from compiled geometry, which never reads them, so the marks are
+            // reported as source-only rather than refused.
+            const bool edge_sharp_marks = id == "cartographer.edge_sharp" &&
+                layer.descriptor.domain == attributes::AttributeDomain::edge &&
+                layer.descriptor.type == attributes::AttributeType::boolean;
+            has_edge_sharp_marks = has_edge_sharp_marks || edge_sharp_marks;
             const bool declared_uv = std::any_of(uv_sets.descriptors().begin(),
                 uv_sets.descriptors().end(), [&](const auto& entry) {
                     return id == entry.second.layer_id;
@@ -423,7 +430,7 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
             const bool authored_tangent = id.starts_with("cartographer.tangent.") ||
                 id.starts_with("cartographer.tangent_uv.");
             const bool supported = id == "cartographer.normal0" ||
-                id == "condition.material_region" ||
+                id == "condition.material_region" || edge_sharp_marks ||
                 (id == "cartographer.material_slot" && export_materials) ||
                 declared_uv || authored_tangent;
             if (!supported) {
@@ -445,6 +452,10 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
     report.objects = document.scene().size();
     report.meshes = document.meshes().size();
     for(const auto& [object,layer]:document.aging_layers()){static_cast<void>(object);if(production::aging_needs_rebake(document,layer))return core::Result<GltfExportReport>::failure(validation("aging appearance is stale; re-bake or unlink the operation before exporting"));}
+    if (has_edge_sharp_marks) {
+        report.warnings.push_back("Edge sharp marks are editor annotations; they remain in the "
+            ".carto source and do not change exported glTF/GLB normals.");
+    }
     if(!document.aging_layers().empty())report.warnings.push_back("Aging is exported as its supported baked material appearance; editable cause recipes and seed/operation identity remain in the .carto source, not glTF/GLB.");
     bool any_active_uv = false;
     bool any_missing_uv = false;
