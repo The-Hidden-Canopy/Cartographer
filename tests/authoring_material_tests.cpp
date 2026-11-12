@@ -1,4 +1,5 @@
 #include "authoring_viewport_fixture.hpp"
+#include "material_bake_two_pass_reference.hpp"
 #include <carto/ui/ui.hpp>
 
 #include <algorithm>
@@ -314,9 +315,70 @@ void pixels_and_lifecycle() {
         "graph edit/rebind survives redo and disk save/reopen without changing "
         "appearance");
 }
+void material_bake_matches_two_pass_reference() {
+    const auto f = fixture();
+    auto graph = authoring_graph_fixture();
+    node(graph, 6).parameter_name = "uv.u";
+    // Spatially varying HDR emission makes the last texel determine a global
+    // scale. A partial-scale or row-local quantizer cannot match this oracle.
+    node(graph, 12).kind = Kind::constant_color;
+    node(graph, 12).parameter_name.clear();
+    node(graph, 12).constants = {2, 10, 4, 1};
+    project::MaterialGraphNode other;
+    other.id = 15;
+    other.kind = Kind::constant_color;
+    other.value_type = Type::color;
+    other.constants = {20, 1, 0, 1};
+    graph.nodes.push_back(other);
+    project::MaterialGraphNode mixed;
+    mixed.id = 16;
+    mixed.kind = Kind::mix;
+    mixed.value_type = Type::color;
+    mixed.inputs = {12, 15, 6};
+    graph.nodes.push_back(mixed);
+    graph.outputs.emissive = 16;
+    const auto catalog = bound_catalog(f, graph);
+    const auto before = catalog.serialize();
+    const auto varying = take(production::compile_authoring_material(catalog, 1));
+    const auto plain = take(production::compile_authoring_material(
+        f.document.material_catalog(), 1));
+    for (const auto* program : {&plain, &varying}) {
+        for (const std::uint32_t resolution : {4U, 16U, 64U}) {
+            const auto expected = take(production::testing::two_pass_material_bake_reference(
+                *program, resolution));
+            const auto actual = take(production::bake_authoring_material(*program, resolution));
+            check(actual.program_digest == expected.program_digest && actual.uv == expected.uv &&
+                    actual.normal_mapping == expected.normal_mapping,
+                "single-evaluation bake preserves source and normal binding");
+            for (std::size_t map = 0; map < actual.maps.size(); ++map)
+                check(actual.maps[map].width == expected.maps[map].width &&
+                        actual.maps[map].height == expected.maps[map].height &&
+                        actual.maps[map].pixels == expected.maps[map].pixels,
+                    "single-evaluation bake must match every old quantized map byte");
+            check(actual.factors.emissive_strength == expected.factors.emissive_strength &&
+                    actual.factors.alpha_mode == expected.factors.alpha_mode &&
+                    actual.factors.alpha_cutoff == expected.factors.alpha_cutoff &&
+                    actual.factors.dielectric_f0 == expected.factors.dielectric_f0 &&
+                    actual.factors.base_color == expected.factors.base_color &&
+                    actual.factors.metallic_roughness == expected.factors.metallic_roughness &&
+                    actual.factors.normal == expected.factors.normal &&
+                    actual.factors.occlusion == expected.factors.occlusion &&
+                    actual.factors.emissive == expected.factors.emissive,
+                "single-evaluation bake preserves global emission scale and center factors");
+        }
+        for (const std::uint32_t bad : {0U, 3U, 7U})
+            check(!production::bake_authoring_material(*program, bad),
+                "single-evaluation bake retains resolution admission");
+    }
+    check(catalog.serialize() == before, "baking never changes authored material sources");
+    production::AuthoringMaterialProgram empty;
+    check(!production::bake_authoring_material(empty, 4),
+        "missing executable material programs remain refused");
+}
 } // namespace
 int main() {
     try {
+        material_bake_matches_two_pass_reference();
         factors_parameters_and_variants();
         stale_source_order_and_ranges();
         unsupported_and_budget();
