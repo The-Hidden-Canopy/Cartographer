@@ -1592,4 +1592,237 @@ core::Result<ProductionCookKey> register_prepared_navigation_node(
     return core::Result<ProductionCookKey>::success(std::move(key));
 }
 
+
+std::uint32_t prepared_asset_channel_mask(const RenderMeshArtifact& mesh) {
+    return infer_channel_mask(mesh);
+}
+
+std::vector<std::uint32_t> prepared_asset_material_regions(const RenderMeshArtifact& mesh) {
+    return infer_material_regions(mesh);
+}
+
+std::string prepared_texture_extension(assets::TextureSourceFormat format) {
+    return texture_extension(format);
+}
+
+core::Result<PreparedLinkedComposition> append_prepared_linked_parts(
+    PreparedSceneEnvelope& scene,
+    project::MaterialCatalog catalog,
+    const PreparedLinkedSceneInput& input) {
+    using Result = core::Result<PreparedLinkedComposition>;
+    constexpr std::uint64_t kField = 1ULL << 20U;
+    if (input.parts.empty() || input.parts.size() > 4096U) {
+        return Result::failure(invalid("linked preparation needs between 1 and 4096 parts"));
+    }
+    if (input.provenance.empty() || input.provenance.size() > 4U * 1024U * 1024U) {
+        return Result::failure(invalid("linked preparation provenance is missing or oversized"));
+    }
+    PreparedLinkedComposition out;
+    std::set<std::uint64_t> parent_assets;
+    for (const auto& asset : scene.assets) parent_assets.insert(asset.id);
+    std::set<std::uint64_t> created_assets;
+    std::set<std::pair<std::uint64_t, std::uint32_t>> bound_regions;
+    std::set<std::string> authorities;
+    const auto namespaced = [](std::uint64_t source_asset, std::uint64_t local) {
+        return kPreparedLinkedIdBase | (source_asset << 20U) | local;
+    };
+    std::vector<std::pair<std::string, core::Revision>> new_products;
+
+    for (const auto& part : input.parts) {
+        if (part.render_mesh == nullptr || !safe_identity(part.source_namespace) ||
+            part.source_digest.is_zero() || part.source_revision.value() == 0U ||
+            part.source_asset == 0U || part.source_asset >= (1ULL << 28U) ||
+            part.source_mesh == 0U || part.source_mesh >= kField ||
+            part.material.id == 0U || part.material.id >= kField) {
+            return Result::failure(invalid("linked part identity is incomplete or outside the namespaced range"));
+        }
+        const auto& render_mesh = *part.render_mesh;
+        if (auto result = render_mesh.validate(); !result) {
+            return Result::failure(result.error().with_context("linked render mesh"));
+        }
+        // The product must stay bound to its own source authority.
+        if (render_mesh.source_digest != part.source_digest ||
+            render_mesh.source_revision != part.source_revision) {
+            return Result::failure(core::Diagnostic(core::ErrorCode::stale_data,
+                "linked render mesh is not bound to its declared source authority"));
+        }
+        if (part.source_digest == scene.source_digest) {
+            return Result::failure(validation(
+                "linked part declares the parent document as its separate source authority"));
+        }
+        auto node = std::find_if(scene.nodes.begin(), scene.nodes.end(),
+            [&part](const PreparedSceneNode& candidate) { return candidate.id == part.scene_node; });
+        if (node == scene.nodes.end()) {
+            return Result::failure(validation("linked part placement node is outside the prepared scene"));
+        }
+        if (node->asset.has_value()) {
+            return Result::failure(validation("linked part placement node already carries parent geometry"));
+        }
+        authorities.insert(part.source_namespace + " r" + std::to_string(part.source_revision.value()) +
+            " sha256:" + part.source_digest.hex());
+
+        const std::uint64_t prepared_asset = namespaced(part.source_asset, part.source_mesh);
+        if (parent_assets.contains(prepared_asset)) {
+            return Result::failure(validation("linked prepared asset ID collides with a parent asset"));
+        }
+        const auto regions = infer_material_regions(render_mesh);
+        if (created_assets.insert(prepared_asset).second) {
+            const auto bytes = render_mesh.serialize();
+            if (!bytes) return Result::failure(bytes.error());
+            const std::string stem = "linked." + std::to_string(part.source_asset) + ".mesh." +
+                std::to_string(part.source_mesh);
+            scene.products.push_back(PreparedProductReference{
+                stem + ".render", PreparedProductKind::render_mesh, kRenderMeshArtifactFormatVersion,
+                digest_bytes(bytes.value()),
+                "products/linked/asset-" + std::to_string(part.source_asset) + "-mesh-" +
+                    std::to_string(part.source_mesh) + ".render-mesh-v" +
+                    std::to_string(kRenderMeshArtifactFormatVersion) + ".bin"});
+            new_products.emplace_back(stem + ".render", part.source_revision);
+            out.payloads.emplace_back(stem + ".render", bytes.value());
+            PreparedAssetDefinition asset;
+            asset.id = prepared_asset;
+            asset.name = "Linked " + std::to_string(part.source_asset) + " mesh " +
+                std::to_string(part.source_mesh);
+            asset.render_mesh_product = stem + ".render";
+            asset.channel_mask = infer_channel_mask(render_mesh);
+            asset.material_regions = regions;
+            scene.assets.push_back(std::move(asset));
+            scene.correspondences.push_back(PreparedSourceCorrespondence{
+                PreparedSourceEntityKind::mesh_asset, part.source_mesh, part.source_asset,
+                PreparedEntityKind::asset, prepared_asset, 0U});
+        }
+        node->asset = prepared_asset;
+
+        // Textures and material, namespaced under the linked source asset.
+        std::map<assets::TextureAssetId, assets::TextureAssetId> texture_ids;
+        for (const auto& texture : part.textures) {
+            if (texture.id == 0U || texture.id >= kField) {
+                return Result::failure(invalid("linked texture ID is outside the namespaced range"));
+            }
+            const auto mapped = namespaced(part.source_asset, texture.id);
+            texture_ids.emplace(texture.id, mapped);
+            if (catalog.textures().contains(mapped)) continue;
+            project::TextureSourceRecord record = texture;
+            record.id = mapped;
+            record.name = "linked " + std::to_string(part.source_asset) + " " + texture.name;
+            record.provenance = "linked-source " + part.source_namespace + " r" +
+                std::to_string(part.source_revision.value()) + " sha256:" + part.source_digest.hex() +
+                " texture " + std::to_string(texture.id) +
+                (texture.provenance.empty() ? std::string{} : "; " + texture.provenance);
+            if (auto result = catalog.insert_texture(record); !result) {
+                return Result::failure(result.error().with_context("linked texture"));
+            }
+            const std::string identity = "source.texture." + std::to_string(mapped);
+            scene.products.push_back(PreparedProductReference{
+                identity, PreparedProductKind::texture_source, 1U, record.content_digest,
+                "products/textures/texture-" + std::to_string(mapped) + "." +
+                    texture_extension(record.format)});
+            new_products.emplace_back(identity, part.source_revision);
+            out.textures_to_capture.emplace_back(identity, record);
+        }
+        const auto mapped_material = namespaced(part.source_asset, part.material.id);
+        if (!catalog.materials().contains(mapped_material)) {
+            render::MaterialAsset material = part.material;
+            material.id = mapped_material;
+            material.name = "linked " + std::to_string(part.source_asset) + " " + part.material.name;
+            for (auto* binding : {&material.definition.base_color, &material.definition.metallic_roughness,
+                     &material.definition.normal, &material.definition.occlusion,
+                     &material.definition.emissive}) {
+                if (binding->asset == 0U) continue;
+                if (binding->sampler != 0U) {
+                    return Result::failure(core::Diagnostic(core::ErrorCode::unsupported,
+                        "linked material sampler state is not carried by preparation"));
+                }
+                const auto mapped = texture_ids.find(binding->asset);
+                if (mapped == texture_ids.end()) {
+                    return Result::failure(validation(
+                        "linked material references a texture outside its verified closure"));
+                }
+                binding->asset = mapped->second;
+            }
+            if (auto result = catalog.insert_material(material); !result) {
+                return Result::failure(result.error().with_context("linked material"));
+            }
+        }
+        for (const auto region : regions) {
+            if (!bound_regions.emplace(prepared_asset, region).second) continue;
+            if (auto result = catalog.insert_assignment(project::MaterialRegionAssignment{
+                    project::MaterialRegionKey{prepared_asset, region}, mapped_material, std::nullopt});
+                !result) {
+                return Result::failure(result.error().with_context("linked material assignment"));
+            }
+            scene.material_bindings.push_back(PreparedMaterialBinding{
+                prepared_asset, region, mapped_material, std::nullopt});
+            scene.correspondences.push_back(PreparedSourceCorrespondence{
+                PreparedSourceEntityKind::material_region, prepared_asset, region,
+                PreparedEntityKind::material_binding, prepared_asset, region});
+        }
+    }
+
+    // Provenance sidecar and extension binding name every authority.
+    const assets::Sha256Digest provenance_digest = digest_text(input.provenance);
+    scene.products.push_back(PreparedProductReference{
+        "linked.provenance", PreparedProductKind::semantic_sidecar, 1U, provenance_digest,
+        "products/linked/provenance-v1.txt"});
+    new_products.emplace_back("linked.provenance", scene.source_revision);
+    out.payloads.emplace_back("linked.provenance",
+        std::vector<std::uint8_t>(input.provenance.begin(), input.provenance.end()));
+    scene.extension_bindings.push_back(PreparedExtensionBinding{
+        "condition.linked-scene", "condition.linked-preparation-input.v1", provenance_digest});
+    std::string detail = std::to_string(input.parts.size()) + " linked parts from " +
+        std::to_string(authorities.size()) +
+        " external source authority; each linked render product is bound to its own source revision and digest (see linked.provenance).";
+    scene.capabilities.push_back(PreparedCapabilityResult{
+        "scene.linked-sources", PreparedCapabilityEvidence::derived_product, false, std::move(detail)});
+
+    // Replace (or add) the single material catalog with the combined one.
+    const std::string catalog_text = catalog.serialize();
+    const auto catalog_digest = digest_text(catalog_text);
+    auto catalog_product = std::find_if(scene.products.begin(), scene.products.end(),
+        [](const PreparedProductReference& product) { return product.identity == "source.material-catalog"; });
+    if (catalog_product == scene.products.end()) {
+        scene.products.push_back(PreparedProductReference{
+            "source.material-catalog", PreparedProductKind::material_catalog,
+            project::MaterialCatalog::kSchemaVersion, catalog_digest,
+            "products/material-catalog-v" + std::to_string(project::MaterialCatalog::kSchemaVersion) + ".txt"});
+        new_products.emplace_back("source.material-catalog", scene.source_revision);
+    } else {
+        catalog_product->content_digest = catalog_digest;
+        for (auto& dependency : scene.dependencies)
+            if (dependency.identity == "source.material-catalog") dependency.content_digest = catalog_digest;
+    }
+    for (const auto& [identity, revision] : new_products) {
+        const auto product = std::find_if(scene.products.begin(), scene.products.end(),
+            [&identity](const PreparedProductReference& value) { return value.identity == identity; });
+        scene.dependencies.push_back(PreparedDependencyReference{
+            identity, PreparedDependencyDisposition::included_product, true, revision,
+            product->content_digest, product->relative_path});
+    }
+    out.material_catalog = std::move(catalog);
+
+    std::sort(scene.products.begin(), scene.products.end(),
+        [](const auto& a, const auto& b) { return a.identity < b.identity; });
+    std::sort(scene.assets.begin(), scene.assets.end(),
+        [](const auto& a, const auto& b) { return a.id < b.id; });
+    std::sort(scene.material_bindings.begin(), scene.material_bindings.end(),
+        [](const auto& a, const auto& b) { return std::tuple{a.asset, a.region} < std::tuple{b.asset, b.region}; });
+    std::sort(scene.dependencies.begin(), scene.dependencies.end(),
+        [](const auto& a, const auto& b) { return a.identity < b.identity; });
+    std::sort(scene.capabilities.begin(), scene.capabilities.end(),
+        [](const auto& a, const auto& b) { return a.feature < b.feature; });
+    std::sort(scene.extension_bindings.begin(), scene.extension_bindings.end(),
+        [](const auto& a, const auto& b) { return a.extension_identity < b.extension_identity; });
+    const auto key = [](const PreparedSourceCorrespondence& value) {
+        return std::tuple{static_cast<unsigned>(value.source_kind), value.source_primary,
+            value.source_secondary, static_cast<unsigned>(value.prepared_kind),
+            value.prepared_primary, value.prepared_secondary};
+    };
+    std::sort(scene.correspondences.begin(), scene.correspondences.end(),
+        [&key](const auto& a, const auto& b) { return key(a) < key(b); });
+    if (auto result = scene.validate(); !result) {
+        return Result::failure(result.error().with_context("linked prepared scene"));
+    }
+    return Result::success(std::move(out));
+}
+
 } // namespace carto::production

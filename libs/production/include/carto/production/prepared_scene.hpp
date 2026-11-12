@@ -300,6 +300,57 @@ compose_prepared_material_catalog(
     std::span<const PreparedAssetInput> asset_inputs,
     std::span<const PreparedWorldPositionInput> world_position_inputs = {});
 
+// One externally linked scene part whose geometry and material belong to a
+// separate source document (for example a CONDITION natural-asset link). Its
+// render mesh stays bound to that source's own revision and digest; it is
+// never rebadged as the parent document's product. IDs are in the linked
+// source's ID space and are namespaced by append_prepared_linked_parts.
+struct PreparedLinkedPartInput {
+    std::uint64_t scene_node = 0U;
+    std::string source_namespace;
+    core::Revision source_revision;
+    assets::Sha256Digest source_digest;
+    std::uint64_t source_asset = 0U;
+    std::uint64_t source_component = 0U;
+    std::uint64_t source_mesh = 0U;
+    const RenderMeshArtifact* render_mesh = nullptr;
+    render::MaterialAsset material;
+    // Texture source records referenced by `material`; locators are relative
+    // to the parent preparation's source root and are digest-verified there.
+    std::vector<project::TextureSourceRecord> textures;
+};
+
+struct PreparedLinkedSceneInput {
+    std::vector<PreparedLinkedPartInput> parts;
+    // Canonical provider provenance (all authorities, digests and mappings).
+    std::string provenance;
+};
+
+inline constexpr std::uint64_t kPreparedLinkedIdBase = 1ULL << 48U;
+
+struct PreparedLinkedComposition {
+    // Parent catalog plus namespaced linked materials, textures and
+    // assignments. Each linked texture record names its source authority.
+    project::MaterialCatalog material_catalog;
+    std::vector<std::pair<std::string, std::vector<std::uint8_t>>> payloads;
+    std::vector<std::pair<std::string, project::TextureSourceRecord>> textures_to_capture;
+};
+
+// Appends verified linked parts to a scene-scope envelope: one namespaced
+// prepared asset per (source asset, source mesh), the parent's mesh-less
+// placement node bound to it, namespaced material bindings, correspondence,
+// a provenance sidecar and extension binding, and a non-required
+// `scene.linked-sources` capability. Refuses collisions, stale authority,
+// unsupported sampler state and nodes that already carry geometry.
+[[nodiscard]] core::Result<PreparedLinkedComposition> append_prepared_linked_parts(
+    PreparedSceneEnvelope& scene,
+    project::MaterialCatalog parent_catalog,
+    const PreparedLinkedSceneInput& input);
+
+[[nodiscard]] std::uint32_t prepared_asset_channel_mask(const RenderMeshArtifact& mesh);
+[[nodiscard]] std::vector<std::uint32_t> prepared_asset_material_regions(const RenderMeshArtifact& mesh);
+[[nodiscard]] std::string prepared_texture_extension(assets::TextureSourceFormat format);
+
 // Composes the prepared navigation product reference for a scene-scope
 // prepared composition that includes a navigation product, following the
 // world.model product pattern: one content-addressed product bound to the

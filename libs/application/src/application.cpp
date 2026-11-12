@@ -2,6 +2,7 @@
 #include <carto/production/material_binding.hpp>
 #include <carto/application/application.hpp>
 #include <carto/core/filesystem.hpp>
+#include <carto/project/condition_link_guard.hpp>
 #include <carto/editor/viewport_interaction.hpp>
 #include <carto/project/recovery.hpp>
 #include <carto/production/lightmap_uv.hpp>
@@ -2005,6 +2006,14 @@ core::Result<void> RecoveryInspection::validate() const {
 ApplicationSession::ApplicationSession() {
     static_cast<void>(tools_.register_builtin_tools());
     saved_revision_ = document_.revision();
+}
+
+core::Result<void> ApplicationSession::install_linked_scene_provider(
+    std::shared_ptr<LinkedSceneProvider> provider) {
+    if (!provider || project_path_ || journal_) return core::Result<void>::failure(core::Diagnostic(
+        core::ErrorCode::invalid_state, "install the linked-scene provider before opening a project"));
+    linked_scene_provider_ = std::move(provider);
+    return core::Result<void>::success();
 }
 
 ApplicationSession::ApplicationSession(
@@ -4496,6 +4505,9 @@ core::Result<DispatchReceipt> ApplicationSession::new_project(const NewProjectAc
     document_ = std::move(created.value());
     viewport_mesh_cache_.clear();
     project_path_.reset();
+    opened_condition_link_companions_ = false;
+    linked_scene_identity_.reset();
+    linked_viewport_.reset();
     journal_.reset();
     reset_editor_state();
     saved_revision_ = document_.revision();
@@ -4510,6 +4522,20 @@ core::Result<DispatchReceipt> ApplicationSession::new_project(const NewProjectAc
 core::Result<DispatchReceipt> ApplicationSession::open_project(const OpenProjectAction& action) {
     if (auto result = require_discard_confirmation(action.discard_dirty); !result) {
         return failure(result.error());
+    }
+    const auto linked_companions = project::has_condition_link_companions(action.path);
+    if (!linked_companions) return failure(linked_companions.error().with_context("open linked scene"));
+    bool same_open_linked_project = false;
+    if (opened_condition_link_companions_ && project_path_) {
+        std::error_code error;
+        same_open_linked_project = std::filesystem::equivalent(action.path, *project_path_, error);
+        if (error) return failure(core::Diagnostic(core::ErrorCode::io_error,
+            "cannot compare previously opened linked project"));
+    }
+    const bool linked_scene = linked_companions.value() || same_open_linked_project;
+    if (action.options.auto_recover && linked_scene) {
+        return failure(core::Diagnostic(core::ErrorCode::unsupported,
+            "linked CONDITION scene recovery requires validated companion rebinding"));
     }
     if (action.options.auto_recover) {
         if (active_source_ != OperationSource::human) {
@@ -4565,6 +4591,10 @@ core::Result<DispatchReceipt> ApplicationSession::open_project(const OpenProject
             document_ = recovered.value().document;
             viewport_mesh_cache_.clear();
             project_path_ = action.path;
+            opened_condition_link_companions_ = false;
+            linked_scene_identity_.reset();
+            linked_viewport_.reset();
+    linked_viewport_.reset();
             journal_ = std::move(prepared_journal.value().journal);
             reset_editor_state();
             saved_revision_ = document_.revision();
@@ -4590,6 +4620,19 @@ core::Result<DispatchReceipt> ApplicationSession::open_project(const OpenProject
     if (!loaded) {
         return failure(loaded.error().with_context("open project"));
     }
+    std::optional<LinkedSceneIdentity> linked_identity;
+    std::shared_ptr<const LinkedViewportScene> linked_viewport;
+    if (linked_scene && linked_scene_provider_) {
+        auto inspected = linked_scene_provider_->inspect(action.path);
+        if (!inspected) return failure(inspected.error().with_context("open linked scene"));
+        linked_identity = std::move(inspected).value();
+        // Linked parts must resolve with their authored geometry and
+        // appearance; an unresolved link refuses the open instead of showing
+        // blank or substitute geometry.
+        auto resolved = linked_scene_provider_->resolve_viewport(*linked_identity);
+        if (!resolved) return failure(resolved.error().with_context("open linked scene"));
+        linked_viewport = std::make_shared<const LinkedViewportScene>(std::move(resolved).value());
+    }
     auto prepared_journal = prepare_journal(action.path, loaded.value());
     if (!prepared_journal) {
         return failure(prepared_journal.error().with_context("open project journal"));
@@ -4598,6 +4641,9 @@ core::Result<DispatchReceipt> ApplicationSession::open_project(const OpenProject
     document_ = std::move(loaded.value());
     viewport_mesh_cache_.clear();
     project_path_ = action.path;
+    opened_condition_link_companions_ = linked_scene;
+    linked_scene_identity_ = std::move(linked_identity);
+    linked_viewport_ = std::move(linked_viewport);
     journal_ = std::move(prepared_journal.value().journal);
     reset_editor_state();
     saved_revision_ = document_.revision();
@@ -4624,6 +4670,17 @@ core::Result<DispatchReceipt> ApplicationSession::recover_project(
             "recovery requires a project file path"));
     }
 
+    const auto linked_companions = project::has_condition_link_companions(action.path);
+    if (!linked_companions) return failure(linked_companions.error().with_context("recover linked scene"));
+    bool same_open_linked_project = false;
+    if (opened_condition_link_companions_ && project_path_) {
+        std::error_code error;
+        same_open_linked_project = std::filesystem::equivalent(action.path, *project_path_, error);
+        if (error) return failure(core::Diagnostic(core::ErrorCode::io_error,
+            "cannot compare previously opened linked project"));
+    }
+    if (linked_companions.value() || same_open_linked_project) return failure(core::Diagnostic(core::ErrorCode::unsupported,
+        "linked CONDITION scene recovery requires validated companion rebinding"));
     project::FileLock project_lock(action.path);
     if (auto result = project_lock.acquire(); !result) {
         return failure(result.error().with_context("project recovery lock"));
@@ -4646,6 +4703,9 @@ core::Result<DispatchReceipt> ApplicationSession::recover_project(
     document_ = recovered.value().document;
     viewport_mesh_cache_.clear();
     project_path_ = action.path;
+    opened_condition_link_companions_ = false;
+    linked_scene_identity_.reset();
+    linked_viewport_.reset();
     journal_ = std::move(prepared_journal.value().journal);
     reset_editor_state();
     saved_revision_ = document_.revision();
@@ -4687,6 +4747,60 @@ core::Result<DispatchReceipt> ApplicationSession::save_project(const SaveProject
     }
     if (!selected) {
         return failure(invalid_state("save requires a project path"));
+    }
+    const auto target_links = project::has_condition_link_companions(*selected);
+    if (!target_links) return failure(target_links.error().with_context("save linked scene"));
+    if (opened_condition_link_companions_) {
+        if (active_source_ != OperationSource::human || !linked_scene_provider_ || !linked_scene_identity_ ||
+            !project_path_ || !journal_ || !action.linked_output_directory || action.path || action.linked_human_reason.empty())
+            return failure(core::Diagnostic(core::ErrorCode::unsupported,
+                "linked scene Save requires a provider, human reason and explicit new generation directory"));
+        project::FileLock source_lock(*project_path_);
+        if (auto locked = source_lock.acquire(); !locked)
+            return failure(locked.error().with_context("linked scene save lock"));
+        // Allocate target handles before publication, so session handoff does
+        // not construct new filesystem paths after the atomic commit.
+        std::error_code target_error;
+        const auto target_dir = std::filesystem::absolute(*action.linked_output_directory, target_error).lexically_normal();
+        if (target_error) return failure(core::Diagnostic(core::ErrorCode::io_error,
+            "cannot resolve linked generation destination"));
+        // A linked generation keeps the opened scene's file name.
+        const auto scene_name = project_path_->filename();
+        std::optional<std::filesystem::path> next_path{target_dir / scene_name};
+        auto journal_name = scene_name;
+        journal_name += ".journal";
+        std::optional<journal::Journal> next_journal{std::in_place,
+            target_dir / journal_name, application_journal_limits()};
+        LinkedScenePublishRequest request{*linked_scene_identity_, *action.linked_output_directory,
+            document_.serialize(), journal_->path(), action.linked_human_reason, action.linked_stop};
+        auto published = linked_scene_provider_->publish(request);
+        if (!published) return failure(published.error().with_context("linked scene save"));
+        if (published.value().revision != document_.revision())
+            return failure(core::Diagnostic(core::ErrorCode::invalid_state,
+                "linked generation was published but its revision differs; inspect it before retrying"));
+        // The provider has verified the copied application journal and source.
+        auto next_identity = std::move(published.value().identity);
+        project_path_.swap(next_path);
+        journal_.swap(next_journal);
+        linked_scene_identity_ = std::move(next_identity);
+        saved_revision_ = document_.revision();
+        // Re-verify the published generation's links for display.
+        if (auto resolved = linked_scene_provider_->resolve_viewport(*linked_scene_identity_); resolved) {
+            linked_viewport_ = std::make_shared<const LinkedViewportScene>(std::move(resolved).value());
+        } else {
+            linked_viewport_.reset();
+            return failure(resolved.error().with_context(
+                "linked generation was published but its links did not re-verify; inspect it"));
+        }
+        return accepted("Save Linked Scene", document_.revision());
+    }
+    if (target_links.value()) return failure(core::Diagnostic(core::ErrorCode::unsupported,
+        "a linked CONDITION destination cannot be overwritten by a base-only Save"));
+    if (project_path_) {
+        const auto source_links = project::has_condition_link_companions(*project_path_);
+        if (!source_links) return failure(source_links.error().with_context("save linked scene"));
+        if (source_links.value()) return failure(core::Diagnostic(core::ErrorCode::unsupported,
+            "linked CONDITION scene requires validated generation Save; base-only Save is refused"));
     }
     project::FileLock project_lock(*selected);
     if (auto result = project_lock.acquire(); !result) {
@@ -12683,6 +12797,7 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
     result.project_name = document_.name();
     result.source_namespace = document_.source_namespace();
     result.project_path = project_path_;
+    result.opened_condition_link_companions = opened_condition_link_companions_;
     result.project_generation = project_generation_;
     result.project_revision = document_.revision();
     result.dirty = document_.revision() != saved_revision_;
@@ -13501,8 +13616,38 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
             }
         }
     }
+    if (!result.viewport.error.has_value() && linked_viewport_) {
+        for (const auto& part : linked_viewport_->parts) {
+            const auto* object = document_.scene().find(scene::ObjectId{part.scene_object});
+            if (object == nullptr || object->mesh_asset.has_value()) {
+                result.viewport.error = core::Diagnostic(core::ErrorCode::stale_data,
+                    "linked part no longer matches its scene placement");
+                break;
+            }
+            if (!object->visible) continue;
+            const auto world = document_.scene().world_transform(object->id);
+            if (!world) {
+                result.viewport.error = world.error().with_context("linked part transform");
+                break;
+            }
+            if (auto inserted = viewport_scene.upsert({object->id, part.mesh, world.value(),
+                    part.mesh->source_revision, std::nullopt}); !inserted) {
+                result.viewport.error = inserted.error().with_context("linked viewport snapshot");
+                break;
+            }
+        }
+    }
     if (!result.viewport.error.has_value()) {
         result.viewport.scene = std::move(viewport_scene);
+        result.viewport.linked = linked_viewport_;
+        if (!appearance_cache_ || appearance_revision_ != document_.revision() ||
+            appearance_generation_ != project_generation_) {
+            appearance_cache_ = std::make_shared<const std::map<std::uint64_t, MeshAppearance>>(
+                resolve_viewport_appearance(document_));
+            appearance_revision_ = document_.revision();
+            appearance_generation_ = project_generation_;
+        }
+        result.viewport.mesh_appearance = appearance_cache_;
     }
     return result;
 }

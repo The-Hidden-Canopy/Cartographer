@@ -1,6 +1,8 @@
 #pragma once
 
 #include <carto/assets/blob_store.hpp>
+#include <carto/application/linked_scene_provider.hpp>
+#include <carto/application/viewport_appearance.hpp>
 #include <carto/assets/source_registry.hpp>
 #include <carto/attributes/uv.hpp>
 #include <carto/core/diagnostic.hpp>
@@ -142,6 +144,12 @@ struct ViewportState {
         std::shared_ptr<const MeshAttributeOverlayData> data;
     };
     std::vector<MeshAttributeOverlay> attribute_overlays;
+    // Authored face appearance per project mesh, resolved through the same
+    // region -> assignment -> material chain as native rendering.
+    std::shared_ptr<const std::map<std::uint64_t, MeshAppearance>> mesh_appearance;
+    // Externally linked parts verified by the trusted provider. Their render
+    // instances are in `scene` with no project mesh asset.
+    std::shared_ptr<const LinkedViewportScene> linked;
     core::Revision project_revision;
     std::optional<core::Diagnostic> error;
 };
@@ -785,6 +793,7 @@ struct ApplicationSnapshot {
     std::uint64_t project_generation = 0;
     core::Revision project_revision;
     bool dirty = false;
+    bool opened_condition_link_companions = false;
     std::vector<ObjectView> objects;
     SelectionView selection;
     std::vector<editor::ToolDescriptor> tools;
@@ -927,6 +936,10 @@ struct RecoverProjectAction {
 
 struct SaveProjectAction {
     std::optional<std::filesystem::path> path;
+    // Linked saves publish to a new directory. Standard .carto saves ignore it.
+    std::optional<std::filesystem::path> linked_output_directory;
+    std::string linked_human_reason;
+    std::stop_token linked_stop;
 };
 
 struct SetWorkspaceAction {
@@ -2147,6 +2160,9 @@ class ApplicationSession {
 public:
     ApplicationSession();
 
+    // Trusted desktop initialization only; install before opening a project.
+    [[nodiscard]] core::Result<void> install_linked_scene_provider(
+        std::shared_ptr<LinkedSceneProvider> provider);
     [[nodiscard]] static core::Result<RecoveryInspection> inspect_recovery(
         const std::filesystem::path& project_path);
 
@@ -2664,6 +2680,14 @@ private:
 
     project::ProjectDocument document_;
     std::optional<std::filesystem::path> project_path_;
+    // Retained at open so removing a companion later cannot enable base-only Save.
+    bool opened_condition_link_companions_ = false;
+    std::shared_ptr<LinkedSceneProvider> linked_scene_provider_;
+    std::optional<LinkedSceneIdentity> linked_scene_identity_;
+    std::shared_ptr<const LinkedViewportScene> linked_viewport_;
+    mutable core::Revision appearance_revision_;
+    mutable std::uint64_t appearance_generation_ = 0U;
+    mutable std::shared_ptr<const std::map<std::uint64_t, MeshAppearance>> appearance_cache_;
     core::Revision saved_revision_;
     std::uint64_t project_generation_ = 0;
     // snapshot() is a UI-thread read boundary. The cache is mutable so a

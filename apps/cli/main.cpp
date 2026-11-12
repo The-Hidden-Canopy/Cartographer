@@ -18,6 +18,10 @@
 #include <carto/production/prepared_publication.hpp>
 #include <carto/providers/registry.hpp>
 #include <carto/project/project.hpp>
+#include <carto/project/condition_link_guard.hpp>
+#if defined(CARTO_CLI_HAS_LINKED_SCENE_PROVIDER)
+#include <carto/linked_scene_provider_factory.hpp>
+#endif
 #include <carto/project/transaction.hpp>
 
 #include <algorithm>
@@ -2892,6 +2896,12 @@ int export_interchange(
     const std::filesystem::path& project_path,
     const std::filesystem::path& output_path,
     bool binary_container, std::uint32_t graph_bake_resolution = 0) {
+    const auto linked = carto::project::has_condition_link_companions(project_path);
+    if (!linked) { print_error(linked.error()); return EXIT_FAILURE; }
+    if (linked.value()) {
+        std::cerr << "error: linked CONDITION geometry requires validated scene resolution before export\n";
+        return EXIT_FAILURE;
+    }
     carto::providers::Registry providers;
     if (auto result = carto::io::register_builtin_gltf_providers(providers); !result) {
         print_error(result.error().with_context("glTF exporter provider"));
@@ -3016,10 +3026,53 @@ int inspect_preparation_profile(const std::filesystem::path& path) {
     return EXIT_SUCCESS;
 }
 
+int print_preparation_report(const carto::production::PreparationOperationReport& report,
+                             const std::filesystem::path& output_root);
+
+#if defined(CARTO_CLI_HAS_LINKED_SCENE_PROVIDER)
+// Linked CONDITION scenes: the provider verifies the binding, journals, asset
+// projects and surface bundles, then every linked part is prepared under its
+// own source authority. Only the full scene scope is supported.
+int prepare_linked_project(int argc, char** argv) {
+    using namespace carto;
+    const std::filesystem::path project_path(argv[2]);
+    const std::filesystem::path output_root(argv[3]);
+    int scope_index = 4;
+    production::PreparationProfile profile = production::portable_preparation_profile();
+    if (argc >= 7 && std::string_view(argv[scope_index]) == "--profile") {
+        const auto loaded = load_preparation_profile(argv[scope_index + 1]);
+        if (!loaded) { print_error(loaded.error()); return EXIT_FAILURE; }
+        profile = loaded.value();
+        scope_index += 2;
+    }
+    if (scope_index + 1 != argc || std::string_view(argv[scope_index]) != "scene") {
+        std::cerr << "error: linked CONDITION scenes are prepared only with the full 'scene' scope\n";
+        return EXIT_FAILURE;
+    }
+    const auto current = production::read_selected_prepared_scene(output_root);
+    if (!current) { print_error(current.error().with_context("prepared output baseline")); return EXIT_FAILURE; }
+    std::optional<assets::Sha256Digest> expected;
+    if (current.value().has_value()) expected = current.value()->prepared_scene_digest;
+    const auto report = carto::linked_scene::prepare_linked_scene(project_path, output_root, profile, expected);
+    return print_preparation_report(report, output_root);
+}
+#endif
+
 int prepare_project(int argc, char** argv) {
     using namespace carto;
     const std::filesystem::path project_path(argv[2]);
     const std::filesystem::path output_root(argv[3]);
+    const auto linked = project::has_condition_link_companions(project_path);
+    if (!linked) { print_error(linked.error()); return EXIT_FAILURE; }
+    if (linked.value()) {
+#if defined(CARTO_CLI_HAS_LINKED_SCENE_PROVIDER)
+        return prepare_linked_project(argc, argv);
+#else
+        std::cerr << "error: linked CONDITION geometry requires validated scene resolution before preparation "
+                     "(this build has no CONDITION linked-scene provider)\n";
+        return EXIT_FAILURE;
+#endif
+    }
     int scope_index = 4;
     production::PreparationProfile profile =
         production::portable_preparation_profile();
@@ -3101,6 +3154,12 @@ int prepare_project(int argc, char** argv) {
         .stop_token = {},
     };
     const auto report = production::prepare_and_publish(document.value(), request);
+    return print_preparation_report(report, output_root);
+}
+
+int print_preparation_report(const carto::production::PreparationOperationReport& report,
+                             const std::filesystem::path& output_root) {
+    using namespace carto;
     for (const auto& diagnostic : report.diagnostics) {
         std::cerr << "diagnostic code=" << diagnostic.code
                   << " stage=" << preparation_stage_name(diagnostic.stage)

@@ -5,6 +5,7 @@ add_library(carto_application STATIC
     src/shared_rig.cpp
     src/material_library.cpp
     src/object_aging.cpp
+    src/viewport_appearance.cpp
 )
 
 target_include_directories(carto_application

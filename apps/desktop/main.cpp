@@ -11,6 +11,7 @@
 #endif
 
 #include <windows.h>
+#include <shellapi.h>
 #include <commdlg.h>
 #include <dwmapi.h>
 #include <mmsystem.h>
@@ -27,6 +28,9 @@
 #include "carto_studio_dock.hpp"
 #include "interchange_export_feedback.hpp"
 #include "prepared_publication_feedback.hpp"
+#ifdef CARTO_HAS_LINKED_SCENE_PROVIDER
+#include <carto/linked_scene_provider_factory.hpp>
+#endif
 #include "reference_image_decoder.hpp"
 #include "reference_image_projection.hpp"
 #include "studio_browser.hpp"
@@ -58,6 +62,8 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
     LPARAM l_param);
 
 #include <carto/application/application.hpp>
+#include <carto/editor/selection_frame.hpp>
+#include <carto/project/condition_link_guard.hpp>
 #if defined(CARTO_DESKTOP_HAS_D3D12_BAKE)
 #include <carto/d3d12/bake_graph.hpp>
 #endif
@@ -3941,6 +3947,13 @@ struct DesktopState {
     static constexpr float kTranslateGizmoHitRadius = 14.0F;
 
     DesktopState() : ui(session) {
+#ifdef CARTO_HAS_LINKED_SCENE_PROVIDER
+        if (auto installed = session.install_linked_scene_provider(
+                carto::linked_scene::make_provider()); !installed) {
+            action_feedback = installed.error().message;
+            action_feedback_error = true;
+        }
+#endif
         workbench.scene = true;
         workbench.inspector = true;
         workbench.assets = true;
@@ -6309,6 +6322,21 @@ struct DesktopState {
     }
 
     bool save_project(const UiSnapshot& snapshot, bool save_as = false) {
+        if (snapshot.opened_condition_link_companions) {
+            // Each Save selects a new immutable generation; cancel leaves the
+            // current document, history and source untouched.
+            const auto name = choose_file(true, FileDialogKind::project);
+            if (!name) return false;
+            auto generation_directory = *name;
+            generation_directory += ".linked";
+            const bool saved = dispatch(carto::application::SaveProjectAction{
+                std::nullopt, generation_directory, "Human saved linked scene"});
+            if (saved) {
+                action_feedback = "Linked generation saved to " + generation_directory.string();
+                action_feedback_error = false;
+            }
+            return saved;
+        }
         if (!save_as && snapshot.project_path.has_value()) {
             return dispatch(carto::application::SaveProjectAction{std::nullopt});
         }
@@ -8868,6 +8896,13 @@ struct DesktopState {
                         L"Cartographer export unavailable", MB_OK | MB_ICONWARNING);
             return;
         }
+        const auto linked = carto::project::has_condition_link_companions(*snapshot.project_path);
+        if (!linked || linked.value() || snapshot.opened_condition_link_companions) {
+            MessageBoxW(window,
+                L"This scene has external CONDITION links that require validated resolution before export.",
+                L"Cartographer export unavailable", MB_OK | MB_ICONWARNING);
+            return;
+        }
         const auto path = choose_file(true,
             binary_container ? FileDialogKind::glb : FileDialogKind::gltf);
         if (!path.has_value()) return;
@@ -8924,6 +8959,58 @@ struct DesktopState {
                         L"Save the project before preparation so every product is bound to one durable source revision.",
                         L"Cartographer preparation unavailable", MB_OK | MB_ICONWARNING);
             return;
+        }
+        const auto linked = carto::project::has_condition_link_companions(*snapshot.project_path);
+        if (!linked) {
+            MessageBoxW(window, wide(linked.error().message).c_str(),
+                        L"Cartographer preparation unavailable", MB_OK | MB_ICONERROR);
+            return;
+        }
+        if (linked.value() || snapshot.opened_condition_link_companions) {
+#ifdef CARTO_HAS_LINKED_SCENE_PROVIDER
+            if (selected_only) {
+                MessageBoxW(window,
+                    L"Linked CONDITION scenes are prepared only as a full scene, so every linked part keeps its source authority.",
+                    L"Cartographer preparation scope", MB_OK | MB_ICONWARNING);
+                return;
+            }
+            const std::filesystem::path linked_output{snapshot.project_path->string() + ".prepared"};
+            const auto linked_current = carto::production::read_selected_prepared_scene(linked_output);
+            if (!linked_current) {
+                MessageBoxW(window, wide(linked_current.error().message).c_str(),
+                            L"Cartographer preparation baseline invalid", MB_OK | MB_ICONERROR);
+                return;
+            }
+            std::optional<carto::assets::Sha256Digest> linked_expected;
+            if (linked_current.value().has_value())
+                linked_expected = linked_current.value()->prepared_scene_digest;
+            const auto report = carto::linked_scene::prepare_linked_scene(*snapshot.project_path,
+                linked_output, carto::production::portable_preparation_profile(), linked_expected);
+            std::string message;
+            if (!report.succeeded()) {
+                message = "Linked scene preparation was refused; nothing was published.";
+                for (const auto& diagnostic : report.diagnostics) {
+                    message += "\n\n" + diagnostic.code + "\n" + diagnostic.message;
+                    if (message.size() > 6'000U) break;
+                }
+                MessageBoxW(window, wide(message).c_str(), L"Cartographer preparation", MB_OK | MB_ICONERROR);
+                return;
+            }
+            message = "Prepared linked scene: " + std::to_string(report.envelope->assets.size()) +
+                " asset(s), " + std::to_string(report.envelope->nodes.size()) + " node(s), " +
+                std::to_string(report.envelope->products.size()) +
+                " verified product(s); linked parts keep their own source authority.\n\nRevision " +
+                report.publication->prepared_scene_digest.hex() + "\nOutput " + linked_output.string();
+            action_feedback = "Prepared linked scene " + report.publication->prepared_scene_digest.hex().substr(0, 12);
+            action_feedback_error = false;
+            MessageBoxW(window, wide(message).c_str(), L"Cartographer preparation", MB_OK | MB_ICONINFORMATION);
+            return;
+#else
+            MessageBoxW(window,
+                L"This scene has external CONDITION links and this build has no linked-scene provider.",
+                L"Cartographer preparation unavailable", MB_OK | MB_ICONWARNING);
+            return;
+#endif
         }
         const auto document = carto::project::ProjectDocument::load(
             snapshot.project_path.value());
@@ -11598,6 +11685,28 @@ struct DesktopState {
         const bool request_camera_frame =
             frame_button_pressed || frame_hotkey_pressed;
         ImGui::SameLine();
+        const bool frame_selection_input_allowed =
+            !workbench_placement_click_consumed && !showing_agent_preview &&
+            !workbench.native_drag.has_value() && !workbench.placement_mode.has_value() &&
+            !native_transform_drag.has_value() && !native_sculpt_stroke.has_value() &&
+            !native_knife_stroke.has_value() && !mesh_knife_mode_active;
+        const bool has_selected_frame_target = !snapshot.selection.objects.empty() ||
+            snapshot.selection.component_object.has_value() ||
+            !snapshot.selection.component_groups.empty();
+        const bool can_frame_selection = has_selected_frame_target && frame_selection_input_allowed;
+        ImGui::BeginDisabled(!can_frame_selection);
+        const bool selected_frame_button = ImGui::SmallButton("Frame selected");
+        ImGui::EndDisabled();
+        const bool selected_frame_hotkey = can_frame_selection &&
+            carto::ui::work_surface_camera_hotkey_allowed(
+                ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows),
+                frame_selection_input_allowed,
+                frame_shortcut_io.WantTextInput,
+                frame_shortcut_io.WantCaptureKeyboard,
+                ImGui::IsKeyPressed(ImGuiKey_F, false));
+        const bool request_selected_frame =
+            !request_camera_frame && (selected_frame_button || selected_frame_hotkey);
+        ImGui::SameLine();
         if (work_surface_pan_tool_active) {
             ImGui::PushStyleColor(ImGuiCol_Button, color(snapshot.colors.panel_selected));
             ImGui::PushStyleColor(ImGuiCol_Text, color(snapshot.colors.accent_primary));
@@ -11650,7 +11759,7 @@ struct DesktopState {
             ImGui::TextDisabled("View %.3f m", work_surface_camera.view_height());
         }
         if (ImGui::CollapsingHeader("Navigation & snapping")) {
-            ImGui::TextDisabled("Pan view · Arrow keys pan · Home frames all");
+            ImGui::TextDisabled("Pan view · Arrow keys pan · Home frames all · F frames selected");
             ImGui::SameLine();
             const ImVec2 nudge_extent = ImGui::GetContentRegionAvail();
             const auto nudge_view = [this, &nudge_extent](double x, double y) {
@@ -11988,6 +12097,56 @@ struct DesktopState {
                 if (framed) work_surface_camera_framed = true;
             }
             if (!framed) camera_frame_failed = true;
+        }
+
+        if (request_selected_frame) {
+            // Frames the same compiled instances the viewport draws. A selected
+            // object without rendered geometry reports that instead of framing
+            // something else.
+            std::vector<carto::scene::SceneObject> frame_objects;
+            frame_objects.reserve(snapshot.objects.size());
+            for (const auto& view : snapshot.objects) frame_objects.push_back(view.object);
+            auto frame_selection = snapshot.selection.objects;
+            if (snapshot.selection.component_object)
+                frame_selection.push_back(*snapshot.selection.component_object);
+            for (const auto& group : snapshot.selection.component_groups)
+                frame_selection.push_back(group.object);
+            const auto selected_bounds = invalid_render_snapshot
+                ? carto::core::Result<carto::core::Bounds3d>::failure(carto::core::Diagnostic(
+                      carto::core::ErrorCode::invalid_state,
+                      "Selection cannot be framed until the viewport matches the current project."))
+                : carto::editor::selected_render_bounds(frame_objects, instances, frame_selection);
+            if (!selected_bounds) {
+                action_feedback = selected_bounds.error().message;
+                action_feedback_error = true;
+            } else {
+                const auto& b = selected_bounds.value();
+                const double half_x = std::max(1.0e-6, b.maximum.x - b.minimum.x) * 0.5;
+                const double half_y = std::max(1.0e-6, b.maximum.y - b.minimum.y) * 0.5;
+                const double half_z = std::max(1.0e-6, b.maximum.z - b.minimum.z) * 0.5;
+                bool framed = false;
+                if (perspective_camera_active) {
+                    framed = perspective_camera.frame(
+                        {b.minimum.x + half_x, b.minimum.y + half_y, b.minimum.z + half_z},
+                        std::max(1.0e-4, std::sqrt(half_x * half_x + half_y * half_y + half_z * half_z)),
+                        viewport_extent.x / viewport_extent.y);
+                    if (framed) {
+                        perspective_camera_framed = true;
+                        perspective_camera_project_bound = true;
+                        perspective_camera_project_generation = snapshot.project_generation;
+                        perspective_camera_project_revision = snapshot.project_revision;
+                    }
+                } else {
+                    framed = work_surface_camera.frame(
+                        {b.minimum.x + half_x, b.minimum.z + half_z},
+                        {half_x * 2.0, half_z * 2.0}, viewport_extent);
+                    if (framed) work_surface_camera_framed = true;
+                }
+                if (!framed) {
+                    action_feedback = "Selected geometry cannot be framed in this viewport.";
+                    action_feedback_error = true;
+                }
+            }
         }
 
         const bool canvas_hovered = ImGui::IsMouseHoveringRect(
@@ -13551,6 +13710,24 @@ struct DesktopState {
         std::vector<ProjectedMesh> projected_meshes;
         projected_meshes.reserve(instances.size());
         std::vector<ProjectedTriangle> projected_triangles;
+        // Authored appearance: project faces resolve region -> assignment ->
+        // material; linked parts carry provider-sampled authored colors. A
+        // face without a real mapping is outlined, never filled with a
+        // stand-in color.
+        std::map<std::uint64_t, const carto::application::LinkedViewportPart*> linked_parts_by_object;
+        if (!showing_agent_preview && snapshot.viewport.linked) {
+            for (const auto& part : snapshot.viewport.linked->parts)
+                linked_parts_by_object.emplace(part.scene_object, &part);
+        }
+        const auto* mesh_appearance = !showing_agent_preview && snapshot.viewport.mesh_appearance
+            ? snapshot.viewport.mesh_appearance.get() : nullptr;
+        std::size_t unmapped_triangles = 0U;
+        std::size_t untextured_authored_triangles = 0U;
+        const auto linear_to_srgb = [](double value) {
+            value = std::clamp(value, 0.0, 1.0);
+            return value <= 0.0031308 ? value * 12.92 : 1.055 * std::pow(value, 1.0 / 2.4) - 0.055;
+        };
+        const Vec3d appearance_light = Vec3d{0.35, 0.84, 0.41}.normalized();
         std::vector<ProjectedObjectHit> projected_object_hits;
         for (const auto& instance : instances) {
             if (instance.mesh == nullptr || !instance.mesh->valid()) {
@@ -13753,37 +13930,93 @@ struct DesktopState {
             const bool face_selected = snapshot.selection.mode == carto::editor::SelectionMode::face &&
                 std::find(snapshot.selection.faces.begin(), snapshot.selection.faces.end(),
                           instance.mesh->triangle_faces[index / 3U]) != snapshot.selection.faces.end();
-            ImU32 fill = face_selected ? rgba(snapshot.colors.semantic_warning, 0.52F)
-                                        : (highlighted ? rgba(snapshot.colors.accent_primary, 0.30F)
-                                                       : display_color(snapshot.colors.panel_hover, 0.18F));
-            if (viewport_view.spatial == carto::studio::ViewportSpatialMode::depth &&
-                depth_far > depth_near) {
-                const auto amount = carto::studio::normalize_viewport_depth(
-                    projected_triangle.average_depth, depth_near, depth_far);
-                if (amount) {
-                    const ImVec4 near_color = color(snapshot.colors.accent_secondary);
-                    // Far depth settles into the blue-black canvas identity.
-                    constexpr float far_rgb[3] = {0.03F, 0.05F, 0.09F};
-                    const float u = static_cast<float>(amount.value());
-                    const auto ramp = carto::studio::map_viewport_color({
-                        near_color.x + (far_rgb[0] - near_color.x) * u,
-                        near_color.y + (far_rgb[1] - near_color.y) * u,
-                        near_color.z + (far_rgb[2] - near_color.z) * u},
-                        viewport_view.color);
-                    if (ramp) {
-                        fill = ImGui::ColorConvertFloat4ToU32(ImVec4(
-                            static_cast<float>(ramp.value().x),
-                            static_cast<float>(ramp.value().y),
-                            static_cast<float>(ramp.value().z),
-                            face_selected ? 0.62F : (highlighted ? 0.42F : 0.30F)));
+            std::optional<carto::core::Vec4d> authored_color;
+            // Only meshes that carry a material-region layer (and linked
+            // parts) report faces without authored appearance; meshes with no
+            // region layer keep the normal fill and Depth/Structure modes.
+            bool appearance_expected = !instance.mesh_asset.has_value();
+            if (!instance.mesh_asset.has_value()) {
+                const auto linked = linked_parts_by_object.find(instance.object.value);
+                if (linked != linked_parts_by_object.end() &&
+                    index / 3U < linked->second->triangle_base_color.size()) {
+                    authored_color = linked->second->triangle_base_color[index / 3U];
+                }
+            } else if (mesh_appearance != nullptr) {
+                const auto appearance = mesh_appearance->find(*instance.mesh_asset);
+                if (appearance != mesh_appearance->end()) {
+                    appearance_expected = appearance->second.state !=
+                        carto::application::FaceAppearanceState::no_region_layer;
+                    const auto face = appearance->second.faces.find(
+                        instance.mesh->triangle_faces[index / 3U]);
+                    if (face != appearance->second.faces.end() &&
+                        face->second.state == carto::application::FaceAppearanceState::authored) {
+                        authored_color = face->second.base_color;
+                        if (face->second.base_color_texture_not_sampled) ++untextured_authored_triangles;
                     }
                 }
             }
-            if (!structure_view) {
-                draw->AddTriangleFilled(a, b, c, fill);
-                draw->AddTriangle(a, b, c,
-                    display_color(snapshot.colors.border_soft, 0.82F), 1.0F);
+            if (authored_color.has_value()) {
+                const Vec3d normal = carto::core::cross(
+                    source_points[1U].world - source_points[0U].world,
+                    source_points[2U].world - source_points[0U].world).normalized();
+                const double light = normal.finite()
+                    ? 0.55 + 0.45 * std::abs(carto::core::dot(normal, appearance_light)) : 1.0;
+                ImVec4 shaded(
+                    static_cast<float>(linear_to_srgb(authored_color->x * light)),
+                    static_cast<float>(linear_to_srgb(authored_color->y * light)),
+                    static_cast<float>(linear_to_srgb(authored_color->z * light)),
+                    static_cast<float>(std::clamp(authored_color->w, 0.0, 1.0)));
+                if (face_selected || highlighted) {
+                    const ImVec4 accent = color(face_selected ? snapshot.colors.semantic_warning
+                                                              : snapshot.colors.accent_primary);
+                    const float mix = face_selected ? 0.55F : 0.35F;
+                    shaded = ImVec4(shaded.x + (accent.x - shaded.x) * mix,
+                        shaded.y + (accent.y - shaded.y) * mix,
+                        shaded.z + (accent.z - shaded.z) * mix, shaded.w);
+                }
+                if (!structure_view)
+                    draw->AddTriangleFilled(a, b, c, ImGui::ColorConvertFloat4ToU32(shaded));
+                draw->AddTriangle(a, b, c, rgba(snapshot.colors.border_soft, 0.30F), 1.0F);
+            } else {
+                ImU32 fill = face_selected ? rgba(snapshot.colors.semantic_warning, 0.52F)
+                                            : (highlighted ? rgba(snapshot.colors.accent_primary, 0.30F)
+                                                           : display_color(snapshot.colors.panel_hover, 0.18F));
+                if (viewport_view.spatial == carto::studio::ViewportSpatialMode::depth &&
+                    depth_far > depth_near) {
+                    const auto amount = carto::studio::normalize_viewport_depth(
+                        projected_triangle.average_depth, depth_near, depth_far);
+                    if (amount) {
+                        const ImVec4 near_color = color(snapshot.colors.accent_secondary);
+                        // Far depth settles into the blue-black canvas identity.
+                        constexpr float far_rgb[3] = {0.03F, 0.05F, 0.09F};
+                        const float u = static_cast<float>(amount.value());
+                        const auto ramp = carto::studio::map_viewport_color({
+                            near_color.x + (far_rgb[0] - near_color.x) * u,
+                            near_color.y + (far_rgb[1] - near_color.y) * u,
+                            near_color.z + (far_rgb[2] - near_color.z) * u},
+                            viewport_view.color);
+                        if (ramp) {
+                            fill = ImGui::ColorConvertFloat4ToU32(ImVec4(
+                                static_cast<float>(ramp.value().x),
+                                static_cast<float>(ramp.value().y),
+                                static_cast<float>(ramp.value().z),
+                                face_selected ? 0.62F : (highlighted ? 0.42F : 0.30F)));
+                        }
+                    }
+                }
+                if (appearance_expected) {
+                    ++unmapped_triangles;
+                    if (!structure_view && (face_selected || highlighted)) draw->AddTriangleFilled(a, b, c, fill);
+                    draw->AddTriangle(a, b, c, rgba(snapshot.colors.semantic_warning, 0.85F), 1.0F);
+                } else if (!structure_view) {
+                    draw->AddTriangleFilled(a, b, c, fill);
+                    draw->AddTriangle(a, b, c,
+                        display_color(snapshot.colors.border_soft, 0.82F), 1.0F);
+                }
             }
+            // Linked parts are display-only here: their face IDs belong to the
+            // linked source asset, so they never feed component picking/sculpt.
+            if (!instance.mesh_asset.has_value()) continue;
             faces.push_back({instance.object, instance.mesh->triangle_faces[index / 3U], {a, b, c}});
             if (perspective_camera_active ||
                 (sculpt_target.has_value() &&
@@ -13837,6 +14070,23 @@ struct DesktopState {
                     clipped_edge->camera_depth,
                     perspective_camera_active});
             }
+        }
+        if (!showing_agent_preview && (unmapped_triangles != 0U || untextured_authored_triangles != 0U ||
+                !linked_parts_by_object.empty())) {
+            std::string legend = "Authored materials";
+            if (!linked_parts_by_object.empty())
+                legend += " · " + std::to_string(linked_parts_by_object.size()) +
+                    " linked CONDITION parts (verified)";
+            if (unmapped_triangles != 0U)
+                legend += " · " + std::to_string(unmapped_triangles) +
+                    " triangles have no authored material (outlined, not filled)";
+            if (untextured_authored_triangles != 0U)
+                legend += " · " + std::to_string(untextured_authored_triangles) +
+                    " use a base-color texture shown as factor only";
+            draw->AddText(origin + ImVec2(8.0F, extent.y - 22.0F),
+                rgba(unmapped_triangles != 0U ? snapshot.colors.semantic_warning
+                                              : snapshot.colors.text_secondary, 0.95F),
+                legend.c_str());
         }
         if (!perspective_viewshed_cells.empty()) {
             std::string depth_warning;
@@ -31934,6 +32184,23 @@ int run(HINSTANCE instance, int show_command) {
             state.material_profile_auto_close = !(hold && std::string_view(hold)=="1");
         }
 #endif
+
+    // `--open <project>` opens a project at launch through the same human
+    // Open action the File menu dispatches (failures show in the status bar).
+    {
+        int argument_count = 0;
+        LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argument_count);
+        if (arguments != nullptr) {
+            for (int index = 1; index + 1 < argument_count; ++index) {
+                if (std::wstring_view(arguments[index]) == L"--open") {
+                    static_cast<void>(state.dispatch(carto::application::OpenProjectAction{
+                        std::filesystem::path(arguments[index + 1])}));
+                    break;
+                }
+            }
+            LocalFree(arguments);
+        }
+    }
 
     trace_desktop_startup("message.loop");
     MSG message{};

@@ -752,7 +752,7 @@ PreparationOperationReport prepare_and_publish(
             source_namespace, request.stop_token)) {
         return report;
     }
-    const auto envelope = compose_prepared_scene(
+    auto envelope = compose_prepared_scene(
         source_namespace, document, scope.value(), request.profile.identity,
         profile_digest.value(), inputs);
     if (!envelope) {
@@ -760,6 +760,23 @@ PreparationOperationReport prepare_and_publish(
             source_namespace, std::nullopt, std::nullopt,
             "prepared-scene.envelope");
         return report;
+    }
+    std::optional<PreparedLinkedComposition> linked;
+    if (request.linked != nullptr) {
+        if (scope.value().kind != PreparationScopeKind::scene) {
+            record_failure(report, PreparationStage::verify,
+                validation("linked parts are prepared only with the full scene scope"),
+                source_namespace, std::nullopt, std::nullopt, "scene.linked-sources");
+            return report;
+        }
+        auto appended = append_prepared_linked_parts(
+            envelope.value(), prepared_materials.value(), *request.linked);
+        if (!appended) {
+            record_failure(report, PreparationStage::verify, appended.error(),
+                source_namespace, std::nullopt, std::nullopt, "scene.linked-sources");
+            return report;
+        }
+        linked = std::move(appended).value();
     }
     report.envelope = envelope.value();
 
@@ -786,8 +803,22 @@ PreparationOperationReport prepare_and_publish(
         payload_map.emplace(
             "mesh." + std::to_string(mesh_asset) + ".lookdev", serialized.value());
     }
+    if (linked.has_value()) {
+        payload_map.emplace("source.material-catalog",
+            text_bytes(linked->material_catalog.serialize()));
+        for (auto& [identity, bytes] : linked->payloads) payload_map.emplace(identity, std::move(bytes));
+        for (const auto& [identity, texture] : linked->textures_to_capture) {
+            const auto captured = read_texture_source(request.source_root, texture);
+            if (!captured) {
+                record_failure(report, PreparationStage::verify, captured.error(),
+                    source_namespace, texture.id, std::nullopt, "scene.linked-sources");
+                return report;
+            }
+            payload_map.emplace(identity, captured.value());
+        }
+    }
     if (!prepared_materials.value().empty()) {
-        payload_map.emplace(
+        if (!linked.has_value()) payload_map.emplace(
             "source.material-catalog",
             text_bytes(prepared_materials.value().serialize()));
         for (const auto& [texture_id, texture] : prepared_materials.value().textures()) {

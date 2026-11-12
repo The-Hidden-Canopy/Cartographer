@@ -122,6 +122,9 @@ struct PreparationOperationRequest {
     // Once atomic publication begins it completes; cancellation never exposes
     // a partial revision or replaces the last valid selector.
     std::stop_token stop_token;
+    // Optional verified externally linked parts (scene scope only). Borrowed
+    // for the duration of the call; each part keeps its own source authority.
+    const PreparedLinkedSceneInput* linked = nullptr;
 };
 
 struct PreparationOperationReport {

@@ -34,3 +34,10 @@ if(TARGET carto_d3d12_scene)
     carto_target(cartographer_scene_render)
     install(TARGETS cartographer_scene_render RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
+
+# Explicit opt-in private linked-scene provider (CARTO_LINKED_SCENE_PROVIDER_ROOT,
+# defined at the top level); without it linked scenes refuse.
+if(TARGET carto_linked_scene_provider)
+    target_compile_definitions(cartographer_cli PRIVATE CARTO_CLI_HAS_LINKED_SCENE_PROVIDER=1)
+    target_link_libraries(cartographer_cli PRIVATE carto_linked_scene_provider)
+endif()

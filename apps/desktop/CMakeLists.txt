@@ -106,6 +106,12 @@ target_include_directories(cartographer_desktop PRIVATE
     ${CARTO_IMGUI_ROOT}/backends
 )
 
+# Explicit opt-in private linked-scene provider (CARTO_LINKED_SCENE_PROVIDER_ROOT).
+if(TARGET carto_linked_scene_provider)
+    target_compile_definitions(cartographer_desktop PRIVATE CARTO_HAS_LINKED_SCENE_PROVIDER=1)
+    target_link_libraries(cartographer_desktop PRIVATE carto_linked_scene_provider)
+endif()
+
 carto_target(cartographer_desktop)
 
 if(NOT CARTO_DESKTOP_D3D12_COMPILE_CHECK)
