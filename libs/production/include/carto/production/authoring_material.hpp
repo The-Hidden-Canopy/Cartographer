@@ -63,6 +63,8 @@ struct AuthoringMaterialGpuPacket {
 class AuthoringMaterialProgram final {
   public:
     AuthoringMaterialProgram() = default;
+    // False for a default-constructed program that was never compiled.
+    [[nodiscard]] bool executable() const noexcept { return impl_ != nullptr; }
     [[nodiscard]] core::Result<AuthoringMaterialSample>
     evaluate(const AuthoringSurfaceSample &surface) const;
     [[nodiscard]] std::optional<render::UvSetId> uv_set() const;

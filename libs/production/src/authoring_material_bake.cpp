@@ -12,6 +12,9 @@ core::Result<AuthoringMaterialBake> bake_authoring_material(
             throw std::runtime_error("material bake resolution must be a power of two from "+
                 std::to_string(kMinAuthoringMaterialBakeResolution)+" through "+
                 std::to_string(kMaxAuthoringMaterialBakeResolution));
+        if(!program.executable())
+            return Result::failure({core::ErrorCode::invalid_argument,
+                "material bake requires a compiled material program"});
         const auto packet=program.gpu_packet();
         if(!packet)return Result::failure(packet.error());
         const double step=1./resolution;
