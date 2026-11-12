@@ -1041,6 +1041,134 @@ void mirrored_uv_tangent_domains_preserve_corner_fidelity() {
         "valid imported tangent frames remain authoritative instead of being regenerated");
 }
 
+void pbr_float32_projection_preserves_triangle_and_uv_orientation() {
+    using namespace carto;
+    using namespace production;
+    const AuthoritativeSource source{
+        "project/float32-fixture", core::Revision{2U}, digest("float32-upload-source")};
+    RenderMeshCompileOptions options;
+    options.uv_set = 7U;
+    options.generate_tangents = true;
+    const auto compiled = compile_render_mesh_artifact(
+        source, render_mesh_fixture(false, false), options);
+    require(static_cast<bool>(compiled), "float32 upload fixture compiles");
+    auto artifact = compiled.value();
+    // Keep one valid triangle so every numerical case isolates one boundary.
+    std::vector<RenderMeshVertex> triangle_vertices;
+    for (std::size_t i = 0U; i < 3U; ++i) {
+        triangle_vertices.push_back(artifact.vertices[artifact.indices[i]]);
+    }
+    artifact.vertices = std::move(triangle_vertices);
+    artifact.indices = {0U, 1U, 2U};
+    artifact.triangle_faces.resize(1U);
+    artifact.submeshes = {{std::nullopt, 0U, 3U}};
+    require(static_cast<bool>(artifact.validate()), "single-triangle source artifact validates");
+    const auto baseline = pack_pbr_mesh_upload(artifact);
+    require(static_cast<bool>(baseline), "representable baseline packs for native PBR");
+
+    auto repeated_index = baseline.value();
+    repeated_index.indices[1U] = repeated_index.indices[0U];
+    require(!repeated_index.validate(), "standalone upload rejects repeated triangle indices");
+    auto collinear = baseline.value();
+    collinear.vertices[0U].position = {0.0F, 0.0F, 0.0F, 1.0F};
+    collinear.vertices[1U].position = {1.0F, 0.0F, 0.0F, 1.0F};
+    collinear.vertices[2U].position = {2.0F, 0.0F, 0.0F, 1.0F};
+    require(!collinear.validate(), "standalone upload rejects distinct but collinear vertices");
+
+    const auto require_narrowing_refusal = [](const RenderMeshArtifact& candidate,
+                                             std::string_view reason) {
+        require(static_cast<bool>(candidate.validate()), "narrowing fixture is valid in double precision");
+        const auto before = candidate.serialize();
+        require(static_cast<bool>(before), "narrowing fixture serializes before conversion");
+        const auto packed = pack_pbr_mesh_upload(candidate);
+        require(!packed && packed.error().message.find(reason) != std::string::npos,
+            "native PBR narrowing refuses the specific fidelity loss");
+        const auto after = candidate.serialize();
+        require(after && after.value() == before.value(),
+            "refused float32 projection leaves the input artifact unchanged");
+    };
+
+    auto collapsed_geometry = artifact;
+    for (auto& vertex : collapsed_geometry.vertices) vertex.position.x += 100'000'000.0;
+    require_narrowing_refusal(collapsed_geometry, "collapsed or degenerate triangle");
+    auto collapsed_uv = artifact;
+    for (auto& vertex : collapsed_uv.vertices) vertex.uv->x += 100'000'000.0;
+    require_narrowing_refusal(collapsed_uv, "authored UV orientation");
+
+    // These corners have negative double-precision area but positive area
+    // after float32 rounding. No corner is merged, so a zero-area check alone
+    // cannot detect the reversed surface/UV orientation.
+    const double unit = std::ldexp(1.0, -23);
+    const std::array<core::Vec2d, 3U> reversed_coordinates{{
+        {0.0, 0.0}, {1.0 + 0.6 * unit, 1.0 + 0.4 * unit},
+        {2.0 + 0.98 * unit, 2.0 - 0.98 * unit}}};
+    auto reversed_geometry = artifact;
+    auto reversed_uv = artifact;
+    for (std::size_t i = 0U; i < 3U; ++i) {
+        const auto value = reversed_coordinates[i];
+        reversed_geometry.vertices[i].position = {value.x, value.y, 0.0};
+        reversed_uv.vertices[i].uv = value;
+    }
+    require_narrowing_refusal(reversed_geometry, "reverses a triangle orientation");
+    require_narrowing_refusal(reversed_uv, "authored UV orientation");
+
+    auto invented_uv_area = artifact;
+    invented_uv_area.vertices[0U].uv = core::Vec2d{0.0, 0.0};
+    invented_uv_area.vertices[1U].uv = core::Vec2d{1.0 + unit, 1.0 + 2.0 * unit};
+    invented_uv_area.vertices[2U].uv = core::Vec2d{3.0 + 3.0 * unit, 3.0 + 6.0 * unit};
+    require_narrowing_refusal(invented_uv_area, "authored UV orientation");
+
+    auto large_geometry = artifact;
+    for (auto& vertex : large_geometry.vertices) vertex.position = vertex.position * 1e30;
+    require(static_cast<bool>(pack_pbr_mesh_upload(large_geometry)),
+        "representable large triangles do not overflow the validation arithmetic");
+    auto tiny_uv = artifact;
+    for (auto& vertex : tiny_uv.vertices) *vertex.uv = *vertex.uv * 1e-8;
+    require(static_cast<bool>(pack_pbr_mesh_upload(tiny_uv)),
+        "small but representable UV area is not rejected by an absolute area threshold");
+    auto underflow_uv = artifact;
+    underflow_uv.vertices[0U].uv = core::Vec2d{0.0, 0.0};
+    underflow_uv.vertices[1U].uv = core::Vec2d{1e-170, 0.0};
+    underflow_uv.vertices[2U].uv = core::Vec2d{0.0, 1e-170};
+    require_narrowing_refusal(underflow_uv, "authored UV orientation");
+    auto anisotropic_uv = artifact;
+    anisotropic_uv.vertices[0U].uv = core::Vec2d{0.0, 0.0};
+    anisotropic_uv.vertices[1U].uv = core::Vec2d{1e-10, 1e-320};
+    anisotropic_uv.vertices[2U].uv = core::Vec2d{2e-10, 1e-320};
+    require_narrowing_refusal(anisotropic_uv, "authored UV orientation");
+    auto subtraction_loss_uv = artifact;
+    subtraction_loss_uv.vertices[0U].uv = core::Vec2d{1.0, 1.0};
+    subtraction_loss_uv.vertices[1U].uv = core::Vec2d{1e-170, 0.0};
+    subtraction_loss_uv.vertices[2U].uv = core::Vec2d{0.0, 1e-170};
+    require_narrowing_refusal(subtraction_loss_uv, "cannot certify authored UV orientation");
+    auto mirrored_uv = artifact;
+    for (auto& vertex : mirrored_uv.vertices) {
+        vertex.uv->x = -vertex.uv->x;
+        vertex.tangent->x = -vertex.tangent->x;
+        vertex.tangent->w = -vertex.tangent->w;
+    }
+    require(static_cast<bool>(pack_pbr_mesh_upload(mirrored_uv)),
+        "representable negative UV orientation remains supported");
+    auto degenerate_uv = artifact;
+    for (auto& vertex : degenerate_uv.vertices) vertex.uv = core::Vec2d{};
+    require(static_cast<bool>(pack_pbr_mesh_upload(degenerate_uv)),
+        "explicit authored constant UVs remain constant without fabricating area");
+
+    auto no_uv = artifact;
+    for (auto& vertex : no_uv.vertices) {
+        vertex.uv.reset();
+        vertex.tangent.reset();
+    }
+    const auto constants = render::pack_material_for_gpu(render::StandardMaterial{});
+    require(static_cast<bool>(constants), "texture-free proof is valid");
+    const std::array materials{constants.value()};
+    require(static_cast<bool>(pack_pbr_mesh_upload(no_uv, materials)),
+        "texture-free neutral UV projection remains valid");
+    for (auto& vertex : no_uv.vertices) vertex.position.x += 100'000'000.0;
+    require(!pack_pbr_mesh_upload(no_uv, materials),
+        "texture-free proof does not bypass the geometry-collapse gate");
+}
+
 void render_mesh_artifact_is_deterministic_and_fail_closed() {
     using namespace carto;
     using namespace production;
@@ -1726,6 +1854,7 @@ int main() {
     spatial_cook_invalidation_is_sparse_and_fail_closed();
     artifact_store_binds_bytes_to_admitted_receipts();
     mirrored_uv_tangent_domains_preserve_corner_fidelity();
+    pbr_float32_projection_preserves_triangle_and_uv_orientation();
     render_mesh_artifact_is_deterministic_and_fail_closed();
     compiled_render_mesh_publishes_through_receipt_store();
     std::cout << "production closure tests passed\n";

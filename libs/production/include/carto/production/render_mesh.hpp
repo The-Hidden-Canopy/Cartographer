@@ -132,7 +132,10 @@ struct PbrMeshUpload {
 // the caller supplies one validated constants record per submesh, in submesh
 // order, and every record has no texture IDs. The caller must bind those
 // records to the current material sources. Values that cannot be represented
-// as finite float32 always fail closed.
+// as finite float32, collapsed/reversed geometry, and changed authored UV
+// orientation after narrowing fail closed, as do uncertain near-collinear UV
+// orientations. Source-degenerate UVs are allowed only when they provably
+// remain degenerate; missing texture-free UVs stay neutral.
 [[nodiscard]] core::Result<PbrMeshUpload> pack_pbr_mesh_upload(
     const RenderMeshArtifact& artifact);
 [[nodiscard]] core::Result<PbrMeshUpload> pack_pbr_mesh_upload(

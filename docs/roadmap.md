@@ -6,6 +6,8 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 
 ## 0.1 - current foundation
 
+- [ ] validate native PBR float32 geometry/UV orientation preservation: fail-closed upload checks and regression cases are implemented, with build, CTest, and GPU/visual acceptance pending ([scope and evidence](verification/pbr-float32-fidelity.md))
+
 - [ ] validate mirrored-UV generated tangent-domain preservation: source and regression cases are implemented, but build, CTest, and normal-map visual acceptance remain pending ([scope and evidence](verification/mirrored-uv-tangent-domains.md))
 
 - [x] projection-aware Front/Right surface and edge picking preserves affine source anchors and foreground ordering while retaining perspective reciprocal interpolation and existing source-admission gates

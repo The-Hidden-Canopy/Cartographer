@@ -1,5 +1,11 @@
 # Capability matrix
 
+Code-only continuation (2026-11-12): native PBR float32 projection refuses
+collapsed/reversed geometry and changed primary-UV orientation instead of
+accepting finite coordinates alone. Regression cases are authored but unrun;
+ABI, build, GPU, and visual acceptance are described in
+[native PBR float32 fidelity](verification/pbr-float32-fidelity.md).
+
 Code-only continuation (2026-11-12): generated render-mesh tangents separate
 mirrored primary-UV orientations before vertex deduplication while preserving
 authored frames and unrelated UV/color/material seams. Regression cases are

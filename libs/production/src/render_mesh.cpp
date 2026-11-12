@@ -194,6 +194,56 @@ bool same_vec3(core::Vec3d left, core::Vec3d right) {
     return left.x == right.x && left.y == right.y && left.z == right.z;
 }
 
+// Only the sign is needed. Scale the two determinant products by a common
+// power of two before subtraction, rather than multiplying tiny authored UVs
+// into zero. Scaling each product separately also handles anisotropic charts.
+// Return no value when rounding prevents a sign certificate; upload must then
+// refuse rather than equate an uncertain source chart with a collapsed one.
+std::optional<int> uv_orientation(core::Vec2d a, core::Vec2d b, core::Vec2d c) {
+    const auto first = b - a;
+    const auto second = c - a;
+    const auto sign = [](double value) { return (value > 0.0) - (value < 0.0); };
+    const int first_sign = sign(first.x) * sign(second.y);
+    const int second_sign = sign(first.y) * sign(second.x);
+    if (first_sign != second_sign) return (first_sign > second_sign) ? 1 : -1;
+    if (first_sign == 0) return 0;
+
+    int ax_exponent = 0, by_exponent = 0, ay_exponent = 0, bx_exponent = 0;
+    double ax = std::frexp(first.x, &ax_exponent);
+    const double by = std::frexp(second.y, &by_exponent);
+    double ay = std::frexp(first.y, &ay_exponent);
+    const double bx = std::frexp(second.x, &bx_exponent);
+    const int first_exponent = ax_exponent + by_exponent;
+    const int second_exponent = ay_exponent + bx_exponent;
+    const int common_exponent = std::max(first_exponent, second_exponent);
+    ax = std::scalbn(ax, first_exponent - common_exponent);
+    ay = std::scalbn(ay, second_exponent - common_exponent);
+    const double second_product = ay * bx;
+    // Compensate product rounding when the two normalized terms nearly cancel.
+    const double determinant = std::fma(ax, by, -second_product) +
+        std::fma(-ay, bx, second_product);
+    const double magnitude = std::abs(ax * by) + std::abs(second_product);
+    const double error_bound = 16.0 * std::numeric_limits<double>::epsilon() * magnitude;
+    if (std::abs(determinant) > error_bound) return sign(determinant);
+
+    // TwoDiff's residual detects information lost before the products were
+    // scaled. A computed zero is proof of collinearity only when those edge
+    // subtractions were exact as well. Other near-collinear cases fail closed.
+    const auto difference_tail = [](double left, double right, double difference) {
+        const double right_virtual = left - difference;
+        const double left_virtual = difference + right_virtual;
+        return (left - left_virtual) + (right_virtual - right);
+    };
+    if (determinant == 0.0 &&
+        difference_tail(b.x, a.x, first.x) == 0.0 &&
+        difference_tail(b.y, a.y, first.y) == 0.0 &&
+        difference_tail(c.x, a.x, second.x) == 0.0 &&
+        difference_tail(c.y, a.y, second.y) == 0.0) {
+        return 0;
+    }
+    return std::nullopt;
+}
+
 RenderVertexKey render_vertex_key(const RenderMeshVertex& vertex) {
     RenderVertexKey result{
         vertex.source_vertex.value,
@@ -806,10 +856,28 @@ core::Result<void> PbrMeshUpload::validate() const {
                 "PBR upload normal and tangent frame is not orthonormal"));
         }
     }
-    for (const std::uint32_t index : indices) {
-        if (index >= vertices.size()) {
+    for (std::size_t triangle = 0U; triangle < indices.size(); triangle += 3U) {
+        const auto first = indices[triangle];
+        const auto second = indices[triangle + 1U];
+        const auto third = indices[triangle + 2U];
+        if (first >= vertices.size() || second >= vertices.size() || third >= vertices.size()) {
             return core::Result<void>::failure(validation(
                 "PBR upload contains an out-of-range index"));
+        }
+        const auto position = [&](std::uint32_t index) {
+            const auto& value = vertices[index].position;
+            return core::Vec3d{value[0U], value[1U], value[2U]};
+        };
+        // Evaluate the actual float32 coordinates in double precision. This
+        // detects narrowing collapse without overflowing area arithmetic for
+        // otherwise representable large triangles.
+        const auto area = core::cross(position(second) - position(first),
+            position(third) - position(first));
+        const double area_squared = area.length_squared();
+        if (first == second || first == third || second == third || !area.finite() ||
+            !std::isfinite(area_squared) || area_squared <= 4e-24) {
+            return core::Result<void>::failure(validation(
+                "PBR float32 upload contains a collapsed or degenerate triangle"));
         }
     }
 
@@ -901,6 +969,40 @@ static core::Result<PbrMeshUpload> pack_pbr_mesh_upload_with_texture_policy(
 
     if (auto result = upload.validate(); !result) {
         return core::Result<PbrMeshUpload>::failure(result.error());
+    }
+    for (std::size_t triangle = 0U; triangle < artifact.indices.size(); triangle += 3U) {
+        const auto ia = artifact.indices[triangle];
+        const auto ib = artifact.indices[triangle + 1U];
+        const auto ic = artifact.indices[triangle + 2U];
+        const auto& a = artifact.vertices[ia];
+        const auto& b = artifact.vertices[ib];
+        const auto& c = artifact.vertices[ic];
+        const auto position = [&](std::uint32_t index) {
+            const auto& value = upload.vertices[index].position;
+            return core::Vec3d{value[0U], value[1U], value[2U]};
+        };
+        const auto source_area = core::cross(b.position - a.position, c.position - a.position);
+        const auto packed_area = core::cross(position(ib) - position(ia), position(ic) - position(ia));
+        if (core::dot(source_area, packed_area) <= 0.0) {
+            return core::Result<PbrMeshUpload>::failure(validation(
+                "float32 PBR conversion reverses a triangle orientation"));
+        }
+        if (a.uv) {
+            const auto uv = [&](std::uint32_t index) {
+                const auto& value = upload.vertices[index].uv0;
+                return core::Vec2d{value[0U], value[1U]};
+            };
+            const auto source_orientation = uv_orientation(*a.uv, *b.uv, *c.uv);
+            const auto packed_orientation = uv_orientation(uv(ia), uv(ib), uv(ic));
+            if (!source_orientation || !packed_orientation) {
+                return core::Result<PbrMeshUpload>::failure(validation(
+                    "float32 PBR conversion cannot certify authored UV orientation"));
+            }
+            if (*source_orientation != *packed_orientation) {
+                return core::Result<PbrMeshUpload>::failure(validation(
+                    "float32 PBR conversion collapses or changes authored UV orientation"));
+            }
+        }
     }
     return core::Result<PbrMeshUpload>::success(std::move(upload));
 }
