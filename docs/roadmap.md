@@ -6,6 +6,8 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 
 ## 0.1 - current foundation
 
+- [ ] validate mirrored-UV generated tangent-domain preservation: source and regression cases are implemented, but build, CTest, and normal-map visual acceptance remain pending ([scope and evidence](verification/mirrored-uv-tangent-domains.md))
+
 - [x] projection-aware Front/Right surface and edge picking preserves affine source anchors and foreground ordering while retaining perspective reciprocal interpolation and existing source-admission gates
 
 - [x] Top/Front/Right orthographic views feed saved-scene preview with preserved projection/scale, source-bound invalidation, bounded camera admission, conservative transformed-source depth fitting for Top, and independent authored-camera selection; CPU request integration and desktop compilation verified, native pixel acceptance still open

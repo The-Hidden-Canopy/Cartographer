@@ -1,5 +1,11 @@
 # Capability matrix
 
+Code-only continuation (2026-11-12): generated render-mesh tangents separate
+mirrored primary-UV orientations before vertex deduplication while preserving
+authored frames and unrelated UV/color/material seams. Regression cases are
+authored but unrun; build and visual acceptance remain pending. See
+[mirrored UV tangent domains](verification/mirrored-uv-tangent-domains.md).
+
 Local integration checkpoint (2026-11-01): twenty selected native CPU suites
 pass at `3e5639d`, covering the combined planar/relax UV history routes,
 native selected-instance and straight-sweep candidate producers, CAD extraction

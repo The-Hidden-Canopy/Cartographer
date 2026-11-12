@@ -181,6 +181,7 @@ struct RenderTangentKey {
     std::uint64_t normal_z = 0U;
     std::uint64_t uv0_u = 0U;
     std::uint64_t uv0_v = 0U;
+    bool mirrored = false;
 
     [[nodiscard]] auto operator<=>(const RenderTangentKey&) const noexcept = default;
 };
@@ -224,14 +225,16 @@ RenderVertexKey render_vertex_key(const RenderMeshVertex& vertex) {
 RenderTangentKey render_tangent_key(
     geometry::VertexId vertex_id,
     core::Vec2d uv,
-    core::Vec3d normal) {
+    core::Vec3d normal,
+    bool mirrored) {
     return {
         vertex_id.value,
         canonical_f64_bits(normal.x),
         canonical_f64_bits(normal.y),
         canonical_f64_bits(normal.z),
         canonical_f64_bits(uv.x),
-        canonical_f64_bits(uv.y)};
+        canonical_f64_bits(uv.y),
+        mirrored};
 }
 
 bool finite_array(std::span<const float> values) {
@@ -1240,6 +1243,78 @@ core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
             "source mesh exceeds the render-mesh submesh bound"));
     }
 
+    // Derive frames before render-vertex deduplication so opposite UV
+    // orientations can retain different tangents at otherwise identical corners.
+    // UV1, color, and material splits must not change the UV0 smoothing domain.
+    std::vector<core::Vec4d> generated_tangents;
+    std::vector<std::uint32_t> generated_tangent_indices;
+    if (options.generate_tangents && tangent_by_corner.empty()) {
+        std::map<RenderTangentKey, std::uint32_t> tangent_vertex_indices;
+        std::vector<render::TangentVertex> tangent_vertices;
+        tangent_vertices.reserve(std::min(
+            compiled.indices.size(), kMaxRenderMeshArtifactVertices));
+        generated_tangent_indices.reserve(compiled.indices.size());
+        for (std::size_t triangle = 0U;
+             triangle < compiled.triangle_faces.size(); ++triangle) {
+            const geometry::FaceId face = compiled.triangle_faces[triangle];
+            std::array<core::Vec2d, 3U> triangle_uvs;
+            for (std::size_t corner = 0U; corner < 3U; ++corner) {
+                const auto source_vertex = compiled.vertex_ids[
+                    compiled.indices[triangle * 3U + corner]];
+                const auto uv = uv_by_corner.find(CornerKey{face, source_vertex});
+                if (uv == uv_by_corner.end()) {
+                    return core::Result<RenderMeshArtifact>::failure(validation(
+                        "tangent source corner has no authored render UV"));
+                }
+                triangle_uvs[corner] = uv->second;
+            }
+            const core::Vec2d uv_one{
+                triangle_uvs[1].x - triangle_uvs[0].x,
+                triangle_uvs[1].y - triangle_uvs[0].y};
+            const core::Vec2d uv_two{
+                triangle_uvs[2].x - triangle_uvs[0].x,
+                triangle_uvs[2].y - triangle_uvs[0].y};
+            const double determinant = uv_one.x * uv_two.y - uv_one.y * uv_two.x;
+            if (!std::isfinite(determinant) || std::abs(determinant) <= 1e-12) {
+                return core::Result<RenderMeshArtifact>::failure(validation(
+                    "tangent generation rejects degenerate UV triangles"));
+            }
+            const bool mirrored = determinant < 0.0;
+            for (std::size_t corner = 0U; corner < 3U; ++corner) {
+                const std::uint32_t source_index = compiled.indices[triangle * 3U + corner];
+                const geometry::VertexId source_vertex = compiled.vertex_ids[source_index];
+                const auto uv = triangle_uvs[corner];
+                const CornerKey corner_key{face, source_vertex};
+                const auto authored_normal = normal_by_corner.find(corner_key);
+                const core::Vec3d normal = authored_normal == normal_by_corner.end()
+                    ? compiled.normals[source_index].normalized()
+                    : authored_normal->second;
+                const RenderTangentKey key = render_tangent_key(
+                    source_vertex, uv, normal, mirrored);
+                auto found = tangent_vertex_indices.find(key);
+                if (found == tangent_vertex_indices.end()) {
+                    if (tangent_vertices.size() >= kMaxRenderMeshArtifactVertices) {
+                        return core::Result<RenderMeshArtifact>::failure(validation(
+                            "UV seam expansion exceeds the tangent-vertex bound"));
+                    }
+                    const std::uint32_t tangent_index =
+                        static_cast<std::uint32_t>(tangent_vertices.size());
+                    tangent_vertices.push_back({
+                        compiled.positions[source_index],
+                        normal,
+                        uv});
+                    found = tangent_vertex_indices.emplace(key, tangent_index).first;
+                }
+                generated_tangent_indices.push_back(found->second);
+            }
+        }
+        auto tangents = render::generate_tangents(tangent_vertices, generated_tangent_indices);
+        if (!tangents) {
+            return core::Result<RenderMeshArtifact>::failure(tangents.error());
+        }
+        generated_tangents = std::move(tangents.value());
+    }
+
     RenderMeshArtifact artifact;
     artifact.source_revision = source.revision;
     artifact.mesh_revision = mesh.revision();
@@ -1313,9 +1388,20 @@ core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
                 const core::Vec4d color = color_iterator == color_by_corner.end()
                     ? core::Vec4d{}
                     : color_iterator->second;
-                const auto tangent_iterator=tangent_by_corner.find(corner_key);
-                const auto tangent=tangent_iterator==tangent_by_corner.end()?std::optional<core::Vec4d>{}:std::optional<core::Vec4d>{tangent_iterator->second};
-                if(tangent&&std::abs(core::dot(normal,core::Vec3d{tangent->x,tangent->y,tangent->z}))>1e-5)return core::Result<RenderMeshArtifact>::failure(validation("authored tangent is not orthogonal to the current normal; regenerate the tangent layer after edits"));
+                const auto tangent_iterator = tangent_by_corner.find(corner_key);
+                std::optional<core::Vec4d> tangent;
+                if (tangent_iterator != tangent_by_corner.end()) {
+                    tangent = tangent_iterator->second;
+                    if (std::abs(core::dot(normal,
+                            core::Vec3d{tangent->x, tangent->y, tangent->z})) > 1e-5) {
+                        return core::Result<RenderMeshArtifact>::failure(validation(
+                            "authored tangent is not orthogonal to the current normal; "
+                            "regenerate the tangent layer after edits"));
+                    }
+                } else if (!generated_tangents.empty()) {
+                    tangent = generated_tangents[
+                        generated_tangent_indices[source_offset + corner]];
+                }
                 const RenderVertexKey vertex_key{
                     source_vertex.value,
                     canonical_f64_bits(normal.x),
@@ -1377,66 +1463,6 @@ core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
         const std::uint32_t index_count = static_cast<std::uint32_t>(artifact.indices.size()) -
             first_index;
         artifact.submeshes.push_back({slot, first_index, index_count});
-    }
-
-    if (options.generate_tangents&&tangent_by_corner.empty()) {
-        std::map<RenderTangentKey, std::uint32_t> tangent_vertex_indices;
-        std::vector<render::TangentVertex> tangent_vertices;
-        tangent_vertices.reserve(std::min(
-            compiled.indices.size(), kMaxRenderMeshArtifactVertices));
-        std::vector<std::uint32_t> tangent_indices;
-        tangent_indices.reserve(compiled.indices.size());
-        for (std::size_t triangle = 0U;
-             triangle < compiled.triangle_faces.size(); ++triangle) {
-            const geometry::FaceId face = compiled.triangle_faces[triangle];
-            for (std::size_t corner = 0U; corner < 3U; ++corner) {
-                const std::uint32_t source_index = compiled.indices[triangle * 3U + corner];
-                const geometry::VertexId source_vertex = compiled.vertex_ids[source_index];
-                const auto uv = uv_by_corner.find(CornerKey{face, source_vertex});
-                if (uv == uv_by_corner.end()) {
-                    return core::Result<RenderMeshArtifact>::failure(validation(
-                        "tangent source corner has no authored render UV"));
-                }
-                const CornerKey corner_key{face, source_vertex};
-                const auto authored_normal = normal_by_corner.find(corner_key);
-                const core::Vec3d normal = authored_normal == normal_by_corner.end()
-                    ? compiled.normals[source_index].normalized()
-                    : authored_normal->second;
-                const RenderTangentKey key = render_tangent_key(
-                    source_vertex, uv->second, normal);
-                auto found = tangent_vertex_indices.find(key);
-                if (found == tangent_vertex_indices.end()) {
-                    if (tangent_vertices.size() >= kMaxRenderMeshArtifactVertices) {
-                        return core::Result<RenderMeshArtifact>::failure(validation(
-                            "UV seam expansion exceeds the tangent-vertex bound"));
-                    }
-                    const std::uint32_t tangent_index =
-                        static_cast<std::uint32_t>(tangent_vertices.size());
-                    tangent_vertices.push_back({
-                        compiled.positions[source_index],
-                        normal,
-                        uv->second});
-                    found = tangent_vertex_indices.emplace(key, tangent_index).first;
-                }
-                tangent_indices.push_back(found->second);
-            }
-        }
-        const auto tangents = render::generate_tangents(tangent_vertices, tangent_indices);
-        if (!tangents) {
-            return core::Result<RenderMeshArtifact>::failure(tangents.error());
-        }
-        for (std::size_t index = 0U; index < artifact.vertices.size(); ++index) {
-            const RenderTangentKey key = render_tangent_key(
-                artifact.vertices[index].source_vertex,
-                artifact.vertices[index].uv.value(),
-                artifact.vertices[index].normal);
-            const auto tangent_index = tangent_vertex_indices.find(key);
-            if (tangent_index == tangent_vertex_indices.end()) {
-                return core::Result<RenderMeshArtifact>::failure(validation(
-                    "render vertex has no matching UV0 tangent domain"));
-            }
-            artifact.vertices[index].tangent = tangents.value()[tangent_index->second];
-        }
     }
 
     if (auto result = artifact.validate(); !result) {

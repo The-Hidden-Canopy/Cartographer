@@ -45,7 +45,8 @@ carto::geometry::EditableMesh render_mesh_fixture(
     bool degenerate_uvs = false,
     bool with_uv_seam = true,
     bool out_of_range_color = false,
-    bool with_additional_uv_seam = false) {
+    bool with_additional_uv_seam = false,
+    bool with_mirrored_uvs = false) {
     using namespace carto;
     geometry::EditableMesh mesh;
     const auto v0 = mesh.add_vertex({0.0, 0.0, 0.0});
@@ -80,6 +81,12 @@ carto::geometry::EditableMesh render_mesh_fixture(
         if (!degenerate_uvs && with_uv_seam && corner.face == f1.value() &&
             corner.vertex == v0.value()) {
             uv.x += 2.0;
+        }
+        if (!degenerate_uvs && with_mirrored_uvs && corner.face == f1.value() &&
+            corner.vertex == v3.value()) {
+            // Both shared-edge UV endpoints stay equal, but this triangle
+            // folds across that edge and needs the opposite handedness.
+            uv = {1.0, 0.0};
         }
         uv_values.emplace_back(uv);
     }
@@ -891,6 +898,149 @@ void artifact_store_binds_bytes_to_admitted_receipts() {
     std::filesystem::remove_all(root, cleanup_error);
 }
 
+void mirrored_uv_tangent_domains_preserve_corner_fidelity() {
+    using namespace carto;
+    using namespace production;
+    const AuthoritativeSource source{
+        "project/mirrored-uv-fixture", core::Revision{17U}, digest("mirrored-uv-source")};
+    const auto mesh = render_mesh_fixture(false, false, false, false, true);
+    const auto source_revision = mesh.revision();
+    RenderMeshCompileOptions options;
+    options.uv_set = 7U;
+    options.uv1_set = 8U;
+    options.vertex_color_layer = "color.display";
+    options.additional_uv_sets = {9U};
+    const auto without_tangents = compile_render_mesh_artifact(source, mesh, options);
+    require(without_tangents && without_tangents.value().vertices.size() == 4U,
+        "mirrored UV coordinates alone share the two source-edge vertices");
+    const auto source_snapshot = without_tangents.value().serialize();
+    require(static_cast<bool>(source_snapshot), "source projection serializes before tangent compile");
+    options.generate_tangents = true;
+
+    for (const bool group_by_material : {false, true}) {
+        options.material_slot_layer = group_by_material
+            ? std::optional<std::string>{"cartographer.material_slot"} : std::nullopt;
+        const auto compiled = compile_render_mesh_artifact(source, mesh, options);
+        require(compiled && compiled.value().vertices.size() == 6U,
+            "opposite UV orientations split both shared tangent-domain vertices");
+        const auto& artifact = compiled.value();
+        require(static_cast<bool>(artifact.validate()), "mirrored tangent artifact validates");
+        require(artifact.triangle_faces.front().value == (group_by_material ? 2U : 1U),
+            "material grouping can reorder triangles without changing tangent domains");
+        for (std::size_t triangle = 0U; triangle < artifact.triangle_faces.size(); ++triangle) {
+            const bool mirrored = artifact.triangle_faces[triangle].value == 2U;
+            for (std::size_t corner = 0U; corner < 3U; ++corner) {
+                const auto& vertex = artifact.vertices[artifact.indices[triangle * 3U + corner]];
+                require(vertex.tangent.has_value(), "every mirrored chart corner has a frame");
+                const auto tangent = *vertex.tangent;
+                require(tangent.w == (mirrored ? -1.0 : 1.0) &&
+                        std::abs(tangent.x - (mirrored ? 0.0 : 1.0)) < 1e-12 &&
+                        std::abs(tangent.y - (mirrored ? 1.0 : 0.0)) < 1e-12 &&
+                        std::abs(tangent.z) < 1e-12,
+                    "each mirrored chart retains its own tangent direction and handedness");
+                const auto source_color = std::get<core::Vec4d>(
+                    mesh.attributes().find("color.display")->values.at(
+                        static_cast<std::size_t>(vertex.source_vertex.value - 1U)));
+                require(vertex.uv1 && vertex.additional_uvs.size() == 1U && vertex.color &&
+                        vertex.uv1->x == vertex.position.x * 0.5 &&
+                        vertex.uv1->y == vertex.position.y * 0.5 &&
+                        vertex.additional_uvs[0].x == vertex.position.x + 0.25 &&
+                        vertex.additional_uvs[0].y == vertex.position.y * 0.75 &&
+                        vertex.color->x == source_color.x && vertex.color->y == source_color.y &&
+                        vertex.color->z == source_color.z && vertex.color->w == source_color.w,
+                    "tangent splitting retains unrelated authored UV streams and color");
+            }
+        }
+        for (const auto id : {geometry::VertexId{1U}, geometry::VertexId{3U}}) {
+            require(std::count_if(artifact.vertices.begin(), artifact.vertices.end(),
+                        [id](const auto& vertex) { return vertex.source_vertex == id; }) == 2,
+                "both mirrored edge endpoints retain two frames and stable source identity");
+        }
+        const auto upload = pack_pbr_mesh_upload(artifact);
+        require(upload && upload.value().vertices.size() == artifact.vertices.size(),
+            "mirrored tangent splits reach the native PBR vertex stream");
+        for (std::size_t index = 0U; index < artifact.vertices.size(); ++index) {
+            require(upload.value().vertices[index].tangent[3U] ==
+                    artifact.vertices[index].tangent->w,
+                "PBR upload preserves the chart handedness");
+        }
+        const auto bytes = artifact.serialize();
+        const auto repeated = compile_render_mesh_artifact(source, mesh, options);
+        require(bytes && repeated, "mirrored artifact and deterministic repeat compile");
+        const auto repeated_bytes = repeated.value().serialize();
+        require(repeated_bytes && repeated_bytes.value() == bytes.value(),
+            "mirrored tangent generation is byte deterministic");
+        const auto reopened = RenderMeshArtifact::deserialize(bytes.value());
+        require(static_cast<bool>(reopened), "mirrored tangent artifact reopens");
+        const auto reopened_bytes = reopened.value().serialize();
+        require(reopened_bytes && reopened_bytes.value() == bytes.value(),
+            "mirrored frames persist without an artifact-format change");
+    }
+
+    auto without_frame_options = options;
+    without_frame_options.generate_tangents = false;
+    without_frame_options.material_slot_layer = std::nullopt;
+    const auto after = compile_render_mesh_artifact(source, mesh, without_frame_options);
+    require(static_cast<bool>(after), "source projection recompiles after tangent generation");
+    const auto after_bytes = after.value().serialize();
+    require(mesh.revision() == source_revision && after_bytes &&
+            after_bytes.value() == source_snapshot.value() &&
+            mesh.attributes().find("cartographer.tangent.7") == nullptr,
+        "generated tangent seams never mutate source geometry, UVs, attributes, or revision");
+
+    auto secondary_seam_mesh = render_mesh_fixture(false, false, false, true);
+    auto secondary_payload = secondary_seam_mesh.attributes();
+    auto skewed_uv = *secondary_payload.find("uv.render");
+    const auto secondary_topology = secondary_seam_mesh.topology();
+    require(static_cast<bool>(secondary_topology), "secondary seam fixture exposes topology");
+    for (std::size_t i = 0U; i < secondary_topology.value().corners.size(); ++i) {
+        if (secondary_topology.value().corners[i].vertex == geometry::VertexId{4U}) {
+            skewed_uv.values[i] = core::Vec2d{0.0, 0.5};
+        }
+    }
+    require(static_cast<bool>(secondary_payload.remove_layer("uv.render")) &&
+            static_cast<bool>(secondary_payload.add_layer(std::move(skewed_uv))) &&
+            static_cast<bool>(secondary_seam_mesh.set_attribute_payload(
+                std::move(secondary_payload), secondary_seam_mesh.uv_sets())),
+        "same-orientation chart fixture has unequal per-triangle tangent directions");
+    const auto secondary = compile_render_mesh_artifact(source, secondary_seam_mesh, options);
+    require(secondary && secondary.value().vertices.size() == 5U,
+        "unrelated additional UV seam retains only its authored vertex split");
+    const auto smoothed_direction = core::Vec3d{2.0, -1.0, 0.0}.normalized();
+    for (const auto& vertex : secondary.value().vertices) {
+        if (vertex.source_vertex != geometry::VertexId{1U}) continue;
+        require(vertex.tangent &&
+                std::abs(vertex.tangent->x - smoothed_direction.x) < 1e-12 &&
+                std::abs(vertex.tangent->y - smoothed_direction.y) < 1e-12 &&
+                vertex.tangent->w == 1.0,
+            "UV0 tangent smoothing crosses unrelated UV and material splits");
+    }
+
+    auto authored_mesh = mesh;
+    auto payload = authored_mesh.attributes();
+    const auto topology = authored_mesh.topology();
+    require(static_cast<bool>(topology), "authored-frame fixture exposes corner topology");
+    std::vector<attributes::AttributeValue> authored_frames;
+    for (const auto& corner : topology.value().corners) {
+        authored_frames.emplace_back(core::Vec4d{
+            0.6, 0.8, 0.0, corner.face.value == 2U ? -1.0 : 1.0});
+    }
+    require(static_cast<bool>(payload.add_layer({
+                {"cartographer.tangent.7", attributes::AttributeDomain::corner,
+                    attributes::AttributeType::vec4}, std::move(authored_frames)})) &&
+            static_cast<bool>(authored_mesh.set_attribute_payload(
+                std::move(payload), authored_mesh.uv_sets())),
+        "authored mirrored tangent fixture binds exact source frames");
+    const auto authored = compile_render_mesh_artifact(source, authored_mesh, options);
+    require(authored && authored.value().vertices.size() == 6U &&
+            std::all_of(authored.value().vertices.begin(), authored.value().vertices.end(),
+                [](const auto& vertex) {
+                    return vertex.tangent && vertex.tangent->x == 0.6 &&
+                        vertex.tangent->y == 0.8 && vertex.tangent->z == 0.0;
+                }),
+        "valid imported tangent frames remain authoritative instead of being regenerated");
+}
+
 void render_mesh_artifact_is_deterministic_and_fail_closed() {
     using namespace carto;
     using namespace production;
@@ -1575,6 +1725,7 @@ int main() {
     representation_and_spatial_scope_are_cook_identity();
     spatial_cook_invalidation_is_sparse_and_fail_closed();
     artifact_store_binds_bytes_to_admitted_receipts();
+    mirrored_uv_tangent_domains_preserve_corner_fidelity();
     render_mesh_artifact_is_deterministic_and_fail_closed();
     compiled_render_mesh_publishes_through_receipt_store();
     std::cout << "production closure tests passed\n";
