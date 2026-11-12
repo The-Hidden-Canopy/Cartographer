@@ -51,6 +51,8 @@
 #include "studio_view_settings.hpp"
 #include "studio_viewport_capture.hpp"
 #include "studio_translate_gizmo.hpp"
+#include "studio_drafting_grid.hpp"
+#include "studio_mesh_placement.hpp"
 #include "uv_inspector.hpp"
 #include "native_presentation.hpp"
 #include "native_upload_lifetime.hpp"
@@ -75,6 +77,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 #include <carto/d3d12/temporal_sampling.hpp>
 #endif
 #include <carto/production/authoring_aging.hpp>
+#include <carto/production/authoring_material_bake.hpp>
 #if defined(CARTO_DESKTOP_D3D12_VIEWPORT) || defined(CARTO_DESKTOP_ASYNC_READBACK) || defined(CARTO_DESKTOP_RESIDENT_WORKER)
 #include <carto/d3d12/authoring_viewport.hpp>
 #endif
@@ -10583,7 +10586,10 @@ struct DesktopState {
             ImGui::Checkbox("Bake UV material graphs on export", &export_bake_graphs);
             if(export_bake_graphs) {
                 ImGui::InputScalar("Graph bake resolution", ImGuiDataType_U32, &export_bake_resolution);
-                ImGui::TextDisabled("Explicit RGBA8 approximation, unit UV tile, powers of two 4..256.");
+                ImGui::TextDisabled("Explicit RGBA8 approximation, unit UV tile, powers of two %u..%u.",
+                    carto::production::kMinAuthoringMaterialBakeResolution,
+                    carto::production::kMaxAuthoringMaterialBakeResolution);
+                ImGui::TextDisabled("1M total texels across unique materials/variants; one 1024 bake fills the budget.");
             }
             if (ImGui::MenuItem("Export OBJ", "Ctrl+Alt+O", false, can_export)) {
                 export_standard_mesh(snapshot, StandardMeshExport::obj);
@@ -12918,66 +12924,19 @@ struct DesktopState {
             }
         }
 
-        // The drafting grid is world-anchored, not a screen-space texture. This
-        // keeps camera movement visible even before the first object is placed.
-        const auto camera_target = perspective_camera_active
-            ? carto::core::Vec2d{perspective_camera.target().x,
-                                 perspective_camera.target().z}
-            : work_surface_camera.target();
-        const double camera_view_height = perspective_camera_active
-            ? 2.0 * perspective_camera.distance() *
-                std::tan(perspective_camera.vertical_fov() * 0.5)
-            : work_surface_camera.view_height();
-        const double pixels_per_grid = snapshot.density == carto::ui::Density::compact
-            ? 28.0 : 36.0;
-        const double target_grid_step = camera_view_height *
-            pixels_per_grid / viewport_extent.y;
-        const double grid_decade = std::pow(10.0, std::floor(std::log10(target_grid_step)));
-        const double normalized_grid_step = target_grid_step / grid_decade;
-        const double grid_multiplier = normalized_grid_step < 1.5 ? 1.0
-            : normalized_grid_step < 3.5 ? 2.0
-            : normalized_grid_step < 7.5 ? 5.0 : 10.0;
-        const double grid_step_world = grid_decade * grid_multiplier;
-        const double world_per_pixel = camera_view_height / viewport_extent.y;
-        const double half_world_width = world_per_pixel * viewport_extent.x * 0.5;
-        const double half_world_height = camera_view_height * 0.5;
-        const double minimum_x = camera_target.x - half_world_width;
-        const double maximum_x = camera_target.x + half_world_width;
-        const double minimum_y = camera_target.y - half_world_height;
-        const double maximum_y = camera_target.y + half_world_height;
-        const ImU32 grid_color = rgba(snapshot.colors.border_soft, 0.22F);
-        const auto draw_world_grid_line = [&](double coordinate, bool vertical, ImU32 ink) {
-            const carto::core::Vec2d start_ground = vertical
-                ? carto::core::Vec2d{coordinate, minimum_y}
-                : carto::core::Vec2d{minimum_x, coordinate};
-            const carto::core::Vec2d end_ground = vertical
-                ? carto::core::Vec2d{coordinate, maximum_y}
-                : carto::core::Vec2d{maximum_x, coordinate};
-            const Vec3d start_world{start_ground.x, 0.0, start_ground.y};
-            const Vec3d end_world{end_ground.x, 0.0, end_ground.y};
-            if (perspective_camera_active &&
-                (camera_depth(start_world) >= 0.0 || camera_depth(end_world) >= 0.0)) {
-                return;
-            }
-            draw->AddLine(project(start_world), project(end_world), ink, 1.0F);
-        };
-        if (std::isfinite(grid_step_world) && grid_step_world > 0.0 &&
-            std::isfinite(minimum_x) && std::isfinite(maximum_x) &&
-            std::isfinite(minimum_y) && std::isfinite(maximum_y)) {
-            const double first_x = std::ceil(minimum_x / grid_step_world) * grid_step_world;
-            const double first_y = std::ceil(minimum_y / grid_step_world) * grid_step_world;
-            for (std::size_t index = 0U; index < 256U; ++index) {
-                const double x = first_x + static_cast<double>(index) * grid_step_world;
-                const double y = first_y + static_cast<double>(index) * grid_step_world;
-                if (x <= maximum_x) draw_world_grid_line(x, true, grid_color);
-                if (y <= maximum_y) draw_world_grid_line(y, false, grid_color);
-            }
+        // Use the active view's drafting plane and real projection span.
+        // Invalid presentation bounds omit only the grid, never scene picking.
+        const auto drafting_grid = carto::studio::drafting_grid_for_view(
+            viewport_view.view, perspective_camera, work_surface_camera, viewport_extent,
+            snapshot.density == carto::ui::Density::compact ? 28.0 : 36.0);
+        if (drafting_grid) {
+            const ImU32 grid_color = rgba(snapshot.colors.border_soft, 0.22F);
             const ImU32 axes_color = rgba(snapshot.colors.accent_primary, 0.24F);
-            if (minimum_x <= 0.0 && maximum_x >= 0.0) {
-                draw_world_grid_line(0.0, true, axes_color);
-            }
-            if (minimum_y <= 0.0 && maximum_y >= 0.0) {
-                draw_world_grid_line(0.0, false, axes_color);
+            for (const auto& line : drafting_grid.value().lines) {
+                if (perspective_camera_active &&
+                    (camera_depth(line.first) >= 0.0 || camera_depth(line.second) >= 0.0)) continue;
+                draw->AddLine(project(line.first), project(line.second),
+                    line.world_axis ? axes_color : grid_color, 1.0F);
             }
         }
 
@@ -14835,19 +14794,19 @@ struct DesktopState {
                         action_feedback_error = true;
                     } else {
                         const ImVec2 pointer = ImGui::GetIO().MousePos;
-                        const auto world = viewport_screen_to_ground(
-                            {static_cast<double>(pointer.x), static_cast<double>(pointer.y)});
-                        if (!world) {
-                            action_feedback = "The viewport drop position cannot be resolved.";
+                        const auto offset = carto::studio::viewport_mesh_placement_offset(
+                            viewport_view.view, perspective_camera, work_surface_camera,
+                            {static_cast<double>(pointer.x), static_cast<double>(pointer.y)},
+                            {static_cast<double>(origin.x), static_cast<double>(origin.y)},
+                            {static_cast<double>(extent.x), static_cast<double>(extent.y)},
+                            source->object.local_transform.translation);
+                        if (!offset) {
+                            action_feedback = offset.error().message;
                             action_feedback_error = true;
                         } else {
-                            const Vec3d offset{
-                                world.value().x - source->object.local_transform.translation.x,
-                                0.0,
-                                world.value().y - source->object.local_transform.translation.z};
                             const bool added = dispatch(
                                 carto::application::DuplicateMeshInstanceAction{
-                                    source->object.id, source->object.name + " Copy", offset});
+                                    source->object.id, source->object.name + " Copy", offset.value()});
                             if (added) {
                                 action_feedback = "Added a shared mesh instance at the viewport drop position.";
                                 action_feedback_error = false;

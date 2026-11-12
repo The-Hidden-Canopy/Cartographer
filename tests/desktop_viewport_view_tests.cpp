@@ -1,4 +1,6 @@
 #include "studio_view_settings.hpp"
+#include "studio_drafting_grid.hpp"
+#include "studio_mesh_placement.hpp"
 
 #include <carto/geometry/compiled_mesh.hpp>
 
@@ -86,6 +88,232 @@ void orthographic_presets_apply_existing_camera() {
     REQUIRE(!carto::studio::apply_orthographic_view_orientation(
         ViewportViewKind::top_plan_xz, untouched));
     REQUIRE(untouched.serialize() == before);
+}
+
+void drafting_grids_match_named_projection_planes() {
+    using namespace carto;
+    for (const auto kind : {ViewportViewKind::front_xy, ViewportViewKind::right_zy}) {
+        for (const auto extent : {core::Vec2d{800, 600}, core::Vec2d{400, 900}}) {
+            editor::EditorCamera camera;
+            editor::WorkSurfaceCamera plan;
+            camera.set_projection(editor::EditorProjection::orthographic);
+            REQUIRE(studio::apply_orthographic_view_orientation(kind, camera));
+            REQUIRE(camera.frame({3.25, -2.5, 700}, 5.0, extent.x / extent.y));
+            const auto before = camera.serialize();
+            const auto grid = studio::drafting_grid_for_view(kind, camera, plan, extent, 36.0);
+            REQUIRE(grid && !grid.value().lines.empty());
+            REQUIRE(camera.serialize() == before);
+            bool vertical = false, horizontal = false;
+            for (const auto& line : grid.value().lines) {
+                if (kind == ViewportViewKind::front_xy) {
+                    require_near(line.first.z, camera.target().z);
+                    require_near(line.second.z, camera.target().z);
+                } else {
+                    require_near(line.first.x, camera.target().x);
+                    require_near(line.second.x, camera.target().x);
+                }
+                const auto a = camera.project_marker(line.first, extent);
+                const auto b = camera.project_marker(line.second, extent);
+                REQUIRE(a && b && a.value().in_front && b.value().in_front);
+                const auto delta = b.value().screen_position - a.value().screen_position;
+                if (std::abs(delta.x) < 1e-8) {
+                    vertical = true;
+                    require_near(std::abs(delta.y), extent.y, 1e-7);
+                } else {
+                    horizontal = true;
+                    require_near(std::abs(delta.x), extent.x, 1e-7);
+                    require_near(delta.y, 0.0);
+                }
+            }
+            REQUIRE(vertical && horizontal); // Old ground grid collapses in both views.
+            const double pixels = grid.value().spacing * extent.y / camera.orthographic_height();
+            REQUIRE(pixels >= 36.0 - 1e-8 && pixels <= 90.0 + 1e-8);
+            REQUIRE(camera.pan(47.0, -31.0, extent.y));
+            const auto panned = studio::drafting_grid_for_view(kind, camera, plan, extent, 36.0);
+            REQUIRE(panned && panned.value().spacing == grid.value().spacing);
+            for (const auto& line : panned.value().lines) {
+                const bool upright = std::abs(line.first.y - line.second.y) > 1e-8;
+                const double coordinate = upright
+                    ? (kind == ViewportViewKind::front_xy ? line.first.x : -line.first.z)
+                    : line.first.y;
+                require_near(coordinate / panned.value().spacing,
+                    std::round(coordinate / panned.value().spacing));
+            }
+            REQUIRE(camera.dolly(10.0));
+            const auto zoomed = studio::drafting_grid_for_view(kind, camera, plan, extent, 36.0);
+            REQUIRE(zoomed && zoomed.value().spacing < grid.value().spacing);
+        }
+    }
+}
+
+void orthographic_grid_uses_span_not_orbit_distance() {
+    using namespace carto;
+    editor::WorkSurfaceCamera plan;
+    editor::EditorCamera near_camera, distant_camera;
+    for (auto* camera : {&near_camera, &distant_camera}) {
+        camera->set_projection(editor::EditorProjection::orthographic);
+        REQUIRE(studio::apply_orthographic_view_orientation(ViewportViewKind::front_xy, *camera));
+    }
+    REQUIRE(distant_camera.frame({}, 500.0, 4.0 / 3.0));
+    REQUIRE(near_camera.frame({}, 5.0, 4.0 / 3.0));
+    REQUIRE(distant_camera.frame({}, 5.0, 4.0 / 3.0));
+    REQUIRE(distant_camera.distance() > near_camera.distance() * 10.0);
+    const auto near_grid = studio::drafting_grid_for_view(
+        ViewportViewKind::front_xy, near_camera, plan, {800, 600}, 36.0);
+    const auto distant_grid = studio::drafting_grid_for_view(
+        ViewportViewKind::front_xy, distant_camera, plan, {800, 600}, 36.0);
+    REQUIRE(near_grid && distant_grid);
+    require_near(near_grid.value().spacing, distant_grid.value().spacing);
+    REQUIRE(near_grid.value().lines.size() == distant_grid.value().lines.size());
+    for (std::size_t i = 0U; i < near_grid.value().lines.size(); ++i) {
+        REQUIRE((near_grid.value().lines[i].first - distant_grid.value().lines[i].first).length() < 1e-9);
+        REQUIRE((near_grid.value().lines[i].second - distant_grid.value().lines[i].second).length() < 1e-9);
+    }
+}
+
+void plan_and_perspective_grids_retain_ground_and_bounded_coverage() {
+    using namespace carto;
+    editor::EditorCamera camera;
+    editor::WorkSurfaceCamera plan;
+    REQUIRE(plan.frame({}, {10, 10}, {800, 600}));
+    for (const auto kind : {ViewportViewKind::top_plan_xz, ViewportViewKind::perspective_3d}) {
+        const auto grid = studio::drafting_grid_for_view(kind, camera, plan, {800, 600}, 28.0);
+        REQUIRE(grid && !grid.value().lines.empty());
+        std::size_t axes = 0U;
+        for (const auto& line : grid.value().lines) {
+            require_near(line.first.y, 0.0);
+            require_near(line.second.y, 0.0);
+            if (line.world_axis) ++axes;
+        }
+        REQUIRE(axes == 2U);
+    }
+    const core::Vec2d extent{1.0e7, 600};
+    const auto wide = studio::drafting_grid_for_view(
+        ViewportViewKind::top_plan_xz, camera, plan, extent, 28.0);
+    REQUIRE(wide && wide.value().lines.size() <= studio::DraftingGrid::kMaximumLinesPerAxis * 2U);
+    double minimum_x = std::numeric_limits<double>::infinity();
+    double maximum_x = -minimum_x;
+    for (const auto& line : wide.value().lines) {
+        if (line.first.x == line.second.x) {
+            minimum_x = std::min(minimum_x, line.first.x);
+            maximum_x = std::max(maximum_x, line.first.x);
+        }
+    }
+    const double half_width = plan.view_height() * extent.x / extent.y * 0.5;
+    REQUIRE(minimum_x + half_width < wide.value().spacing);
+    REQUIRE(half_width - maximum_x < wide.value().spacing);
+}
+
+void drafting_grid_rejects_invalid_or_unrepresentable_inputs() {
+    using namespace carto;
+    editor::EditorCamera camera;
+    editor::WorkSurfaceCamera plan;
+    const auto kind = ViewportViewKind::top_plan_xz;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    for (const auto extent : {core::Vec2d{0, 600}, core::Vec2d{800, nan}, core::Vec2d{1e8, 600}})
+        REQUIRE(!studio::drafting_grid_for_view(kind, camera, plan, extent, 36));
+    for (const double spacing : {0.0, -1.0, nan, 2048.0})
+        REQUIRE(!studio::drafting_grid_for_view(kind, camera, plan, {800, 600}, spacing));
+    REQUIRE(!studio::drafting_grid_for_view(static_cast<ViewportViewKind>(99), camera, plan, {800, 600}, 36));
+    REQUIRE(!studio::drafting_grid_for_view(ViewportViewKind::front_xy, camera, plan, {800, 600}, 36));
+    camera.set_projection(editor::EditorProjection::orthographic);
+    REQUIRE(camera.set_orientation(0.5, 0.5));
+    REQUIRE(!studio::drafting_grid_for_view(ViewportViewKind::front_xy, camera, plan, {800, 600}, 36));
+    REQUIRE(plan.frame({1e300, 0}, {10, 10}, {800, 600}));
+    REQUIRE(!studio::drafting_grid_for_view(kind, camera, plan, {800, 600}, 36));
+}
+
+void mesh_placement_uses_named_view_planes_without_changing_depth() {
+    using namespace carto;
+    const core::Vec2d origin{137.0, 83.0};
+    const core::Vec3d source{3.0, 4.0, 5.0};
+    for (const auto kind : {ViewportViewKind::front_xy, ViewportViewKind::right_zy}) {
+        for (const auto extent : {core::Vec2d{800.0, 600.0}, core::Vec2d{400.0, 900.0}}) {
+            editor::EditorCamera camera;
+            editor::WorkSurfaceCamera plan;
+            camera.set_projection(editor::EditorProjection::orthographic);
+            REQUIRE(studio::apply_orthographic_view_orientation(kind, camera));
+            REQUIRE(camera.frame(source, 5.0, extent.x / extent.y));
+            const auto before = camera.serialize();
+            const core::Vec2d pixel{extent.x * 0.75, extent.y * 0.3};
+            const auto offset = studio::viewport_mesh_placement_offset(
+                kind, camera, plan, origin + pixel, origin, extent, source);
+            REQUIRE(offset && offset.value().finite());
+            REQUIRE(camera.serialize() == before);
+            if (kind == ViewportViewKind::front_xy) REQUIRE(offset.value().z == 0.0);
+            else REQUIRE(offset.value().x == 0.0);
+            REQUIRE(std::abs(offset.value().y) > 0.1);
+            const auto projected = camera.project_marker(source + offset.value(), extent);
+            REQUIRE(projected && projected.value().in_front);
+            require_near(projected.value().screen_position.x, pixel.x, 1e-7);
+            require_near(projected.value().screen_position.y, pixel.y, 1e-7);
+            const auto center = studio::viewport_mesh_placement_offset(
+                kind, camera, plan, origin + extent * 0.5, origin, extent, source);
+            REQUIRE(center && center.value().length() < 1e-8);
+        }
+    }
+}
+
+void mesh_placement_preserves_existing_plan_and_perspective_semantics() {
+    using namespace carto;
+    const core::Vec2d origin{17.0, 29.0}, extent{800.0, 600.0};
+    const core::Vec2d pixel{430.0, 320.0};
+    const core::Vec3d source{3.0, 7.0, 5.0};
+    editor::EditorCamera camera;
+    editor::WorkSurfaceCamera plan;
+    REQUIRE(plan.frame({3.0, 5.0}, {10.0, 8.0}, extent));
+    const auto expected_plan = plan.screen_to_world(origin + pixel, origin, extent);
+    const auto plan_offset = studio::viewport_mesh_placement_offset(
+        ViewportViewKind::top_plan_xz, camera, plan, origin + pixel, origin, extent, source);
+    REQUIRE(expected_plan && plan_offset);
+    REQUIRE(plan_offset.value().y == 0.0);
+    require_near(source.x + plan_offset.value().x, expected_plan.value().x);
+    require_near(source.z + plan_offset.value().z, expected_plan.value().y);
+
+    REQUIRE(camera.set_orientation(0.4, -0.6));
+    REQUIRE(camera.frame({}, 5.0, extent.x / extent.y));
+    const auto before = camera.serialize();
+    const auto ray = camera.ray_for_pixel(pixel, extent);
+    REQUIRE(ray && std::abs(ray.value().direction.y) > 1e-6);
+    const double distance = -ray.value().origin.y / ray.value().direction.y;
+    REQUIRE(distance > 0.0);
+    const auto expected_ground = ray.value().origin + ray.value().direction * distance;
+    const auto perspective = studio::viewport_mesh_placement_offset(
+        ViewportViewKind::perspective_3d, camera, plan, origin + pixel, origin, extent, source);
+    REQUIRE(perspective && perspective.value().y == 0.0);
+    REQUIRE(camera.serialize() == before);
+    require_near(source.x + perspective.value().x, expected_ground.x);
+    require_near(source.z + perspective.value().z, expected_ground.z);
+}
+
+void mesh_placement_rejects_stale_views_invalid_inputs_and_hidden_planes() {
+    using namespace carto;
+    editor::EditorCamera camera;
+    editor::WorkSurfaceCamera plan;
+    const core::Vec2d origin{20.0, 30.0}, extent{800.0, 600.0};
+    const auto center = origin + extent * 0.5;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const auto place = [&](ViewportViewKind kind, core::Vec2d pointer, core::Vec2d size,
+                           core::Vec3d source = {}) {
+        return studio::viewport_mesh_placement_offset(kind, camera, plan,
+            pointer, origin, size, source);
+    };
+    REQUIRE(!place(static_cast<ViewportViewKind>(99), center, extent));
+    REQUIRE(!place(ViewportViewKind::top_plan_xz, {nan, 30.0}, extent));
+    REQUIRE(!place(ViewportViewKind::top_plan_xz, {19.0, 30.0}, extent));
+    REQUIRE(!place(ViewportViewKind::top_plan_xz, {821.0, 30.0}, extent));
+    REQUIRE(!place(ViewportViewKind::top_plan_xz, center, {800.0, 0.0}));
+    REQUIRE(!place(ViewportViewKind::top_plan_xz, center, {1e10, 600.0}));
+    REQUIRE(!place(ViewportViewKind::top_plan_xz, center, extent, {0.0, nan, 0.0}));
+    REQUIRE(!place(ViewportViewKind::front_xy, center, extent)); // Still perspective.
+    REQUIRE(camera.set_orientation(0.0, 0.0));
+    REQUIRE(!place(ViewportViewKind::perspective_3d, center, extent)); // Horizon ray.
+    camera.set_projection(editor::EditorProjection::orthographic);
+    REQUIRE(studio::apply_orthographic_view_orientation(ViewportViewKind::front_xy, camera));
+    REQUIRE(camera.frame({}, 5.0, extent.x / extent.y));
+    REQUIRE(!place(ViewportViewKind::right_zy, center, extent)); // Wrong named camera.
+    const auto behind = camera.position() - camera.axes().forward;
+    REQUIRE(!place(ViewportViewKind::front_xy, center, extent, behind));
 }
 
 // --- Camera pose retention ---------------------------------------------------
@@ -548,6 +776,13 @@ int main() {
         }
     };
 
+    run("drafting_grids_match_named_projection_planes", drafting_grids_match_named_projection_planes);
+    run("orthographic_grid_uses_span_not_orbit_distance", orthographic_grid_uses_span_not_orbit_distance);
+    run("plan_and_perspective_grids_retain_ground_and_bounded_coverage", plan_and_perspective_grids_retain_ground_and_bounded_coverage);
+    run("drafting_grid_rejects_invalid_or_unrepresentable_inputs", drafting_grid_rejects_invalid_or_unrepresentable_inputs);
+    run("mesh_placement_uses_named_view_planes_without_changing_depth", mesh_placement_uses_named_view_planes_without_changing_depth);
+    run("mesh_placement_preserves_existing_plan_and_perspective_semantics", mesh_placement_preserves_existing_plan_and_perspective_semantics);
+    run("mesh_placement_rejects_stale_views_invalid_inputs_and_hidden_planes", mesh_placement_rejects_stale_views_invalid_inputs_and_hidden_planes);
     run("view_labels_cover_every_kind", view_labels_cover_every_kind);
     run("view_axes_match_projection_paths", view_axes_match_projection_paths);
     run("orthographic_presets_apply_existing_camera",
