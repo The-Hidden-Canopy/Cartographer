@@ -54,7 +54,7 @@ void create_only_preserves_existing_targets_and_session() {
     const auto before = session.snapshot();
     const auto rejected = [&](const std::filesystem::path& path) {
         const auto result = application::testing::dispatch(session,
-            application::SaveProjectAction{path, true});
+            application::SaveProjectAction{.path = path, .require_new_target = true});
         require(!result && result.error().code == core::ErrorCode::invalid_state,
             "create-only save rejects an occupied target");
         const auto after = session.snapshot();
@@ -97,12 +97,12 @@ void create_only_preserves_existing_targets_and_session() {
 
     const auto fresh = temp.path / "fresh.carto";
     require(static_cast<bool>(application::testing::dispatch(session,
-        application::SaveProjectAction{fresh, true})), "fresh create-only save succeeds");
+        application::SaveProjectAction{.path = fresh, .require_new_target = true})), "fresh create-only save succeeds");
     require(!session.snapshot().dirty && session.snapshot().project_path == fresh,
         "fresh save binds the project and clears dirty state");
     const auto bytes = read(fresh);
     const auto journal = read(fresh.string() + ".journal");
-    require(!application::testing::dispatch(session, application::SaveProjectAction{fresh, true}),
+    require(!application::testing::dispatch(session, application::SaveProjectAction{.path = fresh, .require_new_target = true}),
         "repeat create-only save cannot overwrite its own target");
     require(read(fresh) == bytes && read(fresh.string() + ".journal") == journal,
         "repeat refusal preserves both project and journal");
@@ -129,7 +129,7 @@ void concurrent_creators_have_one_winner() {
     const auto attempt = [&](std::size_t index) {
         start.arrive_and_wait();
         saved[index] = static_cast<bool>(application::testing::dispatch(sessions[index],
-            application::SaveProjectAction{path, true}));
+            application::SaveProjectAction{.path = path, .require_new_target = true}));
     };
     std::jthread first(attempt, 0U);
     std::jthread second(attempt, 1U);

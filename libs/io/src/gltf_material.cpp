@@ -333,8 +333,11 @@ struct GltfMaterialWriter::Impl {
     Result<production::AuthoringMaterialBake> bake(render::MaterialId id, std::optional<project::MaterialVariantId> variant) {
         using R=Result<production::AuthoringMaterialBake>;
         const auto n=options.graph_bake_resolution;
-        if(n<4||n>256||(n&(n-1))||baked_texels+std::uint64_t(n)*n>1024U*1024U)
-            return R::failure(unsupported("graph baking requires power-of-two resolution 4..256 and at most 1M total texels"));
+        if(!production::authoring_material_bake_fits_budget(n,baked_texels))
+            return R::failure(unsupported("graph baking requires power-of-two resolution "+
+                std::to_string(production::kMinAuthoringMaterialBakeResolution)+".."+
+                std::to_string(production::kMaxAuthoringMaterialBakeResolution)+
+                " and at most 1M total texels across unique material/variant bakes"));
         auto base=catalog.resolve_material(id,variant);if(!base)return R::failure(base.error());
         for(const auto& ref:{base.value().base_color,base.value().metallic_roughness,base.value().normal,base.value().occlusion,base.value().emissive})if(ref) {
             const auto entry=catalog.textures().find(ref.asset);

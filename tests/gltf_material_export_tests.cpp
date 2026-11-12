@@ -2,10 +2,26 @@
 #include "scene_import_test_support.hpp"
 #include <carto/io/generated_mesh.hpp>
 #include <carto/production/authoring_material.hpp>
+#include <carto/production/authoring_material_bake.hpp>
 #include <carto/io/gltf_material_import.hpp>
 #include <carto/io/gltf_scene_import.hpp>
+#include <limits>
 #include "application_access.hpp"
 namespace {
+static_assert(production::authoring_material_bake_fits_budget(4));
+static_assert(production::authoring_material_bake_fits_budget(256));
+static_assert(production::authoring_material_bake_fits_budget(512, 786432));
+static_assert(production::authoring_material_bake_fits_budget(1024));
+static_assert(!production::authoring_material_bake_fits_budget(0));
+static_assert(!production::authoring_material_bake_fits_budget(3));
+static_assert(!production::authoring_material_bake_fits_budget(257));
+static_assert(!production::authoring_material_bake_fits_budget(2048));
+static_assert(!production::authoring_material_bake_fits_budget(
+    std::numeric_limits<std::uint32_t>::max()));
+static_assert(!production::authoring_material_bake_fits_budget(1024, 1));
+static_assert(!production::authoring_material_bake_fits_budget(512, 786433));
+static_assert(!production::authoring_material_bake_fits_budget(
+    4, std::numeric_limits<std::uint64_t>::max()));
 void near(double a, double b, const char *s) {
     check(std::isfinite(a) && std::abs(a - b) < 2e-6, s);
 }
@@ -131,7 +147,8 @@ project::MaterialCatalog catalog(const project::TextureSourceRecord &record) {
     okay(c.insert_assignment({{1, 2}, 10, 20}));
     return c;
 }
-std::vector<std::uint8_t> pixels(const Payload &p, std::string_view info) {
+std::vector<std::uint8_t> pixels(const Payload &p, std::string_view info,
+                               unsigned expected_resolution = 0) {
     const auto texture = array(member(p.json, "textures")).at(number(member(info, "index")));
     const auto image = array(member(p.json, "images")).at(number(member(texture, "source")));
     const auto uri = take(core::json::decode_string(member(image, "uri")));
@@ -139,6 +156,10 @@ std::vector<std::uint8_t> pixels(const Payload &p, std::string_view info) {
     check(uri.starts_with(prefix), "embedded image PNG MIME");
     auto encoded = unbase64(std::string_view(uri).substr(prefix.size()));
     auto decoded = take(assets::decode_png_rgba8(encoded, production::authoring_texture_limits()));
+    if (expected_resolution)
+        check(decoded.admission.width == expected_resolution &&
+                  decoded.admission.height == expected_resolution,
+              "baked PNG retains requested dimensions");
     return decoded.pixels;
 }
 void inspect(const Payload &p, const std::vector<std::uint8_t> &src) {
@@ -595,7 +616,70 @@ int main(int argc, char **argv) {
             }
         }
         auto invalid_bake=options;invalid_bake.graph_bake_resolution=3;
-        rejected(dynamiccat,root,"invalid-bake-budget",invalid_bake,"4..256");
+        rejected(dynamiccat,root,"invalid-bake-budget",invalid_bake,"4..1024");
+        invalid_bake.graph_bake_resolution=2048;
+        rejected(dynamiccat,root,"oversized-bake-budget",invalid_bake,"4..1024");
+        // Both regions share one projection. This exercises the maximum bake
+        // without charging duplicate uses against the aggregate texel budget.
+        auto single_bake_cat=dynamiccat;
+        okay(single_bake_cat.replace_assignment({{1,2},10,std::nullopt}));
+        auto high_doc=material_scene(single_bake_cat,root/"high-resolution.carto");
+        const auto high_source=high_doc.serialize();
+        auto high_options=options;
+        high_options.graph_bake_resolution=512;
+        const auto high_path=root/"high-resolution.gltf";
+        take(io::export_gltf(high_doc,high_path,high_options));
+        {
+            const auto first=read(high_path);
+            take(io::export_gltf(high_doc,high_path,high_options));
+            check(read(high_path)==first,"512 graph baking is byte deterministic");
+            Payload high_payload(high_path);
+            const auto mat=array(member(high_payload.json,"materials"))[0];
+            const auto mr=pixels(high_payload,
+                member(member(mat,"pbrMetallicRoughness"),"metallicRoughnessTexture"),512);
+            check(mr.size()==std::size_t(512)*512*4,"512 bake pixel count");
+        }
+        high_options.graph_bake_resolution=1024;
+        const auto high_report=take(io::export_gltf(high_doc,high_path,high_options));
+        check(high_report.materials==1,"shared regions reuse the same 1024 graph bake");
+        check(std::count_if(high_report.warnings.begin(),high_report.warnings.end(),
+                  [](const auto& w){return w.starts_with("Explicit material graph bake:");})==1,
+              "one receipt for one unique material bake");
+        check(high_report.embedded_image_bytes<=64ULL*1024*1024,
+              "higher-resolution graph bake retains embedded-image budget");
+        {
+            Payload high_payload(high_path);
+            const auto mat=array(member(high_payload.json,"materials"))[0];
+            const auto mr=pixels(high_payload,
+                member(member(mat,"pbrMetallicRoughness"),"metallicRoughnessTexture"),1024);
+            check(mr.size()==std::size_t(1024)*1024*4,"1024 bake pixel count");
+            auto program=take(production::compile_authoring_material(
+                single_bake_cat,10,std::nullopt,library.get()));
+            check(!production::bake_authoring_material(program,2048),
+                  "direct production baker rejects excessive resolution");
+            for(const auto point:std::array<std::array<unsigned,2>,5>{{
+                    {0,0},{511,511},{512,512},{1023,1023},{137,701}}}) {
+                const auto x=point[0],y=point[1];
+                const auto sample=take(program.evaluate(
+                    {{(x+.5)/1024,(y+.5)/1024},{1./1024,0},{0,1./1024}}));
+                const auto at=(std::size_t(y)*1024+x)*4;
+                check(std::abs(double(mr[at+1])/255-sample.material.roughness)<.002,
+                      "1024 roughness samples retain executable graph semantics");
+                check(std::abs(double(mr[at+2])/255-sample.material.metallic)<.002,
+                      "1024 metallic samples retain channel placement");
+            }
+        }
+        check(high_doc.serialize()==high_source,"higher-resolution baking preserves source");
+        // A second unique variant cannot consume another 1024 tile. Keep the
+        // successful high-resolution artifact when the aggregate budget fails.
+        const auto good_high_artifact=read(high_path);
+        const auto overflow=io::export_gltf(baked_doc,high_path,high_options);
+        check(!overflow&&overflow.error().message.find("total texels")!=std::string::npos,
+              "1024 material variants respect aggregate texel budget");
+        check(read(high_path)==good_high_artifact,
+              "aggregate budget failure preserves the prior good high-resolution export");
+        check(baked_doc.serialize()==source_before_bake,
+              "aggregate budget failure preserves source document");
         if(argc==3&&std::string_view(argv[1])=="--bake-fixture")return 0;
         auto badbytes = tga;
         badbytes.back() ^= 1;

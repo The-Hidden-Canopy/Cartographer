@@ -13,6 +13,7 @@
 #include <carto/geometry/primitives.hpp>
 #include <carto/journal/journal.hpp>
 #include <carto/production/bake_graph.hpp>
+#include <carto/production/authoring_material_bake.hpp>
 #include <carto/production/preparation_operation.hpp>
 #include <carto/production/preparation_scope.hpp>
 #include <carto/production/prepared_publication.hpp>
@@ -2784,7 +2785,7 @@ int import_mesh_to_project(
         return EXIT_FAILURE;
     }
     auto baseline = carto::application::HumanApplicationAccess::dispatch(
-        session, carto::application::SaveProjectAction{project_path, true});
+        session, carto::application::SaveProjectAction{.path = project_path, .require_new_target = true});
     if (!baseline) {
         print_error(baseline.error());
         return EXIT_FAILURE;
@@ -2817,7 +2818,7 @@ int import_gltf_scene(const std::filesystem::path& path,const std::filesystem::p
     auto parsed=carto::io::import_gltf_scene(captured.value());if(!parsed){print_error(parsed.error());return EXIT_FAILURE;}
     carto::application::ApplicationSession session;
     const auto send=[&](const carto::application::ApplicationAction& action){auto r=carto::application::HumanApplicationAccess::dispatch(session,action);if(!r)print_error(r.error());return bool(r);};
-    if(!send(carto::application::NewProjectAction{path.stem().string()})||!send(carto::application::SaveProjectAction{output,true}))return EXIT_FAILURE;
+    if(!send(carto::application::NewProjectAction{path.stem().string()})||!send(carto::application::SaveProjectAction{.path = output, .require_new_target = true}))return EXIT_FAILURE;
     carto::ui::UiController controller(session);
     const auto snapshot=controller.snapshot();
     auto imported=controller.import_static_gltf_scene(path,snapshot.project_generation,
@@ -9159,7 +9160,12 @@ int main(int argc, char** argv) {
             auto parsed=parse_bake_u32_argument(argv[4],"explicit graph bake resolution");
             if(!parsed){print_error(parsed.error());return EXIT_FAILURE;}
             bake=parsed.value();
-            if(bake<4||bake>256||(bake&(bake-1))){std::cerr<<"graph bake resolution requires power of two 4..256\n";return EXIT_FAILURE;}
+            if(!carto::production::authoring_material_bake_fits_budget(bake)) {
+                std::cerr<<"graph bake resolution requires power of two "
+                    <<carto::production::kMinAuthoringMaterialBakeResolution<<".."
+                    <<carto::production::kMaxAuthoringMaterialBakeResolution<<'\n';
+                return EXIT_FAILURE;
+            }
         }
         return export_interchange(argv[2], argv[3], command=="export-glb",bake);
     }

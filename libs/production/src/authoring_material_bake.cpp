@@ -7,8 +7,10 @@ core::Result<AuthoringMaterialBake> bake_authoring_material(
     const AuthoringMaterialProgram& program, std::uint32_t resolution) {
     using Result=core::Result<AuthoringMaterialBake>;
     try {
-        if(resolution<4||resolution>256||(resolution&(resolution-1)))
-            throw std::runtime_error("material bake resolution must be a power of two from 4 through 256");
+        if(!authoring_material_bake_fits_budget(resolution))
+            throw std::runtime_error("material bake resolution must be a power of two from "+
+                std::to_string(kMinAuthoringMaterialBakeResolution)+" through "+
+                std::to_string(kMaxAuthoringMaterialBakeResolution));
         const auto packet=program.gpu_packet();
         if(!packet)return Result::failure(packet.error());
         const double step=1./resolution;

@@ -46,7 +46,8 @@ struct GltfExportOptions {
     std::filesystem::path project_path;
     std::shared_ptr<const production::AuthoringTextureLibrary> textures;
     // Opt-in approximation only; zero preserves strict analytic projection.
-    // Powers of two 4..256, one [0,1] UV tile, <=1M total sampled texels.
+    // Powers of two 4..1024, one [0,1] UV tile, <=1M total sampled texels
+    // across unique material/variant bakes. One 1024 bake uses the allowance.
     std::uint32_t graph_bake_resolution = 0;
 };
 
