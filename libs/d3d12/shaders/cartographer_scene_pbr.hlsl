@@ -378,6 +378,32 @@ float anisotropic_ggx_kernel(float roughness, float strength, float3 normal,
     return distribution * visibility;
 }
 
+// Matches transport_scene_anisotropy_frame. Rotation, rather than projecting
+// the old axis alone, remains well-defined when the mapped normal approaches
+// that axis. Near antiparallel normals choose the authored tangent as the
+// otherwise ambiguous half-turn axis.
+float3 transport_anisotropy_tangent(float3 geometric_normal, float3 tangent,
+    float3 shading_normal)
+{
+    const float3 rotation_axis = cross(geometric_normal, shading_normal);
+    const float sine_squared = dot(rotation_axis, rotation_axis);
+    float3 rotated_tangent = tangent;
+    if (sine_squared > 1.0e-12)
+    {
+        const float sine = sqrt(sine_squared);
+        const float3 axis = rotation_axis / sine;
+        const float cosine = clamp(dot(geometric_normal, shading_normal), -1.0, 1.0);
+        rotated_tangent = tangent * cosine + cross(axis, tangent) * sine +
+            axis * (dot(axis, tangent) * (1.0 - cosine));
+    }
+    const float3 fallback_axis = abs(shading_normal.z) < 0.999
+        ? float3(0.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0);
+    const float3 fallback = normalize_or(cross(fallback_axis, shading_normal),
+        float3(1.0, 0.0, 0.0));
+    return normalize_or(rotated_tangent - shading_normal *
+        dot(shading_normal, rotated_tangent), fallback);
+}
+
 float4 PSMain(VertexOutput input) : SV_TARGET
 {
     const float3 geometric_normal = normalize_or(input.world_normal, float3(0.0, 0.0, 1.0));
@@ -433,10 +459,8 @@ float4 PSMain(VertexOutput input) : SV_TARGET
     float3 anisotropic_bitangent = bitangent;
     if (anisotropy != 0.0)
     {
-        // The anisotropic distribution requires a frame around the final
-        // shading normal, including float normalization effects.
-        anisotropic_tangent = normalize_or(tangent - normal * dot(normal, tangent),
-            fallback_tangent);
+        anisotropic_tangent = transport_anisotropy_tangent(
+            geometric_normal, tangent, normal);
         anisotropic_bitangent = normalize_or(cross(normal, anisotropic_tangent),
             bitangent) * tangent_sign;
     }

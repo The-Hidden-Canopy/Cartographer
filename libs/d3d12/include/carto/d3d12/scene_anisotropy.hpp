@@ -9,6 +9,50 @@
 
 namespace carto::d3d12 {
 
+struct SceneAnisotropyFrame {
+    core::Vec3d tangent;
+    core::Vec3d bitangent;
+    core::Vec3d normal;
+};
+
+// Carry the authored axis to the shading normal by the shortest rotation.
+// Rodrigues' axis-angle form avoids dividing by 1 + N.Ns near antiparallel
+// normals. At an unresolved parallel/antiparallel axis (sin^2 <= 1e-12), keep
+// the authored tangent and orthogonalize it; antiparallel rotation about that
+// tangent is the deterministic choice, not a unique physical orientation.
+[[nodiscard]] inline core::Result<SceneAnisotropyFrame>
+transport_scene_anisotropy_frame(core::Vec3d geometric_normal,
+    core::Vec3d tangent, double handedness, core::Vec3d shading_normal) {
+    const auto unit = [](core::Vec3d value) {
+        return value.finite() && std::abs(value.length_squared() - 1.0) <= 1.0e-5;
+    };
+    if (!unit(geometric_normal) || !unit(tangent) || !unit(shading_normal) ||
+        std::abs(core::dot(geometric_normal, tangent)) > 1.0e-5 ||
+        (handedness != -1.0 && handedness != 1.0)) {
+        return core::Result<SceneAnisotropyFrame>::failure({
+            core::ErrorCode::validation_failed,
+            "anisotropy frame transport requires unit orthogonal axes and signed handedness"});
+    }
+    const auto rotation_axis = core::cross(geometric_normal, shading_normal);
+    const double sine_squared = rotation_axis.length_squared();
+    auto rotated_tangent = tangent;
+    if (sine_squared > 1.0e-12) {
+        const double sine = std::sqrt(sine_squared);
+        const auto axis = rotation_axis * (1.0 / sine);
+        const double cosine = std::clamp(core::dot(geometric_normal, shading_normal), -1.0, 1.0);
+        rotated_tangent = tangent * cosine + core::cross(axis, tangent) * sine +
+            axis * (core::dot(axis, tangent) * (1.0 - cosine));
+    }
+    const auto transported = (rotated_tangent - shading_normal *
+        core::dot(shading_normal, rotated_tangent)).normalized();
+    if (!transported.finite()) {
+        return core::Result<SceneAnisotropyFrame>::failure({
+            core::ErrorCode::validation_failed, "anisotropy frame transport collapsed its tangent"});
+    }
+    return core::Result<SceneAnisotropyFrame>::success({transported,
+        core::cross(shading_normal, transported).normalized() * handedness, shading_normal});
+}
+
 struct SceneAnisotropyReference {
     // Scalar specular kernels before Fresnel, clearcoat attenuation, N.L and
     // incident radiance. These are not environment-lighting integrals.
@@ -17,7 +61,8 @@ struct SceneAnisotropyReference {
     double mixed_kernel = 0.0;
 };
 
-// Unit view/light directions in the authored UV0 tangent frame (T, B, N).
+// Unit view/light directions in the shading frame (T, B, N), transported from
+// the authored UV0 frame when a normal map perturbs the geometric normal.
 // Signed strength swaps broad/narrow axes; abs(strength) also blends from the
 // legacy Schlick-GGX kernel to correlated-Smith anisotropic GGX, preserving a
 // continuous zero-strength boundary without changing existing base materials.

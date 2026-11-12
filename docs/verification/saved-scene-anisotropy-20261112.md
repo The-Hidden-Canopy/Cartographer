@@ -4,6 +4,10 @@ Date: 2026-11-12. Based on sheen commit `8e2f8ea` in the isolated
 `codex/saved-scene-opacity-20261112` branch. No shared integration checkout,
 private donor, graph exporter, build lease, or runtime was changed.
 
+This records the original v33 candidate. Its blanket normal-map refusal is
+superseded by the bounded v34 continuation documented in
+[the normal-map handoff](saved-scene-anisotropic-normal-20261112.md).
+
 ## Capability gained and source boundary
 
 The existing scalar graph `anisotropy` output now lowers into a scene-only

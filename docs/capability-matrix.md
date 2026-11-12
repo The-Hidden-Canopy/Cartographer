@@ -27,9 +27,15 @@ Code-only continuation (2026-11-12): saved-scene signed graph anisotropy now
 drives a UV0-tangent-bound direct specular mixture. Zero retains the existing
 kernel, magnitude blends toward anisotropic GGX with correlated Smith
 visibility, and sign swaps the axes. Nonzero values require actual UV0/tangent
-data and reject normal maps and environment lighting. Generic material schema
-and vertex layout remain unchanged. Numerical/source/persistence/native-axis
-regressions are authored, not executed; see
+data and reject environment lighting. A subsequent source-only continuation
+admits normal maps on UV0 with exactly zero rotation and positive axis scales,
+transporting the authored axis to the shading normal by shortest rotation
+with a deterministic near-antiparallel choice. Both normal conventions and
+offset/pivot remain supported; rotated/reflected anisotropic normal maps remain
+refused. Generic material schema and vertex layout remain unchanged.
+Numerical/source/persistence/native-axis and mapped-normal regressions are
+authored, not executed; see
+[the normal-map handoff](verification/saved-scene-anisotropic-normal-20261112.md) and
 [the anisotropy handoff](verification/saved-scene-anisotropy-20261112.md).
 
 Code-only continuation (2026-11-12): saved-scene scalar graph sheen has an

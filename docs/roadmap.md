@@ -16,9 +16,12 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 
 - [ ] Accept source-only signed saved-scene anisotropy: explicit UV0 tangents,
   zero-preserving specular mixture, source/cache identity and direct-light
-  reference/axis/persistence checks. Normal maps, anisotropic environment
-  integration, shader/build execution and visual/energy acceptance remain open;
-  see [the handoff](verification/saved-scene-anisotropy-20261112.md).
+  reference/axis/persistence checks. The bounded UV0 normal-map continuation
+  adds shortest-rotation shading frames and both conventions; rotated/reflected
+  maps, anisotropic environment integration, shader/build execution and
+  visual/energy acceptance remain open. See
+  [the normal-map handoff](verification/saved-scene-anisotropic-normal-20261112.md)
+  and [the original handoff](verification/saved-scene-anisotropy-20261112.md).
 
 - [ ] Accept the source-only saved-scene direct sheen continuation: existing
   graph scalar, bounded Charlie/Neubelt base-layer mixture, exact request/cache

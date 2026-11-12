@@ -639,69 +639,216 @@ void project_graph_anisotropy_requires_source_bound_tangents() {
     auto with_normal = valid;
     with_normal.objects.front().materials.front().current_material.definition.normal.asset = 99U;
     rebind(with_normal.objects.front());
-    const auto normal_refusal = with_normal.validate();
-    require(!normal_refusal && normal_refusal.error().code == core::ErrorCode::unsupported,
-        "normal-map and anisotropy combinations fail before accepting unsupported shading frames");
+    const auto missing_normal = with_normal.validate();
+    require(!missing_normal && missing_normal.error().code == core::ErrorCode::not_found,
+        "admitting anisotropic normal maps never invents missing texture sources");
 
     const auto normal_texture = texture(99U, {128U, 128U, 255U, 255U}, assets::TextureSemantic::normal);
-    for (const bool same_object : {false, true}) {
-        auto document = take(project::ProjectDocument::create("Anisotropy tangent-scope fixture"));
-        auto access = project::testing::access(document);
-        auto mesh = authored_box();
-        auto payload = mesh.attributes();
-        const auto primary_uv_values = payload.find("uv.fixture")->values;
-        take(payload.add_layer({{"uv.second", attributes::AttributeDomain::corner,
-            attributes::AttributeType::vec2}, primary_uv_values}));
-        auto uv_sets = mesh.uv_sets();
-        take(uv_sets.add({2U, "Second UV", "uv.second", false, true, false, 1U}));
-        take(mesh.set_attribute_payload(payload, uv_sets));
-        const auto separate_mesh = mesh;
-        if (same_object) {
-            auto regions = *payload.find("cartographer.material_slot");
-            regions.values.back() = std::uint32_t{2U};
-            take(payload.remove_layer("cartographer.material_slot"));
-            take(payload.add_layer(std::move(regions)));
-            take(mesh.set_attribute_payload(std::move(payload), uv_sets));
+    for (const auto normal_uv : {render::kUv0, render::UvSetId{2U}}) {
+        for (const bool same_object : {false, true}) {
+            auto document = take(project::ProjectDocument::create("Anisotropy tangent-scope fixture"));
+            auto access = project::testing::access(document);
+            auto mesh = authored_box();
+            auto payload = mesh.attributes();
+            const auto primary_uv_values = payload.find("uv.fixture")->values;
+            take(payload.add_layer({{"uv.second", attributes::AttributeDomain::corner,
+                attributes::AttributeType::vec2}, primary_uv_values}));
+            auto uv_sets = mesh.uv_sets();
+            take(uv_sets.add({2U, "Second UV", "uv.second", false, true, false, 1U}));
+            take(mesh.set_attribute_payload(payload, uv_sets));
+            const auto separate_mesh = mesh;
+            if (same_object) {
+                auto regions = *payload.find("cartographer.material_slot");
+                regions.values.back() = std::uint32_t{2U};
+                take(payload.remove_layer("cartographer.material_slot"));
+                take(payload.add_layer(std::move(regions)));
+                take(mesh.set_attribute_payload(std::move(payload), uv_sets));
+            }
+            const auto first_mesh = take(access.add_mesh(mesh));
+            const auto first_object = take(access.create_object("Anisotropic object"));
+            take(access.attach_mesh(first_object, first_mesh));
+            auto second_mesh = first_mesh;
+            if (!same_object) {
+                second_mesh = take(access.add_mesh(separate_mesh));
+                const auto second_object = take(access.create_object("Unrelated normal-mapped object"));
+                take(access.attach_mesh(second_object, second_mesh));
+            }
+            project::MaterialCatalog catalog;
+            render::MaterialAsset anisotropic{1U, "Anisotropic fixture", {}, core::Revision{1U}};
+            render::MaterialAsset normal_mapped{2U, "Normal-mapped fixture", {}, core::Revision{1U}};
+            normal_mapped.definition.normal.asset = normal_texture.asset;
+            normal_mapped.definition.normal.uv_set = normal_uv;
+            normal_mapped.definition.normal.transform.rotation = 0.25;
+            normal_mapped.definition.normal.transform.scale = {-1.0, 1.0};
+            project::TextureSourceRecord source;
+            source.id = normal_texture.asset;
+            source.name = "Normal source fixture";
+            source.relative_locator = "fixtures/normal.tga";
+            source.content_digest = normal_texture.current_source_digest;
+            source.format = assets::TextureSourceFormat::tga;
+            source.width = 1U;
+            source.height = 1U;
+            source.provenance = "Synthetic tangent-scope regression source";
+            take(catalog.insert_texture(source));
+            take(catalog.insert_material(anisotropic));
+            take(catalog.insert_material(normal_mapped));
+            const auto graph = anisotropy_graph_project(1.0).material_catalog()
+                .material_graphs().at("fixture/opacity");
+            take(catalog.insert_material_graph(graph));
+            take(catalog.bind_material_graph(1U, graph.identity));
+            take(catalog.insert_assignment({{first_mesh, 1U}, 1U, {}}));
+            take(catalog.insert_assignment({{second_mesh, same_object ? 2U : 1U}, 2U, {}}));
+            take(document.set_material_catalog(std::move(catalog)));
+            const auto result = d3d12::prepare_project_scene_render(
+                "tangent-scope", document, {}, 97U, 97U, {normal_texture});
+            require(same_object && normal_uv != render::kUv0 ?
+                    (!result && result.error().code == core::ErrorCode::unsupported) :
+                    static_cast<bool>(result),
+                "UV1 tangent conflicts are object-scoped; rotated/reflected UV0 normal maps on other materials remain valid");
         }
-        const auto first_mesh = take(access.add_mesh(mesh));
-        const auto first_object = take(access.create_object("Anisotropic object"));
-        take(access.attach_mesh(first_object, first_mesh));
-        auto second_mesh = first_mesh;
-        if (!same_object) {
-            second_mesh = take(access.add_mesh(separate_mesh));
-            const auto second_object = take(access.create_object("Unrelated normal-mapped object"));
-            take(access.attach_mesh(second_object, second_mesh));
+    }
+}
+
+void scene_anisotropy_frame_transport_preserves_orientation() {
+    const core::Vec3d geometric{0.0, 0.0, 1.0};
+    const core::Vec3d tangent{1.0, 0.0, 0.0};
+    const auto close = [](core::Vec3d a, core::Vec3d b) {
+        return (a - b).length() < 1.0e-10;
+    };
+    for (const double handedness : {-1.0, 1.0}) {
+        for (const auto normal : {geometric, tangent, core::Vec3d{0.0, 1.0, 0.0},
+                core::Vec3d{0.0, 0.0, -1.0}, core::Vec3d{0.3, 0.4, std::sqrt(0.75)},
+                core::Vec3d{1.0, 0.0, 1.0e-10}.normalized(),
+                core::Vec3d{1.0e-8, 0.0, -1.0}.normalized(),
+                core::Vec3d{2.0e-6, 3.0e-6, -1.0}.normalized()}) {
+            const auto frame = take(d3d12::transport_scene_anisotropy_frame(
+                geometric, tangent, handedness, normal));
+            require(frame.tangent.finite() && frame.bitangent.finite() &&
+                    std::abs(frame.tangent.length_squared() - 1.0) < 1.0e-10 &&
+                    std::abs(frame.bitangent.length_squared() - 1.0) < 1.0e-10 &&
+                    std::abs(core::dot(frame.tangent, normal)) < 1.0e-10 &&
+                    std::abs(core::dot(frame.bitangent, normal)) < 1.0e-10 &&
+                    close(core::cross(frame.tangent, frame.bitangent), normal * handedness),
+                "transport retains a finite orthonormal frame and authored handedness at tilted and antiparallel normals");
         }
-        project::MaterialCatalog catalog;
-        render::MaterialAsset anisotropic{1U, "Anisotropic fixture", {}, core::Revision{1U}};
-        render::MaterialAsset normal_mapped{2U, "Normal-mapped fixture", {}, core::Revision{1U}};
-        normal_mapped.definition.normal.asset = normal_texture.asset;
-        normal_mapped.definition.normal.uv_set = 2U;
+    }
+    const auto aligned = take(d3d12::transport_scene_anisotropy_frame(geometric, tangent, 1.0, geometric));
+    const auto quarter_turn = take(d3d12::transport_scene_anisotropy_frame(geometric, tangent, 1.0, tangent));
+    const auto antipodal = take(d3d12::transport_scene_anisotropy_frame(
+        geometric, tangent, 1.0, geometric * -1.0));
+    require(close(aligned.tangent, tangent) && close(quarter_turn.tangent, geometric * -1.0) &&
+            close(quarter_turn.bitangent, {0.0, 1.0, 0.0}) && close(antipodal.tangent, tangent) &&
+            close(antipodal.bitangent, {0.0, -1.0, 0.0}),
+        "closed-form quarter turns and deterministic antipodal orientation match the transport contract");
+    const auto tilted = core::Vec3d{0.3, 0.4, std::sqrt(0.75)};
+    const auto frame = take(d3d12::transport_scene_anisotropy_frame(geometric, tangent, 1.0, tilted));
+    const auto restored = take(d3d12::transport_scene_anisotropy_frame(tilted, frame.tangent, 1.0, geometric));
+    const auto closed_form = tangent - (geometric + tilted) *
+        (core::dot(tangent, tilted) / (1.0 + core::dot(geometric, tilted)));
+    require(close(restored.tangent, tangent) && close(frame.tangent, closed_form),
+        "shortest transport is reversible and matches the independent positive-hemisphere formula");
+    for (const auto bad : {core::Vec3d{}, core::Vec3d{2.0, 0.0, 0.0},
+            core::Vec3d{std::numeric_limits<double>::quiet_NaN(), 0.0, 1.0}}) {
+        require(!d3d12::transport_scene_anisotropy_frame(bad, tangent, 1.0, geometric) &&
+                !d3d12::transport_scene_anisotropy_frame(geometric, bad, 1.0, geometric) &&
+                !d3d12::transport_scene_anisotropy_frame(geometric, tangent, 1.0, bad),
+            "frame transport rejects malformed unit-vector inputs");
+    }
+    require(!d3d12::transport_scene_anisotropy_frame(geometric, geometric, 1.0, geometric) &&
+            !d3d12::transport_scene_anisotropy_frame(geometric, tangent, 0.0, geometric) &&
+            !d3d12::transport_scene_anisotropy_frame(geometric, tangent,
+                std::numeric_limits<double>::quiet_NaN(), geometric),
+        "frame transport rejects nonorthogonal axes and invalid handedness");
+}
+
+void project_graph_anisotropic_normal_maps_preserve_source_boundaries() {
+    const auto normal_texture = texture(99U, {180U, 80U, 240U, 255U}, assets::TextureSemantic::normal);
+    const auto make_document = [&](const render::TextureRef& normal, double strength = 0.7) {
+        auto document = anisotropy_graph_project(strength);
+        auto catalog = document.material_catalog();
         project::TextureSourceRecord source;
         source.id = normal_texture.asset;
-        source.name = "Normal source fixture";
-        source.relative_locator = "fixtures/normal.tga";
+        source.name = "Anisotropic normal source";
+        source.relative_locator = "fixtures/anisotropic-normal.tga";
         source.content_digest = normal_texture.current_source_digest;
         source.format = assets::TextureSourceFormat::tga;
         source.width = 1U;
         source.height = 1U;
-        source.provenance = "Synthetic tangent-scope regression source";
+        source.provenance = "Locally authored synthetic regression texture";
         take(catalog.insert_texture(source));
-        take(catalog.insert_material(anisotropic));
-        take(catalog.insert_material(normal_mapped));
-        const auto graph = anisotropy_graph_project(1.0).material_catalog()
-            .material_graphs().at("fixture/opacity");
-        take(catalog.insert_material_graph(graph));
-        take(catalog.bind_material_graph(1U, graph.identity));
-        take(catalog.insert_assignment({{first_mesh, 1U}, 1U, {}}));
-        take(catalog.insert_assignment({{second_mesh, same_object ? 2U : 1U}, 2U, {}}));
+        auto material = catalog.materials().at(1U);
+        material.definition.normal = normal;
+        material.revision = material.revision.next();
+        take(catalog.replace_material(material));
         take(document.set_material_catalog(std::move(catalog)));
-        const auto result = d3d12::prepare_project_scene_render(
-            "tangent-scope", document, {}, 97U, 97U, {normal_texture});
-        require(same_object ? (!result && result.error().code == core::ErrorCode::unsupported) :
-                static_cast<bool>(result),
-            "UV1 normal-map conflict is scoped to another material on the same anisotropic object");
+        return document;
+    };
+    const auto prepare = [&](const project::ProjectDocument& document) {
+        return d3d12::prepare_project_scene_render(
+            "graph-anisotropic-normal", document, {}, 97U, 97U, {normal_texture});
+    };
+    render::TextureRef normal;
+    normal.asset = normal_texture.asset;
+    normal.transform.scale = {2.0, 0.75};
+    normal.transform.offset = {0.25, -0.5};
+    normal.transform.pivot = {0.2, 0.9};
+    for (const auto convention : {render::NormalConvention::directx_y_minus,
+            render::NormalConvention::opengl_y_plus}) {
+        normal.normal_convention = convention;
+        const auto document = make_document(normal);
+        const auto before = document.serialize();
+        const auto prepared = take(prepare(document));
+        std::size_t affected = 0U;
+        for (const auto& object : prepared.objects) {
+            for (const auto& binding : object.materials) {
+                if (binding.current_material.id == 1U) {
+                    ++affected;
+                    require(binding.current_material.definition.normal == normal && binding.anisotropy == 0.7 &&
+                            object.uv0_set == render::kUv0 && object.mesh.vertices.front().tangent.has_value(),
+                        "saved graph instances retain exact normal binding, convention and explicit tangent source");
+                }
+            }
+        }
+        const auto reopened = take(project::ProjectDocument::deserialize(before));
+        require(affected == 3U && document.serialize() == before &&
+                take(take(prepare(reopened)).digest()) == take(prepared.digest()),
+            "normal-mapped anisotropy survives save/reopen without authoring or binding mutation");
+        auto stale_texture = prepared;
+        stale_texture.textures.front().current_source_digest = hash("different-normal-source");
+        require(!stale_texture.validate() && !stale_texture.digest(),
+            "anisotropic normal-map admission still refuses stale texture bytes");
+        auto stale_material = prepared;
+        stale_material.objects.front().materials.front().current_material.definition.normal.normal_convention =
+            convention == render::NormalConvention::directx_y_minus
+                ? render::NormalConvention::opengl_y_plus : render::NormalConvention::directx_y_minus;
+        require(!stale_material.validate() && !stale_material.digest(),
+            "normal convention changes require source-bound material recompilation");
     }
+    for (const auto rotation : {0.25, -0.25, 2.0 * std::acos(-1.0)}) {
+        auto rotated = normal;
+        rotated.transform.rotation = rotation;
+        const auto refused = prepare(make_document(rotated));
+        require(!refused && refused.error().code == core::ErrorCode::unsupported &&
+                static_cast<bool>(prepare(make_document(rotated, 0.0))),
+            "nonzero authored rotations refuse only for anisotropy; no approximate identity inference");
+    }
+    for (const auto scale : {core::Vec2d{-1.0, 1.0}, core::Vec2d{1.0, -1.0}, core::Vec2d{-1.0, -1.0}}) {
+        auto reflected = normal;
+        reflected.transform.scale = scale;
+        const auto refused = prepare(make_document(reflected));
+        require(!refused && refused.error().code == core::ErrorCode::unsupported &&
+                static_cast<bool>(prepare(make_document(reflected, 0.0))),
+            "reflected normal-map transforms retain their legacy path but refuse anisotropic axis ambiguity");
+    }
+    auto wrong_uv = normal;
+    wrong_uv.uv_set = 2U;
+    require(!prepare(make_document(wrong_uv)), "normal maps cannot select an unauthored anisotropic tangent stream");
+    auto raw = take(prepare(make_document(normal)));
+    raw.objects.front().materials.front().current_material.definition.normal.transform.rotation = 0.1;
+    rebind(raw.objects.front());
+    const auto raw_refusal = raw.validate();
+    require(!raw_refusal && raw_refusal.error().code == core::ErrorCode::unsupported,
+        "direct scene callers cannot bypass anisotropic normal-map orientation admission");
 }
 
 void project_scene_texture_loader_binds_verified_sources_and_fails_closed() {
@@ -4698,6 +4845,143 @@ void anisotropy_direct_lights_match_reference_and_authored_axes(
         "native anisotropy receipts disclose absent environment integration");
 }
 
+void anisotropic_normal_maps_match_transported_reference_and_cache(
+    d3d12::D3D12Device& device) {
+    auto scene = request();
+    scene.width = 97U;
+    scene.height = 97U;
+    scene.antialiasing = d3d12::SceneRenderAntialiasing::none;
+    const core::Vec3d world_view{0.0, 0.0, 1.0};
+    const core::Vec3d world_light{0.48, 0.36, 0.8};
+    scene.light = {world_light, {3.0, 3.0, 3.0}};
+    auto& binding = scene.objects.front().materials.front();
+    auto& material = binding.current_material.definition;
+    material.base_color_factor = {0.6, 0.4, 0.2, 1.0};
+    material.metallic = 1.0;
+    material.normal.asset = 99U;
+    material.normal_scale = 1.25;
+    d3d12::SceneRenderCache cache;
+    const auto render_cached = [&](const d3d12::SceneRenderRequest& input) {
+        return take(d3d12::render_scene_cached(device, cache, input, CARTO_D3D12_SHADER_DIR));
+    };
+    const std::size_t center = (48U * 97U + 48U) * 4U;
+    const std::array<double, 3U> base{0.6, 0.4, 0.2};
+    const auto verify = [&](const d3d12::SceneRenderRequest& input,
+                            const d3d12::SceneRenderImage& image, double attenuation) {
+        const auto& factors = input.objects.front().materials.front();
+        const auto& definition = factors.current_material.definition;
+        const auto& pixels = input.textures.front().mips.levels.front().pixels;
+        const double sign = definition.normal.normal_convention == render::NormalConvention::opengl_y_plus
+            ? -1.0 : 1.0;
+        // Decode the actual source-bound mip texel, including quantization and
+        // existing convention/normal-scale semantics, rather than an ideal normal.
+        const auto normal = core::Vec3d{
+            (2.0 * pixels[0U] / 255.0 - 1.0) * definition.normal_scale,
+            -(2.0 * pixels[1U] / 255.0 - 1.0) * definition.normal_scale * sign,
+            2.0 * pixels[2U] / 255.0 - 1.0}.normalized();
+        const auto frame = take(d3d12::transport_scene_anisotropy_frame(
+            {0.0, 0.0, 1.0}, {1.0, 0.0, 0.0}, sign, normal));
+        const auto local = [&](core::Vec3d direction) {
+            return core::Vec3d{core::dot(frame.tangent, direction),
+                core::dot(frame.bitangent, direction), core::dot(normal, direction)};
+        };
+        const auto reference = take(d3d12::evaluate_scene_anisotropy_reference(
+            definition.roughness, factors.anisotropy, local(world_view), local(world_light)));
+        const auto half = (world_view + world_light).normalized();
+        const double fresnel_power = std::pow(1.0 - core::dot(world_view, half), 5.0);
+        require(image.depth[center / 4U] < 1.0F, "mapped-normal reference pixel covers geometry");
+        for (std::size_t channel = 0U; channel < base.size(); ++channel) {
+            const double fresnel = base[channel] + (1.0 - base[channel]) * fresnel_power;
+            const double expected = 0.03 * base[channel] + fresnel * reference.mixed_kernel *
+                std::max(0.0, core::dot(normal, world_light)) * 3.0 * attenuation;
+            require(std::isfinite(image.linear_hdr_rgba[center + channel]) &&
+                    std::abs(image.linear_hdr_rgba[center + channel] - expected) < 3.0e-4,
+                "mapped signed anisotropy matches transported-frame direct-light reference pixels");
+        }
+    };
+    for (const auto rgba : {std::array<std::uint8_t, 4U>{180U, 80U, 240U, 255U},
+            std::array<std::uint8_t, 4U>{255U, 128U, 128U, 255U}}) {
+        scene.textures = {texture(99U, rgba, assets::TextureSemantic::normal)};
+        for (const auto convention : {render::NormalConvention::directx_y_minus,
+                render::NormalConvention::opengl_y_plus}) {
+            material.normal.normal_convention = convention;
+            binding.anisotropy = 0.0;
+            rebind(scene.objects.front());
+            const auto isotropic = render_cached(scene);
+            for (const double strength : {-1.0, -0.5, 0.5, 1.0, 0.0}) {
+                binding.anisotropy = strength;
+                const auto image = render_cached(scene);
+                verify(scene, image, 1.0);
+                if (strength == 0.0)
+                    require(image.linear_hdr_rgba == isotropic.linear_hdr_rgba && image.depth == isotropic.depth,
+                        "zero anisotropy restores exact mapped-normal legacy pixels after cache reuse");
+            }
+            binding.anisotropy = 0.7;
+            const auto cached = render_cached(scene);
+            const auto fresh = capture(device, scene);
+            require(cached.linear_hdr_rgba == fresh.linear_hdr_rgba && cached.depth == fresh.depth,
+                "normal-source and convention-only changes agree between reused and fresh resources");
+        }
+    }
+    scene.textures = {texture(99U, {180U, 80U, 240U, 255U}, assets::TextureSemantic::normal)};
+    material.normal.normal_convention = render::NormalConvention::directx_y_minus;
+    rebind(scene.objects.front());
+    const auto directx = render_cached(scene);
+    const auto directx_digest = take(scene.digest());
+    material.normal.normal_convention = render::NormalConvention::opengl_y_plus;
+    rebind(scene.objects.front());
+    const auto opengl = render_cached(scene);
+    const auto opengl_fresh = capture(device, scene);
+    require(take(scene.digest()) != directx_digest && directx.pixel_digest != opengl.pixel_digest &&
+            opengl.linear_hdr_rgba == opengl_fresh.linear_hdr_rgba,
+        "convention-only edits change the actual mapped normal and invalidate cached upload factors");
+    verify(scene, opengl, 1.0);
+
+    const auto original_normal = scene.textures.front();
+    const auto unchanged_material_digest = binding.material.artifact_digest;
+    scene.textures.front() = texture(99U, {64U, 190U, 240U, 255U}, assets::TextureSemantic::normal);
+    const auto changed_normal = render_cached(scene);
+    const auto changed_normal_fresh = capture(device, scene);
+    require(binding.material.artifact_digest == unchanged_material_digest &&
+            changed_normal.pixel_digest != opengl.pixel_digest &&
+            changed_normal.linear_hdr_rgba == changed_normal_fresh.linear_hdr_rgba &&
+            changed_normal.depth == changed_normal_fresh.depth,
+        "normal-source-only changes refresh cached texture bytes at fixed material and anisotropy");
+    verify(scene, changed_normal, 1.0);
+    scene.textures.front() = original_normal;
+    require(render_cached(scene).linear_hdr_rgba == opengl.linear_hdr_rgba,
+        "restoring normal texture bytes restores exact cached mapped-anisotropy shading");
+
+    material.normal.transform.scale = {2.0, 0.75};
+    material.normal.transform.offset = {0.2, -0.5};
+    material.normal.transform.pivot = {0.1, 0.9};
+    rebind(scene.objects.front());
+    const auto transformed = render_cached(scene);
+    require(transformed.linear_hdr_rgba == opengl.linear_hdr_rgba,
+        "positive axis-aligned normal transforms do not rotate anisotropy on a constant texel fixture");
+
+    scene.light.radiance = {};
+    d3d12::SceneRenderLocalLight light;
+    light.object = {903U};
+    light.position = {2.4, 1.8, 4.0};
+    light.emission_direction = world_light * -1.0;
+    light.radiance = {3.0, 3.0, 3.0};
+    light.range = 10.0;
+    light.inner_cone_radians = 0.2;
+    light.outer_cone_radians = 0.6;
+    for (const auto kind : {d3d12::SceneRenderLocalLightKind::point, d3d12::SceneRenderLocalLightKind::spot}) {
+        light.kind = kind;
+        scene.local_lights = {light};
+        for (const double strength : {-1.0, 1.0}) {
+            binding.anisotropy = strength;
+            verify(scene, render_cached(scene), (1.0 - 0.0625) * (1.0 - 0.0625) / 25.0);
+        }
+    }
+    require(std::any_of(transformed.limitations.begin(), transformed.limitations.end(),
+            [](const std::string& limitation) { return limitation.find("antiparallel") != std::string::npos; }),
+        "native receipt discloses bounded normal-map orientation and the antiparallel frame choice");
+}
+
 void viewport_camera_rebuilds_pan_from_immutable_base_and_resets_home() {
     d3d12::SceneRenderCamera base;
     base.position = {0.0, 0.0, 10.0};
@@ -4880,6 +5164,8 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--graph-anisotropy-only") {
             scene_anisotropy_reference_preserves_axes_and_zero_boundary();
             project_graph_anisotropy_requires_source_bound_tangents();
+            scene_anisotropy_frame_transport_preserves_orientation();
+            project_graph_anisotropic_normal_maps_preserve_source_boundaries();
             std::cout << "PASS graph anisotropy reference and tangent boundaries (no GPU)\n";
             return 0;
         }
@@ -4906,6 +5192,8 @@ int main(int argc, char** argv) {
             std::cout << "PASS graph sheen reference, source identity and environment refusal\n";
             scene_anisotropy_reference_preserves_axes_and_zero_boundary();
             project_graph_anisotropy_requires_source_bound_tangents();
+            scene_anisotropy_frame_transport_preserves_orientation();
+            project_graph_anisotropic_normal_maps_preserve_source_boundaries();
             std::cout << "PASS graph anisotropy reference, source and tangent boundaries\n";
             authored_project_camera_resolves_world_pose_and_projection();
             std::cout << "PASS authored camera world-pose resolution and projection binding\n";
@@ -4957,6 +5245,8 @@ int main(int argc, char** argv) {
         std::cout << "PASS direct sheen reference pixels and mesh-cache invalidation\n";
         anisotropy_direct_lights_match_reference_and_authored_axes(*device);
         std::cout << "PASS direct anisotropy reference pixels, axes and cache invalidation\n";
+        anisotropic_normal_maps_match_transported_reference_and_cache(*device);
+        std::cout << "PASS anisotropic normal-map frame, conventions and cached reference pixels\n";
         transformed_normals_match_baked_geometry(*device);
         require(device->debug_receipts().empty() && !device->device_lost(), "complete scene suite preserves clean native device state");
         std::cout << "PASS nonuniform and mirrored normal/tangent GPU parity\n";

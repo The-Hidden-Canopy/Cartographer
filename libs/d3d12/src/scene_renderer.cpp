@@ -1668,9 +1668,16 @@ Result<void> SceneRenderRequest::validate() const {
                     "scene anisotropy must be finite and in [-1, 1]"));
             }
             if (binding.anisotropy != 0.0) {
-                if (environment.has_value() || static_cast<bool>(definition.normal)) {
+                if (environment.has_value()) {
                     return Result<void>::failure({core::ErrorCode::unsupported,
-                        "scene anisotropy currently refuses environment lighting and normal maps"});
+                        "scene anisotropy currently refuses environment lighting"});
+                }
+                if (definition.normal && (definition.normal.uv_set != render::kUv0 ||
+                        definition.normal.transform.rotation != 0.0 ||
+                        definition.normal.transform.scale.x <= 0.0 ||
+                        definition.normal.transform.scale.y <= 0.0)) {
+                    return Result<void>::failure({core::ErrorCode::unsupported,
+                        "anisotropic normal maps require UV0 with zero rotation and positive axis scales"});
                 }
                 if (object.uv0_set != render::kUv0 || object.mesh.vertices.empty() ||
                     !object.mesh.vertices.front().uv.has_value() ||
@@ -2064,7 +2071,8 @@ Result<SceneRenderImage> render_scene_impl(
     if (uses_anisotropy) {
         result.limitations.push_back(
             "Signed UV0-tangent anisotropy mixes legacy specular with anisotropic GGX/Smith "
-            "for analytic direct lights only; no normal maps, anisotropic IBL, "
+            "for analytic direct lights only; normal maps require UV0, zero rotation and positive scales; "
+            "shortest-rotation shading axes use a deterministic antiparallel fallback; no anisotropic IBL, "
             "independent direction/roughness texture, or measured energy/appearance acceptance");
     }
     const std::array<std::string, 7U> shader_names{
