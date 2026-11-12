@@ -28,6 +28,9 @@
 #include "carto_studio_dock.hpp"
 #include "interchange_export_feedback.hpp"
 #include "prepared_publication_feedback.hpp"
+#ifdef CARTO_HAS_SCULPT_PREVIEW_PROVIDER
+#include <carto/sculpt_preview_provider_factory.hpp>
+#endif
 #ifdef CARTO_HAS_LINKED_SCENE_PROVIDER
 #include <carto/linked_scene_provider_factory.hpp>
 #endif
@@ -3953,6 +3956,13 @@ struct DesktopState {
     static constexpr float kTranslateGizmoHitRadius = 14.0F;
 
     DesktopState() : ui(session) {
+#ifdef CARTO_HAS_SCULPT_PREVIEW_PROVIDER
+        if (auto installed = session.install_sculpt_preview_provider(
+                carto::sculpt_preview::make_provider()); !installed) {
+            action_feedback = installed.error().message;
+            action_feedback_error = true;
+        }
+#endif
 #ifdef CARTO_HAS_LINKED_SCENE_PROVIDER
         if (auto installed = session.install_linked_scene_provider(
                 carto::linked_scene::make_provider()); !installed) {
@@ -19480,6 +19490,29 @@ struct DesktopState {
                 "The stroke commits through the project command path on mouse-up.");
             ImGui::Text("Project revision %llu",
                 static_cast<unsigned long long>(snapshot.project_revision.value()));
+            {
+                // Evaluated display is view state only; strokes always anchor
+                // to the authored source surface.
+                const auto& sculpt_preview = snapshot.viewport.sculpt_preview;
+                bool show_evaluated = sculpt_preview.enabled;
+                ImGui::BeginDisabled(!sculpt_preview.provider_installed);
+                if (ImGui::Checkbox("Show evaluated sculpt", &show_evaluated)) {
+                    if (auto changed = session.set_sculpt_preview_enabled(show_evaluated); !changed) {
+                        action_feedback = changed.error().message;
+                        action_feedback_error = true;
+                    }
+                }
+                ImGui::EndDisabled();
+                if (!sculpt_preview.provider_installed) {
+                    ImGui::TextDisabled("Sculpt evaluation is not installed in this build; "
+                                        "the viewport shows the authored source.");
+                } else if (sculpt_preview.enabled) {
+                    ImGui::TextWrapped(
+                        "Showing %zu evaluated mesh(es); %zu refused and shown as authored. "
+                        "Turn this off to add strokes on the source surface.",
+                        sculpt_preview.evaluated_meshes, sculpt_preview.refused_meshes);
+                }
+            }
             ImGui::Separator();
             const bool agent_object_scope =
                 snapshot.selection.mode == carto::editor::SelectionMode::object &&

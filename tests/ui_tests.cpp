@@ -4522,6 +4522,85 @@ void sculpt_surface_strokes_commit_anchored_samples_through_human_commands() {
 
 }
 
+// A host-installed SculptStack evaluator changes only what the viewport shows.
+// Authoring stays on the source surface: strokes are refused while the
+// evaluated preview is on, and identity-breaking evaluations fail closed.
+struct OffsetSculptPreviewProvider final : carto::application::SculptPreviewProvider {
+    mutable bool keep_identity = true;
+    [[nodiscard]] std::string_view name() const noexcept override { return "test offset"; }
+    [[nodiscard]] carto::core::Result<carto::geometry::CompiledMesh> evaluate(
+        const carto::geometry::EditableMesh& source,
+        const carto::production::SculptStack&) const override {
+        auto compiled = source.compile();
+        if (!compiled) return compiled;
+        for (auto& position : compiled.value().positions) position.y += 0.25;
+        if (!keep_identity && compiled.value().vertex_ids.size() > 1U)
+            std::swap(compiled.value().vertex_ids.front(), compiled.value().vertex_ids.back());
+        return compiled;
+    }
+};
+
+void sculpt_preview_provider_displays_evaluated_geometry_without_authoring() {
+    carto::application::ApplicationSession bare;
+    const auto unavailable = bare.set_sculpt_preview_enabled(true);
+    REQUIRE(!unavailable && unavailable.error().code == carto::core::ErrorCode::unsupported);
+
+    carto::application::ApplicationSession session;
+    const auto provider = std::make_shared<OffsetSculptPreviewProvider>();
+    REQUIRE(session.install_sculpt_preview_provider(provider));
+    REQUIRE(!session.install_sculpt_preview_provider(provider));
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::NewProjectAction{"Sculpt preview test"}));
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{"Sculpt mesh", {2.0, 2.0, 2.0}}));
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::sculpt));
+    auto snapshot = ui.snapshot();
+    const carto::scene::ObjectId object = snapshot.objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{object}));
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::vertex}));
+    REQUIRE(ui.dispatch(carto::application::SelectVertexAction{
+        object, carto::geometry::VertexId{1U}}));
+    snapshot = ui.snapshot();
+    REQUIRE(ui.dispatch(carto::application::AppendSculptStrokeAction{
+        snapshot.project_revision, carto::production::SculptStrokeMode::add, 0.5, 0.05,
+        snapshot.project_generation}));
+
+    const auto source = ui.snapshot();
+    const auto source_positions = source.viewport.scene.find(object)->mesh->positions;
+    REQUIRE(source.viewport.sculpt_preview.provider_installed &&
+            !source.viewport.sculpt_preview.enabled &&
+            source.viewport.sculpt_preview.evaluated_meshes == 0U);
+
+    REQUIRE(session.set_sculpt_preview_enabled(true));
+    const auto previewed = ui.snapshot();
+    const auto& shown = previewed.viewport.scene.find(object)->mesh->positions;
+    REQUIRE(shown.size() == source_positions.size());
+    for (std::size_t index = 0U; index < shown.size(); ++index)
+        REQUIRE(shown[index].y == source_positions[index].y + 0.25);
+    REQUIRE(previewed.viewport.sculpt_preview.enabled &&
+            previewed.viewport.sculpt_preview.evaluated_meshes == 1U &&
+            previewed.viewport.sculpt_preview.refused_meshes == 0U);
+    const auto refused_stroke = ui.dispatch(carto::application::AppendSculptStrokeAction{
+        previewed.project_revision, carto::production::SculptStrokeMode::add, 0.5, 0.05,
+        previewed.project_generation});
+    REQUIRE(!refused_stroke && refused_stroke.error().code == carto::core::ErrorCode::invalid_state);
+    REQUIRE(ui.snapshot().project_revision == previewed.project_revision);
+
+    REQUIRE(session.set_sculpt_preview_enabled(false));
+    const auto restored = ui.snapshot();
+    REQUIRE(same_positions(restored.viewport.scene.find(object)->mesh->positions, source_positions));
+    REQUIRE(ui.dispatch(carto::application::AppendSculptStrokeAction{
+        restored.project_revision, carto::production::SculptStrokeMode::add, 0.5, 0.05,
+        restored.project_generation}));
+
+    provider->keep_identity = false;
+    REQUIRE(session.set_sculpt_preview_enabled(true));
+    const auto broken = ui.snapshot();
+    REQUIRE(broken.viewport.sculpt_preview.refused_meshes == 1U &&
+            broken.viewport.sculpt_preview.evaluated_meshes == 0U);
+    REQUIRE(same_positions(broken.viewport.scene.find(object)->mesh->positions, source_positions));
+}
+
 void sculpt_point_strokes_are_revision_bound_human_commands() {
     TempDirectory temp;
     carto::application::ApplicationSession session;
@@ -5389,6 +5468,7 @@ int main() {
         knife_viewport_sampling_snaps_endpoints_and_stays_on_the_selected_face();
         sculpt_surface_strokes_commit_anchored_samples_through_human_commands();
         sculpt_point_strokes_are_revision_bound_human_commands();
+        sculpt_preview_provider_displays_evaluated_geometry_without_authoring();
         sculpt_layer_weight_and_order_edits_are_revision_bound_human_commands();
         decal_projection_outlines_require_exact_bounded_source_identity();
         viewport_decal_preparation_requires_live_current_exact_displayed_source();

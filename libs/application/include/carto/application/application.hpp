@@ -2,6 +2,7 @@
 
 #include <carto/assets/blob_store.hpp>
 #include <carto/application/linked_scene_provider.hpp>
+#include <carto/application/sculpt_preview_provider.hpp>
 #include <carto/application/viewport_appearance.hpp>
 #include <carto/assets/source_registry.hpp>
 #include <carto/attributes/uv.hpp>
@@ -150,6 +151,8 @@ struct ViewportState {
     // Externally linked parts verified by the trusted provider. Their render
     // instances are in `scene` with no project mesh asset.
     std::shared_ptr<const LinkedViewportScene> linked;
+    // Optional evaluated SculptStack display; see SculptPreviewProvider.
+    SculptPreviewStatus sculpt_preview;
     core::Revision project_revision;
     std::optional<core::Diagnostic> error;
 };
@@ -2166,6 +2169,14 @@ public:
     // Trusted desktop initialization only; install before opening a project.
     [[nodiscard]] core::Result<void> install_linked_scene_provider(
         std::shared_ptr<LinkedSceneProvider> provider);
+    // Trusted host initialization only; install before opening a project.
+    [[nodiscard]] core::Result<void> install_sculpt_preview_provider(
+        std::shared_ptr<const SculptPreviewProvider> provider);
+    // Session view state, never project data. While enabled the viewport shows
+    // evaluated sculpt geometry and stroke authoring is refused, because
+    // strokes anchor to the source surface rather than the displayed one.
+    [[nodiscard]] core::Result<void> set_sculpt_preview_enabled(bool enabled);
+    [[nodiscard]] bool sculpt_preview_enabled() const noexcept { return sculpt_preview_enabled_; }
     [[nodiscard]] static core::Result<RecoveryInspection> inspect_recovery(
         const std::filesystem::path& project_path);
 
@@ -2679,6 +2690,9 @@ private:
         std::shared_ptr<const geometry::CompiledMesh> mesh;
         std::shared_ptr<const ViewportState::MeshAttributeOverlayData> attribute_overlay;
         std::optional<core::Diagnostic> attribute_overlay_error;
+        // Set when `mesh` is an evaluated sculpt preview of this stack digest.
+        std::optional<assets::Sha256Digest> sculpt_digest;
+        std::optional<core::Diagnostic> sculpt_error;
     };
 
     project::ProjectDocument document_;
@@ -2686,6 +2700,8 @@ private:
     // Retained at open so removing a companion later cannot enable base-only Save.
     bool opened_condition_link_companions_ = false;
     std::shared_ptr<LinkedSceneProvider> linked_scene_provider_;
+    std::shared_ptr<const SculptPreviewProvider> sculpt_preview_provider_;
+    bool sculpt_preview_enabled_ = false;
     std::optional<LinkedSceneIdentity> linked_scene_identity_;
     std::shared_ptr<const LinkedViewportScene> linked_viewport_;
     mutable core::Revision appearance_revision_;

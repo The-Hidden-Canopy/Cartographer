@@ -2016,6 +2016,26 @@ core::Result<void> ApplicationSession::install_linked_scene_provider(
     return core::Result<void>::success();
 }
 
+core::Result<void> ApplicationSession::install_sculpt_preview_provider(
+    std::shared_ptr<const SculptPreviewProvider> provider) {
+    if (!provider || sculpt_preview_provider_ || project_path_ || journal_)
+        return core::Result<void>::failure(core::Diagnostic(core::ErrorCode::invalid_state,
+            "install one sculpt preview provider before opening a project"));
+    sculpt_preview_provider_ = std::move(provider);
+    return core::Result<void>::success();
+}
+
+core::Result<void> ApplicationSession::set_sculpt_preview_enabled(bool enabled) {
+    if (enabled && !sculpt_preview_provider_)
+        return core::Result<void>::failure(core::Diagnostic(core::ErrorCode::unsupported,
+            "sculpt evaluation is not installed in this build; the viewport shows the authored source"));
+    if (sculpt_preview_enabled_ != enabled) {
+        sculpt_preview_enabled_ = enabled;
+        viewport_mesh_cache_.clear();
+    }
+    return core::Result<void>::success();
+}
+
 ApplicationSession::ApplicationSession(
     const ApplicationSession& source,
     SpeculativeCopyTag)
@@ -5811,6 +5831,11 @@ core::Result<DispatchReceipt> ApplicationSession::append_sculpt_stroke(
             core::ErrorCode::unsupported,
             "SculptStack authoring requires the human command boundary"));
     }
+    if (sculpt_preview_enabled_) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "turn off the evaluated sculpt preview to add strokes on the source surface"));
+    }
     if (action.expected_project_generation != project_generation_ ||
         action.expected_project_revision != document_.revision()) {
         return failure(core::Diagnostic(
@@ -5885,6 +5910,11 @@ core::Result<DispatchReceipt> ApplicationSession::append_sculpt_surface_stroke(
         return failure(core::Diagnostic(
             core::ErrorCode::unsupported,
             "Sculpt surface authoring requires the human command boundary"));
+    }
+    if (sculpt_preview_enabled_) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "turn off the evaluated sculpt preview to add strokes on the source surface"));
     }
     if (action.expected_project_generation != project_generation_ ||
         action.expected_project_revision != document_.revision()) {
@@ -13555,6 +13585,8 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
              result.selection.objects.front() == object);
     };
     render::RenderScene viewport_scene;
+    result.viewport.sculpt_preview.provider_installed = sculpt_preview_provider_ != nullptr;
+    result.viewport.sculpt_preview.enabled = sculpt_preview_enabled_;
     for (auto cache = viewport_mesh_cache_.begin(); cache != viewport_mesh_cache_.end();) {
         if (!document_.meshes().contains(cache->first)) {
             cache = viewport_mesh_cache_.erase(cache);
@@ -13575,39 +13607,81 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
             break;
         }
         const auto source_revision = mesh->second.revision();
+        // Evaluated sculpt display needs an installed provider, the session
+        // toggle and an authored stack for this mesh; otherwise the source shows.
+        const project::SerializedSculptStack* stored_stack = nullptr;
+        std::optional<assets::Sha256Digest> wanted_sculpt;
+        if (sculpt_preview_enabled_ && sculpt_preview_provider_) {
+            const auto stack = document_.sculpt_stacks().find(*object.mesh_asset);
+            if (stack != document_.sculpt_stacks().end()) {
+                stored_stack = &stack->second;
+                wanted_sculpt = stack->second.digest;
+            }
+        }
         const auto cached = viewport_mesh_cache_.find(*object.mesh_asset);
         std::shared_ptr<const geometry::CompiledMesh> compiled_mesh;
         if (cached != viewport_mesh_cache_.end() &&
             cached->second.project_generation == project_generation_ &&
             cached->second.source == &mesh->second &&
             cached->second.source_revision == source_revision &&
+            cached->second.sculpt_digest == wanted_sculpt &&
             cached->second.mesh != nullptr) {
             compiled_mesh = cached->second.mesh;
         } else {
-            // SculptStack is authored source data here; the public viewport
-            // compiles the current mesh without evaluating brush kernels.
             const geometry::EditableMesh& viewport_mesh = mesh->second;
             auto compiled = viewport_mesh.compile();
             if (!compiled) {
                 result.viewport.error = compiled.error().with_context("viewport compilation");
                 break;
             }
-            auto attribute_overlay = build_viewport_attribute_overlay(
-                viewport_mesh, compiled.value());
+            std::optional<core::Diagnostic> sculpt_error;
+            bool sculpt_evaluated = false;
+            if (stored_stack != nullptr) {
+                auto decoded = production::SculptStack::deserialize(stored_stack->bytes);
+                auto evaluated = decoded
+                    ? sculpt_preview_provider_->evaluate(viewport_mesh, decoded.value())
+                    : core::Result<geometry::CompiledMesh>::failure(decoded.error());
+                if (!evaluated) {
+                    sculpt_error = evaluated.error().with_context("sculpt preview");
+                } else if (!evaluated.value().valid() ||
+                           evaluated.value().vertex_ids != compiled.value().vertex_ids ||
+                           evaluated.value().triangle_faces != compiled.value().triangle_faces) {
+                    sculpt_error = core::Diagnostic(core::ErrorCode::validation_failed,
+                        "sculpt preview did not keep the source vertex and face identities");
+                } else {
+                    compiled = std::move(evaluated);
+                    sculpt_evaluated = true;
+                }
+            }
             std::shared_ptr<const ViewportState::MeshAttributeOverlayData> overlay_data;
             std::optional<core::Diagnostic> overlay_error;
-            if (attribute_overlay) {
-                overlay_data = std::move(attribute_overlay.value());
-            } else {
-                overlay_error = attribute_overlay.error().with_context(
-                    "viewport authored mesh attributes");
+            // Authored attribute overlays describe source geometry, so they are
+            // not drawn over an evaluated sculpt surface.
+            if (!sculpt_evaluated) {
+                auto attribute_overlay = build_viewport_attribute_overlay(
+                    viewport_mesh, compiled.value());
+                if (attribute_overlay) {
+                    overlay_data = std::move(attribute_overlay.value());
+                } else {
+                    overlay_error = attribute_overlay.error().with_context(
+                        "viewport authored mesh attributes");
+                }
             }
             auto owned_mesh = std::make_shared<geometry::CompiledMesh>(std::move(compiled.value()));
             compiled_mesh = owned_mesh;
             viewport_mesh_cache_[*object.mesh_asset] = ViewportMeshCacheEntry{
                 project_generation_, &mesh->second, source_revision,
                 std::move(owned_mesh), std::move(overlay_data),
-                std::move(overlay_error)};
+                std::move(overlay_error), wanted_sculpt, std::move(sculpt_error)};
+        }
+        if (wanted_sculpt.has_value()) {
+            const auto& entry = viewport_mesh_cache_.at(*object.mesh_asset);
+            if (entry.sculpt_error.has_value()) {
+                ++result.viewport.sculpt_preview.refused_meshes;
+                append_problem(*entry.sculpt_error);
+            } else {
+                ++result.viewport.sculpt_preview.evaluated_meshes;
+            }
         }
         if (auto inserted = viewport_scene.upsert({
                 object.id, compiled_mesh, object_view.world_transform,

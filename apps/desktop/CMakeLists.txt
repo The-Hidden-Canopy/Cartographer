@@ -106,6 +106,23 @@ target_include_directories(cartographer_desktop PRIVATE
     ${CARTO_IMGUI_ROOT}/backends
 )
 
+# Explicit opt-in: a sculpt preview evaluator is built only from a directory
+# the developer supplies. Its provider.cmake must define the static library
+# target carto_sculpt_preview_provider, which exposes
+# <carto/sculpt_preview_provider_factory.hpp>. None of it is part of this repository.
+set(CARTO_SCULPT_PREVIEW_PROVIDER_ROOT "" CACHE PATH "SculptStack preview provider directory")
+if(CARTO_SCULPT_PREVIEW_PROVIDER_ROOT)
+    if(NOT EXISTS "${CARTO_SCULPT_PREVIEW_PROVIDER_ROOT}/provider.cmake")
+        message(FATAL_ERROR "Sculpt preview provider directory has no provider.cmake")
+    endif()
+    include("${CARTO_SCULPT_PREVIEW_PROVIDER_ROOT}/provider.cmake")
+    if(NOT TARGET carto_sculpt_preview_provider)
+        message(FATAL_ERROR "provider.cmake did not define carto_sculpt_preview_provider")
+    endif()
+    target_compile_definitions(cartographer_desktop PRIVATE CARTO_HAS_SCULPT_PREVIEW_PROVIDER=1)
+    target_link_libraries(cartographer_desktop PRIVATE carto_sculpt_preview_provider)
+endif()
+
 # Explicit opt-in private linked-scene provider (CARTO_LINKED_SCENE_PROVIDER_ROOT).
 if(TARGET carto_linked_scene_provider)
     target_compile_definitions(cartographer_desktop PRIVATE CARTO_HAS_LINKED_SCENE_PROVIDER=1)
