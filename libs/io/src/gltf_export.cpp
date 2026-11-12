@@ -585,18 +585,30 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
                         maximum[axis] = std::max(maximum[axis], narrowed.value()[axis]);
                     }
                 }
-                // A valid authoring triangle may collapse after narrowing to float32.
+                // Judge the actual float32 payload using double arithmetic, as
+                // native PBR upload does. Float area arithmetic would overflow
+                // for otherwise representable large triangles. A nonzero area
+                // alone also cannot detect a winding reversal from rounding.
                 for (std::size_t triangle = 0; triangle < source.indices.size(); triangle += 3U) {
-                    const auto &a = positions[source.indices[triangle]];
-                    const auto &b = positions[source.indices[triangle + 1U]];
-                    const auto &c = positions[source.indices[triangle + 2U]];
-                    const float abx = b[0] - a[0], aby = b[1] - a[1], abz = b[2] - a[2];
-                    const float acx = c[0] - a[0], acy = c[1] - a[1], acz = c[2] - a[2];
-                    const float x = aby * acz - abz * acy, y = abz * acx - abx * acz, z = abx * acy - aby * acx;
-                    const float area_squared = x*x + y*y + z*z;
-                    if (!std::isfinite(area_squared) || static_cast<double>(area_squared) * 0.25 <= 1.0e-24)
+                    const auto ia = source.indices[triangle];
+                    const auto ib = source.indices[triangle + 1U];
+                    const auto ic = source.indices[triangle + 2U];
+                    const auto position = [&](std::uint32_t index) {
+                        const auto& value = positions[index];
+                        return core::Vec3d{value[0], value[1], value[2]};
+                    };
+                    const auto projected_area = core::cross(
+                        position(ib) - position(ia), position(ic) - position(ia));
+                    const double area_squared = projected_area.length_squared();
+                    if (!projected_area.finite() || !std::isfinite(area_squared) || area_squared <= 4e-24)
                         return core::Result<GltfExportReport>::failure(validation(
                             "glTF float32 narrowing collapses a triangle or makes its area non-finite"));
+                    const auto source_area = core::cross(
+                        render_positions[ib] - render_positions[ia],
+                        render_positions[ic] - render_positions[ia]);
+                    if (!(core::dot(source_area, projected_area) > 0.0))
+                        return core::Result<GltfExportReport>::failure(validation(
+                            "glTF float32 narrowing reverses or loses a triangle orientation"));
                 }
                 for (const auto normal : render_normals) {
                     const auto narrowed = finite_vec3(normal, "mesh normal");

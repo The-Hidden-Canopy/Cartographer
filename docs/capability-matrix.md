@@ -1,5 +1,11 @@
 # Capability matrix
 
+Code-only continuation (2026-11-12): glTF/GLB position narrowing now refuses
+rounding-induced triangle orientation loss and evaluates packed-coordinate
+area in double precision, avoiding false overflow refusals for large finite
+float32 geometry. Regression cases are authored but unrun; see
+[interchange geometry fidelity](verification/gltf-float32-geometry-fidelity.md).
+
 Code-only continuation (2026-11-12): glTF/GLB applies the shared native UV
 orientation certificate to each emitted primitive's actual float32 coordinates,
 including UV-only fallback. Refusal and exact-payload regression cases are

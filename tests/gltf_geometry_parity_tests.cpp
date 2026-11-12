@@ -584,6 +584,115 @@ void gltf_float32_uv_projection_preserves_fidelity(const std::filesystem::path& 
     }
 }
 
+using PositionTriangle = std::array<core::Vec3d, 3U>;
+
+geometry::EditableMesh position_projection_fixture(const PositionTriangle& positions, bool uv) {
+    geometry::EditableMesh mesh;
+    okay(mesh.insert_bulk(
+        {{{1}, positions[0]}, {{2}, positions[1]}, {{3}, positions[2]}},
+        {{{1}, {{1}, {2}, {3}}}}));
+    if (uv) {
+        attributes::AttributeSet payload({{attributes::AttributeDomain::corner, 3U}});
+        okay(payload.add_layer({{"uv.export", attributes::AttributeDomain::corner,
+            attributes::AttributeType::vec2},
+            {core::Vec2d{0, 0}, core::Vec2d{1, 0}, core::Vec2d{0, 1}}}));
+        attributes::UvSetTable sets;
+        okay(sets.add({7U, "Render UV", "uv.export", true, true, false, 1U}));
+        okay(mesh.set_attribute_payload(std::move(payload), std::move(sets)));
+    }
+    return mesh;
+}
+
+void gltf_float32_position_projection_preserves_fidelity(const std::filesystem::path& root) {
+    const PositionTriangle unit_triangle{{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}}};
+    const auto baseline_root = root / "baseline";
+    std::filesystem::create_directory(baseline_root);
+    const auto baseline = make_scene(position_projection_fixture(unit_triangle, true), baseline_root);
+    static_cast<void>(exported(baseline, baseline_root, "preserved"));
+    const auto good_gltf = baseline_root / "preserved.gltf";
+    const auto good_glb = baseline_root / "preserved.glb";
+    const auto gltf_before = read(good_gltf), glb_before = read(good_glb);
+
+    // Distinct vertices and nonzero area survive float32 narrowing, but the
+    // geometric normal changes sign. Test all three planes so the gate cannot
+    // accidentally depend on a selected 2D projection or a normal attribute.
+    const double unit = std::ldexp(1.0, -23);
+    const PositionTriangle reversed_xy{{{0, 0, 0},
+        {1 + 0.6 * unit, 1 + 0.4 * unit, 0},
+        {2 + 0.98 * unit, 2 - 0.98 * unit, 0}}};
+    for (unsigned plane = 0U; plane < 3U; ++plane) {
+        auto coordinates = reversed_xy;
+        for (auto& value : coordinates) {
+            if (plane == 1U) value = {value.z, value.x, value.y};
+            if (plane == 2U) value = {value.y, value.z, value.x};
+        }
+        for (const bool uv : {false, true}) {
+            for (const bool mirrored : {false, true}) {
+                const auto case_root = root / ("reversed-" + std::to_string(plane) +
+                    (uv ? "-uv" : "-plain") + (mirrored ? "-mirrored" : "-positive"));
+                std::filesystem::create_directory(case_root);
+                const auto scene = make_scene(position_projection_fixture(coordinates, uv), case_root, mirrored);
+                const auto before_source = scene.doc.serialize();
+                const auto gltf = io::export_gltf(scene.doc, good_gltf);
+                const auto glb = io::export_glb(scene.doc, good_glb);
+                check(!gltf && !glb &&
+                      gltf.error().message.find("float32 narrowing reverses or loses a triangle orientation") != std::string::npos &&
+                      glb.error().message.find("float32 narrowing reverses or loses a triangle orientation") != std::string::npos,
+                    "both formats refuse rounding-induced winding reversal independently of UVs and object scale sign");
+                check(read(good_gltf) == gltf_before && read(good_glb) == glb_before &&
+                      scene.doc.serialize() == before_source,
+                    "refused position projection preserves prior artifacts and authoritative source");
+                const auto reopened = take(project::ProjectDocument::deserialize(before_source));
+                const auto new_gltf = case_root / "refused.gltf", new_glb = case_root / "refused.glb";
+                check(!io::export_gltf(reopened, new_gltf) && !std::filesystem::exists(new_gltf) &&
+                      !io::export_glb(reopened, new_glb) && !std::filesystem::exists(new_glb) &&
+                      reopened.serialize() == before_source,
+                    "reopened source retains winding refusal without publishing a partial artifact");
+            }
+        }
+    }
+
+    struct Case { std::string name; PositionTriangle coordinates; };
+    const std::vector<Case> accepted{
+        {"counterclockwise", unit_triangle},
+        {"clockwise", {{{0, 0, 0}, {0, 1, 0}, {1, 0, 0}}}},
+        {"tilted", {{{0, 0, 0}, {1, 0, 1}, {0, 1, 1}}}},
+        {"area-square-overflow", {{{0, 0, 0}, {1e10, 0, 0}, {0, 1e10, 0}}}},
+        {"cross-product-overflow", {{{0, 0, 0}, {1e30, 0, 0}, {0, 1e30, 0}}}},
+    };
+    for (const auto& item : accepted) {
+        for (const bool uv : {false, true}) {
+            for (const bool mirrored : {false, true}) {
+                const auto case_root = root / (item.name + (uv ? "-uv" : "-plain") +
+                    (mirrored ? "-mirrored" : "-positive"));
+                std::filesystem::create_directory(case_root);
+                const auto scene = make_scene(position_projection_fixture(item.coordinates, uv), case_root, mirrored);
+                const auto payload = exported(scene, case_root, "preserved", mirrored ? -2.0 : 2.0);
+                const auto positions = payload.attribute("POSITION"), indices = payload.indices();
+                check(positions.size() == 9U && indices.size() == 3U,
+                    "accepted projection preserves a complete nondegenerate triangle");
+                for (std::size_t corner = 0U; corner < 3U; ++corner) {
+                    const auto index = static_cast<std::size_t>(indices[corner]) * 3U;
+                    const auto expected = item.coordinates[corner];
+                    check(positions[index] == static_cast<float>(expected.x) &&
+                          positions[index + 1U] == static_cast<float>(expected.y) &&
+                          positions[index + 2U] == static_cast<float>(expected.z),
+                        "accepted position accessor retains the exact float32 payload in source winding order");
+                }
+                const auto source = scene.doc.serialize();
+                const Scene reopened{take(project::ProjectDocument::deserialize(source)), scene.mesh};
+                const auto repeated = exported(reopened, case_root, "reopened", mirrored ? -2.0 : 2.0);
+                check(repeated.bytes == payload.bytes && repeated.json == payload.json,
+                    "source reopen produces deterministic glTF and GLB geometry");
+            }
+        }
+    }
+    static_cast<void>(take(io::export_gltf(baseline.doc, good_gltf)));
+    static_cast<void>(take(io::export_glb(baseline.doc, good_glb)));
+    check(read(good_gltf) == gltf_before && read(good_glb) == glb_before,
+        "valid geometry still exports after a rejected position projection");
+}
+
 } // namespace
 int main(int argc, char** argv) {
     try {
@@ -611,6 +720,9 @@ int main(int argc, char** argv) {
         const auto uv_projection_root = root / "uv-float32-projection";
         std::filesystem::create_directory(uv_projection_root);
         gltf_float32_uv_projection_preserves_fidelity(uv_projection_root);
+        const auto position_projection_root = root / "position-float32-projection";
+        std::filesystem::create_directory(position_projection_root);
+        gltf_float32_position_projection_preserves_fidelity(position_projection_root);
         vanta_metadata_export(root);
         const auto scalar_root = root / "constant-material";
         std::filesystem::create_directory(scalar_root);
