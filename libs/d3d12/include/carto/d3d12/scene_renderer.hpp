@@ -19,6 +19,7 @@
 
 namespace carto::d3d12 {
 
+// V35 compares PCF taps on the receiver plane and decodes LDR environment blue.
 // V34 transports direct anisotropy axes to bounded UV0 normal-map normals.
 // V33 adds UV0-tangent-bound direct anisotropy with explicit unsupported inputs.
 // V32 binds scene-only direct-light sheen to request and uploaded-mesh identity.
@@ -34,7 +35,7 @@ namespace carto::d3d12 {
 // environment integration, per-texture affine transforms, bounded UV streams,
 // primary-stream normal-map tangents, both conventions, and material samplers.
 inline constexpr std::string_view kSceneRenderAlgorithm =
-    "carto.d3d12.scene-direct-capture.v34";
+    "carto.d3d12.scene-direct-capture.v35";
 inline constexpr std::uint32_t kSceneRenderEnvironmentPrefilterSampleCount = 32U;
 inline constexpr double kSceneRenderLocalLightDistanceFloorMeters = 0.01;
 inline constexpr double kSceneRenderMaximumLocalLightIntensity = 1.0e20;

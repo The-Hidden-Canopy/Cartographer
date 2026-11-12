@@ -30,7 +30,7 @@ saved-project scene preparation, opacity, neutral physical outputs, sheen and
 anisotropy CPU cases. It then fails at the separate fixture assertion
 `fixture binds a saved perspective camera to its scene object`.
 This is not a full-suite pass or independent verification of main's 228/228 claim.
-No main, shared staging, Opus checkout or denied session was changed.
+The candidate was prepared in isolation; main was not changed.
 
 ## Integration
 

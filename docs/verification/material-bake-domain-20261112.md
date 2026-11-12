@@ -18,4 +18,4 @@ The domain changes neither resolution admission nor the one-evaluation-per-texel
 
 Regression source covers default-overload parity, explicit subregion roughness against direct surface evaluation, constant-material tiles outside the unit square, domain metadata, source immutability and invalid/collapsed-coordinate cases. The previous full six-map two-pass oracle remains in the same test target.
 
-`git diff --check` passed; source reviewed. No compile, CMake, test binary, GPU, image acceptance or benchmark was run under the build hold. No shared checkout or Opus integration was changed.
+`git diff --check` passed; source reviewed. No compile, CMake, test binary, GPU, image acceptance or benchmark was run under the build hold.

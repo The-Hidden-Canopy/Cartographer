@@ -5194,6 +5194,7 @@ int main(int argc, char** argv) {
             project::AuthoredCamera camera;
             camera.object = camera_object;
             camera.identity = "fixture-render-camera";
+            camera.bookmark_identity = "fixture-render-bookmark";
             camera.vertical_fov_radians = 0.9;
             camera.near_plane = 0.02;
             camera.far_plane = 500.0;
@@ -5207,6 +5208,7 @@ int main(int argc, char** argv) {
             project::AuthoredCamera orthographic_camera;
             orthographic_camera.object = orthographic_object;
             orthographic_camera.identity = "fixture-orthographic-render-camera";
+            orthographic_camera.bookmark_identity = "fixture-orthographic-render-bookmark";
             orthographic_camera.projection = project::CameraProjection::orthographic;
             orthographic_camera.orthographic_height = 3.5;
             orthographic_camera.near_plane = 0.02;

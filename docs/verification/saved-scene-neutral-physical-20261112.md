@@ -1,6 +1,6 @@
 # Saved-scene exact-neutral physical output compatibility
 
-Date: 2026-11-12. Isolated material candidate based on `470cf52`; not integrated into main or Opus's checkout.
+Date: 2026-11-12. Isolated material candidate based on `470cf52`; not integrated into main.
 
 ## Change
 
@@ -17,6 +17,6 @@ This is a graph compatibility improvement, **not** transmission, subsurface, or 
 
 ## Verification and handoff
 
-`git diff --check` passed. Source and test wiring reviewed. No compiler, CMake build, CPU suite, shader compilation, GPU run, native window, screenshot, or visual acceptance was performed because the parent build hold remains active. No held or denied session was accessed.
+`git diff --check` passed. Source and test wiring reviewed. No compiler, CMake build, CPU suite, shader compilation, GPU run, native window, screenshot, or visual acceptance was performed because the parent build hold remains active.
 
 Next: integrate the isolated material sequence after ownership review, then run the existing D3D12 scene renderer preparation tests and GPU suite serially. Verify shader/capture parity for the preceding sheen and anisotropy commits before treating this sequence as accepted. The UV agent owns separate geometry/tangent patches; this change touches no UV, exporter, or bake files.

@@ -29,7 +29,7 @@ foreach(frame first repeat)
         message(FATAL_ERROR "Capture receipt must contain one render_graph_passes field")
     endif()
     string(JSON algorithm GET "${receipt}" algorithm)
-    if(NOT algorithm STREQUAL "carto.d3d12.scene-direct-capture.v31")
+    if(NOT algorithm STREQUAL "carto.d3d12.scene-direct-capture.v35")
         message(FATAL_ERROR "Capture must identify the current renderer algorithm")
     endif()
     string(JSON camera_source_kind GET "${receipt}" camera_source kind)
@@ -70,8 +70,8 @@ foreach(frame first repeat)
        NOT draw_count EQUAL 14 OR NOT shader_count EQUAL 7 OR NOT graph_pass_count EQUAL 4 OR
        NOT graph_pbr STREQUAL "scene.shadow" OR NOT graph_tonemap STREQUAL "scene.tonemap" OR
        NOT camera_up_x STREQUAL "0" OR NOT camera_up_y STREQUAL "0" OR
-       NOT camera_up_z STREQUAL "1" OR NOT vertical_fov STREQUAL "0.9" OR
-       NOT clip_near STREQUAL "0.02" OR NOT clip_far STREQUAL "500" OR
+       NOT camera_up_z STREQUAL "1" OR NOT vertical_fov EQUAL 0.9 OR
+       NOT clip_near EQUAL 0.02 OR NOT clip_far STREQUAL "500" OR
        limitation_count LESS 3 OR gpu_timing_requested OR
        NOT local_light_count EQUAL 0 OR
        NOT local_lighting_model_type STREQUAL "NULL" OR
@@ -106,7 +106,7 @@ string(JSON explicit_orthographic_projection GET
 string(JSON explicit_orthographic_height GET
     "${explicit_orthographic_receipt}" orthographic_height)
 if(NOT explicit_orthographic_projection STREQUAL "orthographic" OR
-   NOT explicit_orthographic_height STREQUAL "2.5")
+   NOT explicit_orthographic_height EQUAL 2.5)
     message(FATAL_ERROR "Explicit orthographic receipt lost its projection settings")
 endif()
 execute_process(COMMAND "${RENDER}" "${root}/room.carto"
@@ -202,19 +202,19 @@ string(JSON effective_radiance_g GET "${local_light_receipt}" light_radiance 1)
 string(JSON effective_radiance_b GET "${local_light_receipt}" light_radiance 2)
 if(NOT local_light_count EQUAL 2 OR NOT local_light_kind STREQUAL "point" OR
    NOT local_light_source_id STREQUAL local_light_id OR
-   NOT local_light_position_x STREQUAL "1.25" OR
-   NOT local_light_radiance_r STREQUAL "1.5" OR
-   NOT local_light_radiance_g STREQUAL "0.75" OR
+   NOT local_light_position_x EQUAL 1.25 OR
+   NOT local_light_radiance_r EQUAL 1.5 OR
+   NOT local_light_radiance_g EQUAL 0.75 OR
    NOT local_light_radiance_b STREQUAL "3" OR
    NOT local_light_range STREQUAL "6" OR local_light_shadowed OR
    NOT local_spot_kind STREQUAL "spot" OR
    NOT local_spot_source_id STREQUAL local_spot_id OR
    NOT local_spot_direction_z STREQUAL "-1" OR
-   NOT local_spot_inner_cone STREQUAL "0.25" OR
-   NOT local_spot_outer_cone STREQUAL "0.5" OR NOT local_spot_shadowed OR
+   NOT local_spot_inner_cone EQUAL 0.25 OR
+   NOT local_spot_outer_cone EQUAL 0.5 OR NOT local_spot_shadowed OR
    NOT local_light_model_radiance STREQUAL "linear_lookdev_scale_not_calibrated_lumens" OR
    NOT local_light_model_attenuation STREQUAL "inverse_square" OR
-   NOT local_light_model_floor STREQUAL "0.01" OR
+   NOT local_light_model_floor EQUAL 0.01 OR
    NOT local_light_model_range_fade STREQUAL "quartic_smooth" OR
    NOT local_light_model_shadowing STREQUAL "at_most_one_spotlight" OR
    NOT effective_light_x STREQUAL "0" OR NOT effective_light_z STREQUAL "1" OR
@@ -240,8 +240,8 @@ string(JSON changed_camera_clip_near GET "${changed_camera_receipt}" clip_range 
 string(JSON changed_camera_clip_far GET "${changed_camera_receipt}" clip_range 1)
 if(changed_camera_request STREQUAL first_request OR
    NOT changed_camera_up_y STREQUAL "1" OR
-   NOT changed_camera_fov STREQUAL "0.75" OR
-   NOT changed_camera_clip_near STREQUAL "0.1" OR
+   NOT changed_camera_fov EQUAL 0.75 OR
+   NOT changed_camera_clip_near EQUAL 0.1 OR
    NOT changed_camera_clip_far STREQUAL "250")
     message(FATAL_ERROR "Camera settings did not alter request identity and receipt provenance")
 endif()
@@ -302,7 +302,7 @@ string(JSON orthographic_camera_receipt_id GET
     "${orthographic_camera_receipt}" camera_source object_id)
 if(NOT orthographic_camera_kind STREQUAL "authored_project" OR
    NOT orthographic_camera_projection STREQUAL "orthographic" OR
-   NOT orthographic_camera_height STREQUAL "3.5" OR
+   NOT orthographic_camera_height EQUAL 3.5 OR
    NOT orthographic_camera_receipt_id STREQUAL orthographic_camera_id)
     message(FATAL_ERROR "Orthographic camera receipt lost its source or projection extent")
 endif()

@@ -77,7 +77,7 @@ Changed source:
 - `d3d12_scene_renderer_tests.cpp`: source, numerical and native regressions.
 
 Capability matrix, roadmap and the original anisotropy handoff link this
-continuation. Opus retains integration ownership. Reconcile algorithm/cache
+continuation. Integration ownership stays with main. Reconcile algorithm/cache
 versions with the final integration branch; do not overwrite newer IDs.
 
 ## Authored verification and remaining acceptance
