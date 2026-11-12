@@ -752,7 +752,7 @@ core::Result<SceneRenderEnvironment> load_scene_render_environment_equirectangul
             const core::Vec3d radiance{
                 linear_channels[pixels[pixel_offset]],
                 linear_channels[pixels[pixel_offset + 1U]],
-                linear_channels[pixel_offset + 2U]};
+                linear_channels[pixels[pixel_offset + 2U]]};
             if (specular_eligible) {
                 specular_base[static_cast<std::size_t>(y) * width + x] = {
                     static_cast<float>(radiance.x), static_cast<float>(radiance.y),

@@ -2322,6 +2322,9 @@ void equirectangular_environment_derives_digest_bound_sh() {
         std::abs(linear.diffuse_irradiance_over_pi_sh[0U].x -
             linear_red * kY00Integral) < 1.0e-6,
         "uniform linear panorama derives source-bound diffuse and specular inputs");
+    require(std::abs(linear.diffuse_irradiance_over_pi_sh[0U].z -
+            3.0 * linear.diffuse_irradiance_over_pi_sh[0U].x) < 1.0e-12,
+        "blue environment radiance uses the decoded byte, not its pixel offset");
     for (const auto& level : linear.specular_environment_mips->levels) {
         for (const auto& pixel : level.linear_rgb) {
             require(std::abs(pixel[0U] - 64.0F / 255.0F) < 1.0e-5F &&
@@ -5254,6 +5257,12 @@ int main(int argc, char** argv) {
             scene_anisotropy_frame_transport_preserves_orientation();
             project_graph_anisotropic_normal_maps_preserve_source_boundaries();
             std::cout << "PASS graph anisotropy reference and tangent boundaries (no GPU)\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--environment-only") {
+            equirectangular_environment_derives_digest_bound_sh();
+            radiance_hdr_environment_preserves_linear_specular_mips();
+            std::cout << "PASS LDR/HDR environment source admission and prefiltering\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--material-gpu-only") {
