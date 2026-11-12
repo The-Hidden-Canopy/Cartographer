@@ -4,6 +4,11 @@ Date: 2026-11-12. Isolated base: `14ef6ba`. This is source-only work awaiting
 integration-owner review and validation. No shared integration checkout,
 graph-bake exporter, project schema, or shader was changed.
 
+This note describes the opacity commit. The subsequent
+[direct sheen candidate](saved-scene-sheen-20261112.md) separately expands the
+saved-scene shader; its narrower material limitations and pending gates are
+recorded there.
+
 ## Capability and invariant
 
 `prepare_project_scene_render` can lower an optional scalar graph opacity

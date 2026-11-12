@@ -14,6 +14,13 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 
 - [ ] validate mirrored-UV generated tangent-domain preservation: source and regression cases are implemented, but build, CTest, and normal-map visual acceptance remain pending ([scope and evidence](verification/mirrored-uv-tangent-domains.md))
 
+- [ ] Accept the source-only saved-scene direct sheen continuation: existing
+  graph scalar, bounded Charlie/Neubelt base-layer mixture, exact request/cache
+  binding, direct-light reference/pixel and persistence coverage. No sheen IBL,
+  independent sheen roughness/color texture, measured cloth or energy acceptance;
+  build and execution remain pending. See
+  [the handoff](verification/saved-scene-sheen-20261112.md).
+
 - [ ] Accept the source-only saved-scene graph opacity continuation: independent
   alpha/opacity bounds, multiplicative coverage, unchanged authored alpha mode
   and cutoff, saved-project replay and native masked/blended parity. Build,

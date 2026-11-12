@@ -92,14 +92,15 @@ core::Result<void> collect_material_sampler(
 core::Result<void> apply_evaluated_material_graph(
     const project::MaterialGraph& graph,
     const project::MaterialGraphEvaluation& evaluation,
-    render::StandardMaterial& material) {
+    render::StandardMaterial& material,
+    double& sheen_weight) {
     const auto& outputs = graph.outputs;
     if (outputs.normal != 0U || outputs.transmission != 0U ||
-        outputs.subsurface != 0U || outputs.sheen != 0U ||
+        outputs.subsurface != 0U ||
         outputs.anisotropy != 0U || outputs.displacement != 0U) {
         return core::Result<void>::failure({core::ErrorCode::unsupported,
             "native scene rendering cannot lower normal, transmission, subsurface, "
-            "sheen, anisotropy, or displacement material graph outputs"});
+            "anisotropy, or displacement material graph outputs"});
     }
 
     const auto& base_color = evaluation.node_values.at(outputs.base_color);
@@ -117,6 +118,12 @@ core::Result<void> apply_evaluated_material_graph(
     if (!coverage_in_range(alpha.components[0U]) || !coverage_in_range(opacity)) {
         return core::Result<void>::failure({core::ErrorCode::validation_failed,
             "native scene material graph alpha and opacity must each be in [0, 1]"});
+    }
+    sheen_weight = outputs.sheen == 0U ? 0.0 :
+        evaluation.node_values.at(outputs.sheen).components[0U];
+    if (!coverage_in_range(sheen_weight)) {
+        return core::Result<void>::failure({core::ErrorCode::validation_failed,
+            "native scene material graph sheen must be in [0, 1]"});
     }
     material.base_color_factor = {base_color.components[0U], base_color.components[1U],
         base_color.components[2U], alpha.components[0U] * opacity};
@@ -396,6 +403,7 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
     struct GraphMaterialFactors {
         render::StandardMaterial definition;
         assets::Sha256Digest digest;
+        double sheen_weight = 0.0;
     };
     std::size_t project_graph_evaluation_nodes = 0U;
     std::map<render::MaterialId, GraphMaterialFactors> graph_material_factors;
@@ -456,6 +464,7 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
             if (!resolved) return Output::failure(resolved.error());
             auto material = catalog.materials().at(authored.material);
             material.definition = resolved.value();
+            double sheen_weight = 0.0;
             std::string identity = "project/" + std::string(project_identity) + "/material/" + std::to_string(material.id);
             if (authored.variant.has_value()) identity += "/variant/" + std::to_string(*authored.variant);
 
@@ -514,7 +523,8 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
                         used_graph_inputs.insert(graph->first);
                     }
                     if (auto applied = apply_evaluated_material_graph(
-                            graph->second, evaluation.value(), material.definition); !applied) {
+                            graph->second, evaluation.value(), material.definition,
+                            sheen_weight); !applied) {
                         return Output::failure(applied.error());
                     }
                     const std::string graph_context =
@@ -525,9 +535,11 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
                         reinterpret_cast<const std::uint8_t*>(graph_context.data()),
                         graph_context.size()});
                     factors = graph_material_factors.emplace(authored.material,
-                        GraphMaterialFactors{material.definition, evaluated_graph_digest}).first;
+                        GraphMaterialFactors{material.definition, evaluated_graph_digest,
+                            sheen_weight}).first;
                 } else {
                     material.definition = factors->second.definition;
+                    sheen_weight = factors->second.sheen_weight;
                 }
                 identity += "/graph/" + factors->second.digest.hex();
             }
@@ -548,7 +560,8 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
             }
             const auto artifact = compile_scene_render_material_artifact(identity, material);
             if (!artifact) return Output::failure(artifact.error());
-            rendered.materials.push_back({submesh.material_slot, identity, material, artifact.value()});
+            rendered.materials.push_back({submesh.material_slot, identity, material,
+                artifact.value(), sheen_weight});
             bindings.push_back({submesh.material_slot, artifact.value()});
         }
         std::set<render::UvSetId> requested_uv_sets;

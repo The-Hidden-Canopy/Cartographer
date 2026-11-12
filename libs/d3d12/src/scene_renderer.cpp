@@ -169,6 +169,7 @@ struct SceneMaterialUvState {
     std::array<render::SamplerId, 5U> samplers{};
     std::array<render::UvSetId, 5U> uv_sets{};
     std::array<std::array<float, 4U>, 5U> channel_mappings{};
+    float sheen_weight = 0.0F;
 };
 
 Result<UvAffine> texture_uv_affine(const render::TextureTransform& transform) {
@@ -636,6 +637,7 @@ assets::Sha256Digest request_digest(const SceneRenderRequest& request) {
         for (const auto& binding : object.materials) {
             append_u64(data, binding.material_slot.has_value()
                 ? static_cast<std::uint64_t>(*binding.material_slot) + 1U : 0U);
+            append_double(data, binding.sheen_weight);
             for (const auto sampler : material_draw_samplers(
                      binding.current_material.definition))
                 append_u64(data, sampler);
@@ -701,7 +703,7 @@ assets::Sha256Digest request_digest(const SceneRenderRequest& request) {
 }
 
 assets::Sha256Digest mesh_cache_identity(const SceneRenderRequest& request) {
-    constexpr std::string_view domain = "carto.d3d12.scene-mesh-cache.v7";
+    constexpr std::string_view domain = "carto.d3d12.scene-mesh-cache.v8";
     std::vector<std::uint8_t> data(domain.begin(), domain.end());
     append_u64(data, request.source_revision.value());
     append_digest(data, request.source_digest);
@@ -730,6 +732,9 @@ assets::Sha256Digest mesh_cache_identity(const SceneRenderRequest& request) {
         for (const auto uv_set : object.mesh.additional_uv_set_ids)
             append_u64(data, uv_set);
         for (const auto& binding : object.materials) {
+            append_u64(data, binding.material_slot.has_value()
+                ? static_cast<std::uint64_t>(*binding.material_slot) + 1U : 0U);
+            append_double(data, binding.sheen_weight);
             for (const auto& mapping : material_draw_channel_mappings(
                      binding.current_material.definition)) {
                 for (const float selector : mapping)
@@ -1640,6 +1645,16 @@ Result<void> SceneRenderRequest::validate() const {
         }
         std::vector<production::LookdevMaterialBinding> bindings;
         for (const auto& binding : object.materials) {
+            if (!std::isfinite(binding.sheen_weight) || binding.sheen_weight < 0.0 ||
+                binding.sheen_weight > 1.0) {
+                return Result<void>::failure(invalid(
+                    "scene sheen weight must be finite and in [0, 1]"));
+            }
+            if (binding.sheen_weight > 0.0 && environment.has_value()) {
+                return Result<void>::failure({core::ErrorCode::unsupported,
+                    "scene sheen currently supports analytic direct lights only; "
+                    "environment sheen integration is unsupported"});
+            }
             if (auto valid = validate_scene_render_material_artifact_source(
                     binding.material, binding.source_identity,
                     binding.current_material); !valid) return valid;
@@ -1811,7 +1826,8 @@ Result<SceneRenderImage> render_scene_impl(
                         material_draw_samplers(binding.current_material.definition),
                         material_draw_uv_sets(binding.current_material.definition),
                         material_draw_channel_mappings(
-                            binding.current_material.definition)}).second) {
+                            binding.current_material.definition),
+                        static_cast<float>(binding.sheen_weight)}).second) {
                 return Result<SceneRenderImage>::failure(invalid(
                     "scene material UV transforms contain a duplicate slot"));
             }
@@ -2003,6 +2019,19 @@ Result<SceneRenderImage> render_scene_impl(
         result.limitations.push_back(has_spot_shadow
             ? "One authored spotlight uses the scene shadow map; other local lights remain unshadowed; inverse-square intensity uses a 1 cm floor, quartic range fade, and uncalibrated linear units"
             : "Point/spot lights are unshadowed; inverse-square intensity uses a 1 cm floor, quartic range fade, and uncalibrated linear units");
+    }
+    const bool uses_sheen = std::any_of(request.objects.begin(), request.objects.end(),
+        [](const SceneRenderObject& object) {
+            return std::any_of(object.materials.begin(), object.materials.end(),
+                [](const SceneRenderMaterialBinding& binding) {
+                    return binding.sheen_weight > 0.0;
+                });
+        });
+    if (uses_sheen) {
+        result.limitations.push_back(
+            "Scalar base-tinted Charlie/Neubelt sheen uses a metallic-suppressed base mixture "
+            "for analytic direct lights only; shared surface roughness, no sheen IBL, "
+            "independent sheen texture/color, or measured cloth/energy acceptance");
     }
     const std::array<std::string, 7U> shader_names{
         "cartographer_scene_pbr.hlsl", "cartographer_scene_pbr.hlsl",
@@ -2447,7 +2476,7 @@ Result<SceneRenderImage> render_scene_impl(
                     channel_mappings[3U][0U], channel_mappings[4U][0U]};
                 const std::array<float, 4U> channel_mapping_c{
                     channel_mappings[4U][1U], channel_mappings[4U][2U],
-                    0.0F, 0.0F};
+                    transforms.value().sheen_weight, 0.0F};
                 if (draw.first_index > mesh.value().indices.size() ||
                     draw.index_count > mesh.value().indices.size() - draw.first_index) {
                     return Result<SceneRenderImage>::failure({core::ErrorCode::stale_data,

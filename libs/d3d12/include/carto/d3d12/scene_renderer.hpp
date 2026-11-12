@@ -19,6 +19,7 @@
 
 namespace carto::d3d12 {
 
+// V32 binds scene-only direct-light sheen to request and uploaded-mesh identity.
 // V31 adds one explicitly selected authored spotlight to the bounded shadow pass.
 // V30 applies bounded inverse-square falloff to authored point/spot lights.
 // V29 binds bounded output-pixel projection jitter for temporal accumulation.
@@ -31,7 +32,7 @@ namespace carto::d3d12 {
 // environment integration, per-texture affine transforms, bounded UV streams,
 // primary-stream normal-map tangents, both conventions, and material samplers.
 inline constexpr std::string_view kSceneRenderAlgorithm =
-    "carto.d3d12.scene-direct-capture.v31";
+    "carto.d3d12.scene-direct-capture.v32";
 inline constexpr std::uint32_t kSceneRenderEnvironmentPrefilterSampleCount = 32U;
 inline constexpr double kSceneRenderLocalLightDistanceFloorMeters = 0.01;
 inline constexpr double kSceneRenderMaximumLocalLightIntensity = 1.0e20;
@@ -90,6 +91,11 @@ struct SceneRenderMaterialBinding {
     std::string source_identity;
     render::MaterialAsset current_material;
     production::CompiledMaterialArtifact material;
+    // Scene-only derived graph factor. Direct-light Charlie/Neubelt sheen uses
+    // base-color tint and surface roughness; a metallic-suppressed mixture with
+    // the base sits beneath clearcoat. Not part of the generic material schema.
+    // Must be finite in [0, 1]; nonzero values with environment IBL are refused.
+    double sheen_weight = 0.0;
 };
 
 // D3D12 scene-only material compilation keeps the exact authored source digest
@@ -406,7 +412,9 @@ struct SceneRenderReceipt {
 // outputs are lowered into material factors. Optional graph opacity multiplies
 // graph alpha as coverage; both must be in [0, 1]. The authored alpha mode and
 // cutoff are preserved (opaque mode still ignores coverage). This is not
-// refraction or transmission. Durable graph inputs are used by
+// refraction or transmission. Scalar sheen lowers into the scene-only direct
+// lobe described by SceneRenderMaterialBinding; sheen IBL is not supported.
+// Durable graph inputs are used by
 // default; an optional transient input map is revision/digest-bound to the exact
 // source and overrides them for that request only. Missing inputs, texture
 // sampling, variants on graph-bound materials, unsupported texture controls,

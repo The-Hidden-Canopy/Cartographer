@@ -1,6 +1,7 @@
 #include "project_document_access.hpp"
 
 #include <carto/d3d12/scene_renderer.hpp>
+#include <carto/d3d12/scene_sheen.hpp>
 #include <carto/d3d12/scene_camera_navigation.hpp>
 #include <carto/d3d12/temporal_sampling.hpp>
 #include <carto/d3d12/viewport_input.hpp>
@@ -358,7 +359,7 @@ void project_graph_opacity_preserves_coverage_policy_and_source() {
 
     using OutputMember = std::uint64_t project::MaterialGraphOutputs::*;
     for (const OutputMember output : {&project::MaterialGraphOutputs::transmission,
-            &project::MaterialGraphOutputs::subsurface, &project::MaterialGraphOutputs::sheen,
+            &project::MaterialGraphOutputs::subsurface,
             &project::MaterialGraphOutputs::anisotropy, &project::MaterialGraphOutputs::displacement}) {
         auto document = opacity_graph_project(1.0, 0.5, render::AlphaMode::blended);
         auto unsupported_catalog = document.material_catalog();
@@ -372,6 +373,126 @@ void project_graph_opacity_preserves_coverage_policy_and_source() {
         require(!refused && refused.error().code == core::ErrorCode::unsupported,
             "opacity never silently substitutes for unsupported physical material outputs");
     }
+}
+
+project::ProjectDocument sheen_graph_project(double weight) {
+    auto document = opacity_graph_project(1.0, std::nullopt, render::AlphaMode::opaque);
+    auto catalog = document.material_catalog();
+    auto graph = catalog.material_graphs().at("fixture/opacity");
+    graph.revision = graph.revision.next();
+    project::MaterialGraphNode sheen;
+    sheen.id = 5U;
+    sheen.constants[0U] = weight;
+    graph.nodes.push_back(sheen);
+    graph.outputs.sheen = sheen.id;
+    take(catalog.replace_material_graph(graph));
+    take(catalog.bind_material_graph(1U, graph.identity));
+    take(document.set_material_catalog(std::move(catalog)));
+    return document;
+}
+
+void scene_sheen_reference_is_bounded_and_reciprocal() {
+    const auto exact = take(d3d12::evaluate_scene_sheen_reference(
+        0.5, 1.0, 0.0, 0.5, 0.5, 0.5));
+    require(exact.base_layer_weight == 0.5 && std::abs(exact.sheen_brdf -
+            std::sqrt(0.75) / (4.0 * std::acos(-1.0))) < 1.0e-12,
+        "Charlie and Neubelt factors match the analytical roughness-one reference");
+    for (const double roughness : {0.0, 0.5, 1.0}) {
+        for (const double n_dot_l : {0.0, 1.0e-8, 0.5, 1.0}) {
+            for (const double n_dot_v : {0.0, 1.0e-8, 0.5, 1.0}) {
+                const auto value = take(d3d12::evaluate_scene_sheen_reference(
+                    1.0, roughness, 0.0, n_dot_l, n_dot_v, 0.5));
+                const auto reversed = take(d3d12::evaluate_scene_sheen_reference(
+                    1.0, roughness, 0.0, n_dot_v, n_dot_l, 0.5));
+                require(std::isfinite(value.sheen_brdf) && value.sheen_brdf >= 0.0 &&
+                        value.sheen_brdf == reversed.sheen_brdf,
+                    "sheen remains finite and reciprocal at grazing angles and zero roughness");
+                if (n_dot_l == 0.0 || n_dot_v == 0.0)
+                    require(value.sheen_brdf == 0.0, "sheen does not leak across a closed hemisphere");
+            }
+        }
+    }
+    const auto metal = take(d3d12::evaluate_scene_sheen_reference(
+        1.0, 0.5, 1.0, 0.5, 0.5, 0.5));
+    const auto absent = take(d3d12::evaluate_scene_sheen_reference(
+        0.0, 0.5, 0.0, 0.5, 0.5, 0.5));
+    require(metal.base_layer_weight == 1.0 && metal.sheen_brdf == 0.0 &&
+            absent.base_layer_weight == 1.0 && absent.sheen_brdf == 0.0,
+        "metals and zero sheen retain the complete existing base lobe");
+    for (std::size_t index = 0U; index < 6U; ++index) {
+        for (const double bad : {-0.01, 1.01, std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::quiet_NaN()}) {
+            std::array<double, 6U> inputs{0.5, 0.5, 0.0, 0.5, 0.5, 0.5};
+            inputs[index] = bad;
+            require(!d3d12::evaluate_scene_sheen_reference(inputs[0U], inputs[1U],
+                    inputs[2U], inputs[3U], inputs[4U], inputs[5U]),
+                "each sheen factor and cosine rejects invalid data independently");
+        }
+    }
+}
+
+void project_graph_sheen_binds_source_and_refuses_missing_ibl() {
+    const auto prepare = [](const project::ProjectDocument& document) {
+        return d3d12::prepare_project_scene_render(
+            "graph-sheen", document, {}, 96U, 96U);
+    };
+    for (const double weight : {0.0, 0.5, 1.0}) {
+        const auto document = sheen_graph_project(weight);
+        const auto before = document.serialize();
+        const auto prepared = take(prepare(document));
+        std::size_t affected = 0U;
+        for (const auto& object : prepared.objects) {
+            for (const auto& binding : object.materials) {
+                if (binding.current_material.id == 1U) {
+                    ++affected;
+                    require(binding.sheen_weight == weight,
+                        "shared graph sheen reaches each matching draw binding");
+                } else {
+                    require(binding.sheen_weight == 0.0,
+                        "sheen cannot leak onto an unrelated material");
+                }
+            }
+        }
+        require(affected == 3U && document.serialize() == before,
+            "sheen preparation leaves the exact saved source unchanged");
+        const auto reopened = take(project::ProjectDocument::deserialize(before));
+        require(take(take(prepare(reopened)).digest()) == take(prepared.digest()),
+            "saved sheen graph reproduces exact prepared request identity");
+        auto environment_request = prepared;
+        d3d12::SceneRenderEnvironment environment;
+        environment.source_digest = hash("sheen-environment-refusal-fixture");
+        environment_request.environment = environment;
+        const auto admitted = environment_request.validate();
+        require(weight == 0.0 ? static_cast<bool>(admitted) :
+                (!admitted && admitted.error().code == core::ErrorCode::unsupported),
+            "only nonzero sheen refuses the unavailable environment integration");
+    }
+    for (const double invalid_weight : {-0.5, 1.5}) {
+        const auto result = prepare(sheen_graph_project(invalid_weight));
+        require(!result && result.error().code == core::ErrorCode::validation_failed,
+            "evaluated sheen must be within the shader's declared weight bounds");
+    }
+    auto prepared = take(prepare(sheen_graph_project(0.5)));
+    const auto original_digest = take(prepared.digest());
+    prepared.objects.front().materials.front().sheen_weight = 0.75;
+    require(take(prepared.digest()) != original_digest,
+        "scene-only sheen participates in request identity independently of generic material artifacts");
+    for (const double invalid_weight : {-0.5, 1.5, std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::quiet_NaN()}) {
+        prepared.objects.front().materials.front().sheen_weight = invalid_weight;
+        require(!prepared.validate() && !prepared.digest(),
+            "direct scene callers cannot bypass finite range admission for sheen");
+    }
+    auto stale_document = sheen_graph_project(0.5);
+    auto catalog = stale_document.material_catalog();
+    auto graph = catalog.material_graphs().at("fixture/opacity");
+    graph.nodes.back().constants[0U] = 0.75;
+    graph.revision = graph.revision.next();
+    take(catalog.replace_material_graph(graph));
+    take(stale_document.set_material_catalog(std::move(catalog)));
+    const auto stale = prepare(stale_document);
+    require(!stale && stale.error().code == core::ErrorCode::stale_data,
+        "sheen graph changes require an explicit source rebind");
 }
 
 void project_scene_texture_loader_binds_verified_sources_and_fails_closed() {
@@ -4174,6 +4295,111 @@ void graph_opacity_reaches_native_coverage(d3d12::D3D12Device& device) {
     }
 }
 
+void sheen_direct_lights_match_reference_and_invalidate_mesh_cache(
+    d3d12::D3D12Device& device) {
+    auto scene = request();
+    scene.width = 97U;
+    scene.height = 97U;
+    scene.antialiasing = d3d12::SceneRenderAntialiasing::none;
+    scene.light = {{0.6, 0.0, 0.8}, {3.0, 3.0, 3.0}};
+    auto& binding = scene.objects.front().materials.front();
+    binding.current_material.definition.base_color_factor = {0.6, 0.4, 0.2, 1.0};
+    rebind(scene.objects.front());
+    d3d12::SceneRenderCache cache;
+    const auto render_cached = [&](const d3d12::SceneRenderRequest& input) {
+        return take(d3d12::render_scene_cached(device, cache, input, CARTO_D3D12_SHADER_DIR));
+    };
+    const auto uncoated = render_cached(scene);
+    const auto before = take(scene.digest());
+    binding.sheen_weight = 1.0;
+    const auto full = render_cached(scene);
+    const auto fresh = capture(device, scene);
+    require(take(scene.digest()) != before && full.linear_hdr_rgba == fresh.linear_hdr_rgba &&
+            full.depth == fresh.depth && full.pixel_digest != uncoated.pixel_digest,
+        "a sheen-only change rebuilds cached mesh payload and matches a fresh render");
+    const auto reference = take(d3d12::evaluate_scene_sheen_reference(
+        1.0, 0.65, 0.0, 0.8, 1.0, std::sqrt(0.9)));
+    const std::size_t center = (48U * 97U + 48U) * 4U;
+    const std::array<double, 3U> base{0.6, 0.4, 0.2};
+    require(full.depth[center / 4U] < 1.0F,
+        "odd-sized sheen fixture covers the exact camera-target surface sample");
+    for (std::size_t channel = 0U; channel < base.size(); ++channel) {
+        const double expected = base[channel] * (0.03 + reference.sheen_brdf * 0.8 * 3.0);
+        require(std::abs(full.linear_hdr_rgba[center + channel] - expected) < 2.0e-4,
+            "native directional sheen matches the CPU direct BRDF plus declared ambient");
+    }
+    binding.sheen_weight = 0.5;
+    const auto half = render_cached(scene);
+    for (std::size_t channel = 0U; channel < base.size(); ++channel)
+        require(std::abs(half.linear_hdr_rgba[center + channel] -
+                0.5F * (full.linear_hdr_rgba[center + channel] +
+                    uncoated.linear_hdr_rgba[center + channel])) < 2.0e-5,
+            "scalar sheen mixes linearly with the existing base at fixed surface factors");
+
+    binding.sheen_weight = 1.0;
+    auto local = scene;
+    local.light.radiance = {};
+    d3d12::SceneRenderLocalLight light;
+    light.object = {901U};
+    light.position = {3.0, 0.0, 4.0};
+    light.emission_direction = {-0.6, 0.0, -0.8};
+    light.range = 10.0;
+    light.radiance = {3.0, 3.0, 3.0};
+    light.inner_cone_radians = 0.2;
+    light.outer_cone_radians = 0.6;
+    light.casts_shadows = false;
+    for (const auto kind : {d3d12::SceneRenderLocalLightKind::point,
+            d3d12::SceneRenderLocalLightKind::spot}) {
+        light.kind = kind;
+        local.local_lights = {light};
+        const auto image = render_cached(local);
+        const double range_attenuation = (1.0 - 0.0625) * (1.0 - 0.0625) / 25.0;
+        for (std::size_t channel = 0U; channel < base.size(); ++channel) {
+            const double expected = base[channel] *
+                (0.03 + reference.sheen_brdf * 0.8 * 3.0 * range_attenuation);
+            require(std::abs(image.linear_hdr_rgba[center + channel] - expected) < 2.0e-4,
+                "point and spot sheen apply existing distance and cone attenuation exactly once");
+        }
+    }
+    binding.current_material.definition.metallic = 0.5;
+    binding.sheen_weight = 0.0;
+    rebind(scene.objects.front());
+    const auto mixed_metal_base = render_cached(scene);
+    binding.sheen_weight = 1.0;
+    const auto mixed_metal_sheen = render_cached(scene);
+    for (std::size_t channel = 0U; channel < base.size(); ++channel)
+        require(std::abs(mixed_metal_sheen.linear_hdr_rgba[center + channel] -
+                0.5F * (mixed_metal_base.linear_hdr_rgba[center + channel] +
+                    full.linear_hdr_rgba[center + channel])) < 2.0e-5,
+            "fractional metallic suppresses the mixture weight over the complete base lobe");
+    binding.current_material.definition.metallic = 0.0;
+    binding.current_material.definition.clearcoat = 0.5;
+    binding.sheen_weight = 0.0;
+    rebind(scene.objects.front());
+    const auto coated_base = render_cached(scene);
+    binding.sheen_weight = 1.0;
+    const auto coated_sheen = render_cached(scene);
+    const double coat_attenuation = 1.0 - 0.5 *
+        (0.04 + 0.96 * std::pow(1.0 - std::sqrt(0.9), 5.0));
+    for (std::size_t channel = 0U; channel < base.size(); ++channel)
+        require(std::abs((coated_sheen.linear_hdr_rgba[center + channel] -
+                    coated_base.linear_hdr_rgba[center + channel]) - coat_attenuation *
+                (full.linear_hdr_rgba[center + channel] -
+                    uncoated.linear_hdr_rgba[center + channel])) < 2.0e-4,
+            "clearcoat attenuates both mixed base lobes while retaining its own outer reflection");
+    binding.current_material.definition.clearcoat = 0.0;
+    binding.current_material.definition.metallic = 1.0;
+    rebind(scene.objects.front());
+    const auto metal_sheen = render_cached(scene);
+    binding.sheen_weight = 0.0;
+    const auto metal_base = render_cached(scene);
+    require(metal_sheen.linear_hdr_rgba == metal_base.linear_hdr_rgba,
+        "full-metal shading remains unchanged by the suppressed sheen mixture");
+    require(std::any_of(full.limitations.begin(), full.limitations.end(),
+            [](const std::string& limitation) { return limitation.find("no sheen IBL") != std::string::npos; }),
+        "native sheen receipt discloses the missing environment integration");
+}
+
 void viewport_camera_rebuilds_pan_from_immutable_base_and_resets_home() {
     d3d12::SceneRenderCamera base;
     base.position = {0.0, 0.0, 10.0};
@@ -4347,6 +4573,12 @@ int main(int argc, char** argv) {
             std::cout << "PASS graph opacity preparation and source boundaries (no GPU)\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--graph-sheen-only") {
+            scene_sheen_reference_is_bounded_and_reciprocal();
+            project_graph_sheen_binds_source_and_refuses_missing_ibl();
+            std::cout << "PASS graph sheen reference and source boundaries (no GPU)\n";
+            return 0;
+        }
         temporal_sampling_is_deterministic_and_memory_bounded();
         std::cout << "PASS shared temporal sampling bounds and texture budget\n";
         viewport_camera_rebuilds_pan_from_immutable_base_and_resets_home();
@@ -4365,6 +4597,9 @@ int main(int argc, char** argv) {
             std::cout << "PASS saved-project scene preparation, immutable source and reopen identity\n";
             project_graph_opacity_preserves_coverage_policy_and_source();
             std::cout << "PASS graph opacity composition, authored alpha policy and source pinning\n";
+            scene_sheen_reference_is_bounded_and_reciprocal();
+            project_graph_sheen_binds_source_and_refuses_missing_ibl();
+            std::cout << "PASS graph sheen reference, source identity and environment refusal\n";
             authored_project_camera_resolves_world_pose_and_projection();
             std::cout << "PASS authored camera world-pose resolution and projection binding\n";
             project_scene_adapter_wires_supported_authored_lights_and_refuses_fallbacks();
@@ -4411,6 +4646,8 @@ int main(int argc, char** argv) {
         std::cout << "PASS material graph occlusion reaches native pixels without source mutation\n";
         graph_opacity_reaches_native_coverage(*device);
         std::cout << "PASS material graph opacity reaches native masked and blended coverage\n";
+        sheen_direct_lights_match_reference_and_invalidate_mesh_cache(*device);
+        std::cout << "PASS direct sheen reference pixels and mesh-cache invalidation\n";
         transformed_normals_match_baked_geometry(*device);
         require(device->debug_receipts().empty() && !device->device_lost(), "complete scene suite preserves clean native device state");
         std::cout << "PASS nonuniform and mirrored normal/tangent GPU parity\n";

@@ -23,6 +23,16 @@ authored frames and unrelated UV/color/material seams. Regression cases are
 authored but unrun; build and visual acceptance remain pending. See
 [mirrored UV tangent domains](verification/mirrored-uv-tangent-domains.md).
 
+Code-only continuation (2026-11-12): saved-scene scalar graph sheen has an
+isolated direct-light implementation using a base-tinted Charlie distribution
+and Neubelt visibility, with a metallic-suppressed base-layer mixture below
+clearcoat. It shares surface roughness, binds request/cache identity, and
+rejects nonzero sheen with environment lighting because sheen IBL is absent.
+No durable material schema or generic GPU-material ABI changed. Numerical,
+source/persistence and native pixel/cache regression source is authored;
+compilation, tests, GPU execution, cloth appearance and energy acceptance
+remain unverified. See [the sheen handoff](verification/saved-scene-sheen-20261112.md).
+
 Code-only continuation (2026-11-12): saved-scene graph opacity now lowers as
 additional coverage (`graph alpha * graph opacity`) through the existing PBR
 alpha path. Both operands must independently be finite and in [0, 1]. Authored

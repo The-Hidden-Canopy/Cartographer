@@ -330,6 +330,24 @@ float2 sample_split_sum_brdf(float n_dot_v, float roughness)
     return lerp(top, bottom, frac(texel.y));
 }
 
+// Matches evaluate_scene_sheen_reference. Scalar sheen is a mixture with the
+// base, below clearcoat, with base-color tint and shared roughness. Metallic
+// suppresses the mixture weight; full metals retain their existing base lobe.
+// The host refuses sheen with environment lighting until a sheen IBL exists.
+float sheen_charlie_neubelt(float roughness, float n_dot_l, float n_dot_v,
+    float n_dot_h)
+{
+    if (n_dot_l <= 0.0 || n_dot_v <= 0.0)
+        return 0.0;
+    const float inverse_alpha = 1.0 / max(0.07, roughness * roughness);
+    const float distribution = (2.0 + inverse_alpha) *
+        pow(saturate(1.0 - n_dot_h * n_dot_h), 0.5 * inverse_alpha) /
+        (2.0 * 3.14159265);
+    const float visibility = 1.0 / max(1.0e-5,
+        4.0 * (n_dot_l + n_dot_v - n_dot_l * n_dot_v));
+    return distribution * visibility;
+}
+
 float4 PSMain(VertexOutput input) : SV_TARGET
 {
     const float3 geometric_normal = normalize_or(input.world_normal, float3(0.0, 0.0, 1.0));
@@ -378,6 +396,8 @@ float4 PSMain(VertexOutput input) : SV_TARGET
         mapped_channel(sampled_metallic_roughness, input.channel_mapping_a.y));
     const float roughness = saturate(input.material_surface_factors.y *
         mapped_channel(sampled_metallic_roughness, input.channel_mapping_a.z));
+    // z is a scene-only lobe factor in the spare channel-mapping payload.
+    const float sheen_weight = saturate(input.channel_mapping_c.z) * (1.0 - metallic);
     const float dielectric_f0 = saturate(emissive_radiance_and_f0.w);
     const float clearcoat = saturate(input.camera_clearcoat.w);
     const float coat_roughness = saturate(clearcoat_roughness);
@@ -413,7 +433,10 @@ float4 PSMain(VertexOutput input) : SV_TARGET
                 input.occlusion_uv), input.channel_mapping_b.z)),
             saturate(occlusion_parameter))
         : saturate(occlusion_parameter);
-    const float3 direct = (diffuse + specular + clearcoat_specular) *
+    const float3 sheen = base_color * (sheen_weight * base_attenuation *
+        sheen_charlie_neubelt(roughness, n_dot_l, n_dot_v, n_dot_h));
+    const float3 direct = ((diffuse + specular) * (1.0 - sheen_weight) +
+        sheen + clearcoat_specular) *
         (n_dot_l * light_radiance * shadow);
     uint local_light_width = 0U;
     uint local_light_height = 0U;
@@ -502,7 +525,11 @@ float4 PSMain(VertexOutput input) : SV_TARGET
         const float3 local_coat_specular = clearcoat * local_coat_fresnel *
             local_coat_distribution * local_coat_geometry /
             max(4.0 * local_n_dot_l * local_n_dot_v, 1e-5);
-        local_direct += (local_diffuse + local_specular + local_coat_specular) *
+        const float3 local_sheen = base_color *
+            (sheen_weight * local_base_attenuation * sheen_charlie_neubelt(
+                roughness, local_n_dot_l, local_n_dot_v, local_n_dot_h));
+        local_direct += ((local_diffuse + local_specular) * (1.0 - sheen_weight) +
+            local_sheen + local_coat_specular) *
             (local_n_dot_l * radiance_inner.rgb * range_attenuation *
                 cone_attenuation * local_shadow);
     }
