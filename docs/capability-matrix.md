@@ -1,5 +1,18 @@
 # Capability matrix
 
+Integration verification (2026-11-12): the continuations below for:
+
+- float32 geometry/UV fidelity and mirrored UV tangent domains
+- saved-scene graph opacity, sheen and anisotropy (including normal maps)
+- exact-neutral physical outputs
+- single-evaluation and explicit-UV-domain material baking
+
+were built together on main with the drafting grid, XYZ move/snapping, orthographic picking
+and export handoff. They passed the full headless CTest suite, 228 of 228, including the
+native D3D12 scene-renderer cases on a local GPU. Earlier notes below that call these
+cases unbuilt or unrun predate that run. Interactive native-window and visual acceptance,
+and target-consumer glTF/GLB import, remain open.
+
 Code-only continuation (2026-11-12): glTF/GLB position narrowing now refuses
 rounding-induced triangle orientation loss and evaluates packed-coordinate
 area in double precision, avoiding false overflow refusals for large finite
