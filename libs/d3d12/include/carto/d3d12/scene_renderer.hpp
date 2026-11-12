@@ -403,7 +403,10 @@ struct SceneRenderReceipt {
 // Read-only saved-document adapter. Consumes explicit authored UV0, material
 // regions, assignments and world transforms; it never invents missing UVs or
 // a default material. Bound graphs with CPU-evaluable nodes and supported PBR
-// outputs are lowered into material factors. Durable graph inputs are used by
+// outputs are lowered into material factors. Optional graph opacity multiplies
+// graph alpha as coverage; both must be in [0, 1]. The authored alpha mode and
+// cutoff are preserved (opaque mode still ignores coverage). This is not
+// refraction or transmission. Durable graph inputs are used by
 // default; an optional transient input map is revision/digest-bound to the exact
 // source and overrides them for that request only. Missing inputs, texture
 // sampling, variants on graph-bound materials, unsupported texture controls,

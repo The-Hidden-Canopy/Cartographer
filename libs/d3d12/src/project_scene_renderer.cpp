@@ -96,18 +96,30 @@ core::Result<void> apply_evaluated_material_graph(
     const auto& outputs = graph.outputs;
     if (outputs.normal != 0U || outputs.transmission != 0U ||
         outputs.subsurface != 0U || outputs.sheen != 0U ||
-        outputs.anisotropy != 0U || outputs.opacity != 0U ||
-        outputs.displacement != 0U) {
+        outputs.anisotropy != 0U || outputs.displacement != 0U) {
         return core::Result<void>::failure({core::ErrorCode::unsupported,
-            "native scene rendering cannot lower this material graph output set"});
+            "native scene rendering cannot lower normal, transmission, subsurface, "
+            "sheen, anisotropy, or displacement material graph outputs"});
     }
 
     const auto& base_color = evaluation.node_values.at(outputs.base_color);
     const auto& alpha = evaluation.node_values.at(outputs.alpha);
     const auto& roughness = evaluation.node_values.at(outputs.roughness);
     const auto& metallic = evaluation.node_values.at(outputs.metallic);
+    // Opacity is additional coverage, not transmission or an alpha-mode
+    // override. Validate each operand before composition: invalid negative or
+    // above-one inputs must not cancel into an apparently valid final alpha.
+    const double opacity = outputs.opacity == 0U ? 1.0 :
+        evaluation.node_values.at(outputs.opacity).components[0U];
+    const auto coverage_in_range = [](double value) {
+        return std::isfinite(value) && value >= 0.0 && value <= 1.0;
+    };
+    if (!coverage_in_range(alpha.components[0U]) || !coverage_in_range(opacity)) {
+        return core::Result<void>::failure({core::ErrorCode::validation_failed,
+            "native scene material graph alpha and opacity must each be in [0, 1]"});
+    }
     material.base_color_factor = {base_color.components[0U], base_color.components[1U],
-        base_color.components[2U], alpha.components[0U]};
+        base_color.components[2U], alpha.components[0U] * opacity};
     material.roughness = roughness.components[0U];
     material.metallic = metallic.components[0U];
 

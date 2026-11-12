@@ -15,6 +15,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <system_error>
@@ -186,6 +187,191 @@ project::ProjectDocument parameterized_graph_project() {
             static_cast<bool>(document.set_material_catalog(std::move(catalog))),
         "fixture binds a graph with one explicit roughness input");
     return document;
+}
+
+project::ProjectDocument opacity_graph_project(
+    double alpha, std::optional<double> opacity, render::AlphaMode mode) {
+    auto document = room_project();
+    auto catalog = document.material_catalog();
+    auto material = catalog.materials().at(1U);
+    material.definition.alpha_mode = mode;
+    material.definition.alpha_cutoff = 0.375;
+    material.revision = material.revision.next();
+    take(catalog.replace_material(material));
+    project::MaterialGraph graph;
+    graph.identity = "fixture/opacity";
+    graph.revision = core::Revision{1U};
+    project::MaterialGraphNode color;
+    color.id = 1U;
+    color.kind = project::MaterialGraphNodeKind::constant_color;
+    color.value_type = project::MaterialGraphValueType::color;
+    color.constants = {0.6, 0.4, 0.2, 1.0};
+    project::MaterialGraphNode alpha_node;
+    alpha_node.id = 2U;
+    alpha_node.constants[0U] = alpha;
+    project::MaterialGraphNode roughness;
+    roughness.id = 3U;
+    roughness.constants[0U] = 0.5;
+    project::MaterialGraphNode metallic;
+    metallic.id = 4U;
+    graph.nodes = {color, alpha_node, roughness, metallic};
+    graph.outputs.base_color = color.id;
+    graph.outputs.alpha = alpha_node.id;
+    graph.outputs.roughness = roughness.id;
+    graph.outputs.metallic = metallic.id;
+    if (opacity.has_value()) {
+        project::MaterialGraphNode opacity_node;
+        opacity_node.id = 5U;
+        opacity_node.constants[0U] = *opacity;
+        graph.nodes.push_back(opacity_node);
+        graph.outputs.opacity = opacity_node.id;
+    }
+    take(catalog.insert_material_graph(graph));
+    take(catalog.bind_material_graph(1U, graph.identity));
+    take(document.set_material_catalog(std::move(catalog)));
+    return document;
+}
+
+void project_graph_opacity_preserves_coverage_policy_and_source() {
+    d3d12::SceneRenderCamera camera;
+    camera.position = {5.0, 3.1, 5.5};
+    camera.target = {-0.3, 0.8, -1.0};
+    const auto prepare = [&](const project::ProjectDocument& document) {
+        return d3d12::prepare_project_scene_render(
+            "graph-opacity", document, camera, 96U, 96U);
+    };
+    for (const auto mode : {render::AlphaMode::opaque,
+            render::AlphaMode::masked, render::AlphaMode::blended}) {
+        for (const double opacity : {0.0, 0.5, 1.0}) {
+            const auto document = opacity_graph_project(0.5, opacity, mode);
+            const auto before = document.serialize();
+            const auto prepared = take(prepare(document));
+            std::size_t bound_materials = 0U;
+            for (const auto& object : prepared.objects) {
+                for (const auto& binding : object.materials) {
+                    if (binding.current_material.id != 1U) continue;
+                    ++bound_materials;
+                    const auto& material = binding.current_material.definition;
+                    require(material.base_color_factor.w == 0.5 * opacity &&
+                            material.alpha_mode == mode && material.alpha_cutoff == 0.375,
+                        "graph coverage composes without changing authored alpha policy");
+                }
+            }
+            require(bound_materials == 3U && document.serialize() == before,
+                "shared graph materials lower consistently without mutating the project");
+            const auto reopened = take(project::ProjectDocument::deserialize(before));
+            require(take(take(prepare(reopened)).digest()) == take(prepared.digest()),
+                "opacity source and prepared request identity survive saved-project reopen");
+        }
+    }
+    const auto absent = take(prepare(opacity_graph_project(
+        0.5, std::nullopt, render::AlphaMode::masked)));
+    require(absent.objects.front().materials.front().current_material.definition
+            .base_color_factor.w == 0.5,
+        "graphs without opacity retain their existing alpha result");
+    for (const double alpha : {0.0, 1.0}) {
+        const auto endpoint = take(prepare(opacity_graph_project(
+            alpha, 0.5, render::AlphaMode::blended)));
+        require(endpoint.objects.front().materials.front().current_material.definition
+                .base_color_factor.w == alpha * 0.5,
+            "zero and one alpha retain exact multiplicative endpoint behavior");
+    }
+    const auto invalid_legacy_alpha = prepare(opacity_graph_project(
+        2.0, std::nullopt, render::AlphaMode::opaque));
+    require(!invalid_legacy_alpha &&
+            invalid_legacy_alpha.error().code == core::ErrorCode::validation_failed,
+        "missing opacity and opaque mode cannot hide an invalid graph alpha");
+
+    // Products inside [0, 1] must not hide invalid individual operands.
+    for (const auto values : {std::array{-0.5, -0.5}, std::array{2.0, 0.25},
+            std::array{0.25, 2.0}, std::array{0.0, -0.5}, std::array{-0.5, 0.0}}) {
+        const auto document = opacity_graph_project(
+            values[0U], values[1U], render::AlphaMode::blended);
+        const auto before = document.serialize();
+        const auto refused = prepare(document);
+        require(!refused && refused.error().code == core::ErrorCode::validation_failed &&
+                document.serialize() == before,
+            "invalid alpha or opacity fails before publishing a prepared scene");
+    }
+
+    auto parameterized = opacity_graph_project(0.5, 0.5, render::AlphaMode::blended);
+    auto catalog = parameterized.material_catalog();
+    auto graph = catalog.material_graphs().at("fixture/opacity");
+    graph.revision = graph.revision.next();
+    auto& opacity = graph.nodes.back();
+    opacity.kind = project::MaterialGraphNodeKind::parameter_scalar;
+    opacity.constants = {};
+    opacity.parameter_name = "opacity";
+    take(catalog.replace_material_graph(graph));
+    take(catalog.bind_material_graph(1U, graph.identity));
+    take(parameterized.set_material_catalog(catalog));
+    const auto missing = prepare(parameterized);
+    require(!missing && missing.error().code == core::ErrorCode::not_found,
+        "missing opacity input cannot silently become fully opaque");
+    project::MaterialGraphEvaluationInputs inputs;
+    project::MaterialGraphValue value;
+    value.components[0U] = 0.5;
+    inputs.parameters.emplace("opacity", value);
+    const auto graph_digest = take(graph.canonical_digest());
+    take(catalog.set_material_graph_inputs(
+        1U, graph.identity, graph.revision, graph_digest, inputs));
+    take(parameterized.set_material_catalog(catalog));
+    const auto saved_request = take(prepare(parameterized));
+    require(saved_request.objects.front().materials.front().current_material.definition
+            .base_color_factor.w == 0.25,
+        "durable typed opacity inputs reach composed material coverage");
+    const auto reopened = take(project::ProjectDocument::deserialize(parameterized.serialize()));
+    require(take(take(prepare(reopened)).digest()) == take(saved_request.digest()),
+        "durable opacity parameters survive serialization and exact request replay");
+    inputs.parameters.at("opacity").components[0U] = 0.75;
+    d3d12::SceneRenderMaterialGraphInputs override_inputs;
+    override_inputs.emplace(graph.identity,
+        d3d12::SceneRenderMaterialGraphInputBinding{graph.revision, graph_digest, inputs});
+    const auto overridden = take(d3d12::prepare_project_scene_render(
+        "graph-opacity", parameterized, camera, 96U, 96U, {},
+        {{0.3, 0.7, 1.0}, {3.0, 3.0, 3.0}}, override_inputs));
+    require(overridden.objects.front().materials.front().current_material.definition
+            .base_color_factor.w == 0.375 &&
+            take(overridden.digest()) != take(saved_request.digest()),
+        "transient opacity changes coverage and request identity");
+    auto invalid_inputs = override_inputs;
+    invalid_inputs.at(graph.identity).inputs.parameters.at("opacity").components[0U] = 2.0;
+    const auto invalid_parameter = d3d12::prepare_project_scene_render(
+        "graph-opacity", parameterized, camera, 96U, 96U, {},
+        {{0.3, 0.7, 1.0}, {3.0, 3.0, 3.0}}, invalid_inputs);
+    require(!invalid_parameter &&
+            invalid_parameter.error().code == core::ErrorCode::validation_failed,
+        "typed but out-of-range transient opacity is refused before lowering");
+    auto wrong_digest = override_inputs;
+    wrong_digest.at(graph.identity).graph_digest = hash("different-opacity-source");
+    const auto digest_mismatch = d3d12::prepare_project_scene_render(
+        "graph-opacity", parameterized, camera, 96U, 96U, {},
+        {{0.3, 0.7, 1.0}, {3.0, 3.0, 3.0}}, wrong_digest);
+    require(!digest_mismatch && digest_mismatch.error().code == core::ErrorCode::stale_data,
+        "same-revision opacity inputs still require the exact graph digest");
+    override_inputs.at(graph.identity).graph_revision = core::Revision{1U};
+    const auto stale = d3d12::prepare_project_scene_render(
+        "graph-opacity", parameterized, camera, 96U, 96U, {},
+        {{0.3, 0.7, 1.0}, {3.0, 3.0, 3.0}}, override_inputs);
+    require(!stale && stale.error().code == core::ErrorCode::stale_data,
+        "opacity cannot bypass graph input source pinning");
+
+    using OutputMember = std::uint64_t project::MaterialGraphOutputs::*;
+    for (const OutputMember output : {&project::MaterialGraphOutputs::transmission,
+            &project::MaterialGraphOutputs::subsurface, &project::MaterialGraphOutputs::sheen,
+            &project::MaterialGraphOutputs::anisotropy, &project::MaterialGraphOutputs::displacement}) {
+        auto document = opacity_graph_project(1.0, 0.5, render::AlphaMode::blended);
+        auto unsupported_catalog = document.material_catalog();
+        auto unsupported_graph = unsupported_catalog.material_graphs().at("fixture/opacity");
+        unsupported_graph.revision = unsupported_graph.revision.next();
+        unsupported_graph.outputs.*output = 4U;
+        take(unsupported_catalog.replace_material_graph(unsupported_graph));
+        take(unsupported_catalog.bind_material_graph(1U, unsupported_graph.identity));
+        take(document.set_material_catalog(std::move(unsupported_catalog)));
+        const auto refused = prepare(document);
+        require(!refused && refused.error().code == core::ErrorCode::unsupported,
+            "opacity never silently substitutes for unsupported physical material outputs");
+    }
 }
 
 void project_scene_texture_loader_binds_verified_sources_and_fails_closed() {
@@ -3933,6 +4119,61 @@ void graph_occlusion_values_reach_native_pixels(d3d12::D3D12Device& device) {
         "zero authored texture strength still disables the bound occlusion map");
 }
 
+void graph_opacity_reaches_native_coverage(d3d12::D3D12Device& device) {
+    for (const auto mode : {render::AlphaMode::opaque,
+            render::AlphaMode::masked, render::AlphaMode::blended}) {
+        const auto document = opacity_graph_project(0.5, 0.5, mode);
+        const auto before = document.serialize();
+        d3d12::SceneRenderCamera camera;
+        camera.position = {0.0, 5.0, 3.0};
+        camera.target = {0.0, -0.1, 0.0};
+        const auto floor_request = [&](const project::ProjectDocument& source) {
+            auto prepared = take(d3d12::prepare_project_scene_render(
+                "graph-opacity", source, camera, 96U, 96U, {},
+                {{0.0, 1.0, 0.0}, {0.0, 0.0, 0.0}}));
+            std::erase_if(prepared.objects, [&](const auto& rendered) {
+                return source.scene().find(rendered.object)->name != "Floor";
+            });
+            return prepared;
+        };
+        const auto prepared = floor_request(document);
+        const auto actual = capture(device, prepared);
+        auto explicit_material = document;
+        auto catalog = explicit_material.material_catalog();
+        auto material = catalog.materials().at(1U);
+        material.definition.base_color_factor = {0.6, 0.4, 0.2, 0.25};
+        material.definition.roughness = 0.5;
+        material.definition.metallic = 0.0;
+        material.revision = material.revision.next();
+        take(catalog.unbind_material_graph(1U));
+        take(catalog.replace_material(material));
+        take(explicit_material.set_material_catalog(std::move(catalog)));
+        const auto expected = capture(device, floor_request(explicit_material));
+        require(actual.linear_hdr_rgba == expected.linear_hdr_rgba &&
+                actual.depth == expected.depth,
+            "graph opacity matches explicit factor coverage in the actual native shader path");
+        const auto full_opacity = capture(device, floor_request(
+            opacity_graph_project(0.5, 1.0, mode)));
+        const std::size_t center = (48U * 96U + 48U) * 4U;
+        if (mode == render::AlphaMode::opaque) {
+            require(actual.depth[center / 4U] < 1.0F &&
+                    actual.linear_hdr_rgba == full_opacity.linear_hdr_rgba,
+                "authored opaque policy remains opaque rather than inferring a blend mode");
+        } else if (mode == render::AlphaMode::masked) {
+            require(actual.depth[center / 4U] == 1.0F &&
+                    full_opacity.depth[center / 4U] < 1.0F,
+                "graph opacity drives the existing authored cutoff and masked depth discard");
+        } else {
+            require(actual.depth[center / 4U] == 1.0F &&
+                    actual.linear_hdr_rgba[center] > 0.0F &&
+                    actual.linear_hdr_rgba[center] < full_opacity.linear_hdr_rgba[center],
+                "graph opacity changes blended HDR coverage without writing opaque depth");
+        }
+        require(document.serialize() == before,
+            "native opacity capture leaves all authored project bytes unchanged");
+    }
+}
+
 void viewport_camera_rebuilds_pan_from_immutable_base_and_resets_home() {
     d3d12::SceneRenderCamera base;
     base.position = {0.0, 0.0, 10.0};
@@ -4101,6 +4342,11 @@ int main(int argc, char** argv) {
                 "fixture writes CLI equirectangular source");
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--graph-opacity-only") {
+            project_graph_opacity_preserves_coverage_policy_and_source();
+            std::cout << "PASS graph opacity preparation and source boundaries (no GPU)\n";
+            return 0;
+        }
         temporal_sampling_is_deterministic_and_memory_bounded();
         std::cout << "PASS shared temporal sampling bounds and texture budget\n";
         viewport_camera_rebuilds_pan_from_immutable_base_and_resets_home();
@@ -4117,6 +4363,8 @@ int main(int argc, char** argv) {
             std::cout << "PASS linear Radiance HDR reflection mip binding\n";
             project_adapter_preserves_source_and_rejects_missing_authoring();
             std::cout << "PASS saved-project scene preparation, immutable source and reopen identity\n";
+            project_graph_opacity_preserves_coverage_policy_and_source();
+            std::cout << "PASS graph opacity composition, authored alpha policy and source pinning\n";
             authored_project_camera_resolves_world_pose_and_projection();
             std::cout << "PASS authored camera world-pose resolution and projection binding\n";
             project_scene_adapter_wires_supported_authored_lights_and_refuses_fallbacks();
@@ -4161,6 +4409,8 @@ int main(int argc, char** argv) {
         std::cout << "PASS direct GPU target pixel parity, stale-state refusal and caller ownership\n";
         graph_occlusion_values_reach_native_pixels(*device);
         std::cout << "PASS material graph occlusion reaches native pixels without source mutation\n";
+        graph_opacity_reaches_native_coverage(*device);
+        std::cout << "PASS material graph opacity reaches native masked and blended coverage\n";
         transformed_normals_match_baked_geometry(*device);
         require(device->debug_receipts().empty() && !device->device_lost(), "complete scene suite preserves clean native device state");
         std::cout << "PASS nonuniform and mirrored normal/tangent GPU parity\n";

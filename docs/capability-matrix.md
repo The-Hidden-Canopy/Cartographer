@@ -23,6 +23,15 @@ authored frames and unrelated UV/color/material seams. Regression cases are
 authored but unrun; build and visual acceptance remain pending. See
 [mirrored UV tangent domains](verification/mirrored-uv-tangent-domains.md).
 
+Code-only continuation (2026-11-12): saved-scene graph opacity now lowers as
+additional coverage (`graph alpha * graph opacity`) through the existing PBR
+alpha path. Both operands must independently be finite and in [0, 1]. Authored
+opaque/masked/blended mode and cutoff remain unchanged; opaque mode ignores
+coverage, and opacity does not provide transmission or refraction. Regression
+source covers immutable preparation, persistence, exact input binding and
+native coverage parity, but no build, test or GPU execution has run for this
+candidate. See [the handoff](verification/saved-scene-graph-opacity-20261112.md).
+
 Local integration checkpoint (2026-11-01): twenty selected native CPU suites
 pass at `3e5639d`, covering the combined planar/relax UV history routes,
 native selected-instance and straight-sweep candidate producers, CAD extraction

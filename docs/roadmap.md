@@ -14,6 +14,12 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 
 - [ ] validate mirrored-UV generated tangent-domain preservation: source and regression cases are implemented, but build, CTest, and normal-map visual acceptance remain pending ([scope and evidence](verification/mirrored-uv-tangent-domains.md))
 
+- [ ] Accept the source-only saved-scene graph opacity continuation: independent
+  alpha/opacity bounds, multiplicative coverage, unchanged authored alpha mode
+  and cutoff, saved-project replay and native masked/blended parity. Build,
+  focused preparation tests and GPU acceptance remain unrun; see
+  [the handoff](verification/saved-scene-graph-opacity-20261112.md).
+
 - [x] projection-aware Front/Right surface and edge picking preserves affine source anchors and foreground ordering while retaining perspective reciprocal interpolation and existing source-admission gates
 
 - [x] Top/Front/Right orthographic views feed saved-scene preview with preserved projection/scale, source-bound invalidation, bounded camera admission, conservative transformed-source depth fitting for Top, and independent authored-camera selection; CPU request integration and desktop compilation verified, native pixel acceptance still open
