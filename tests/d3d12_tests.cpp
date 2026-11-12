@@ -1898,13 +1898,18 @@ void d3d12_executes_builtin_shader_suite_and_dispatches_compute() {
         device, temporal_resolve_graph_pass, temporal_stream, gpu::QueueType::compute);
     const auto temporal_pixels = device.read_texture_rgba32f(temporal_resolved.value());
     REQUIRE(temporal_pixels);
+    // Valid history is clamped to the current frame's finite 3x3 neighborhood.
+    // A uniform current frame therefore admits no history outside its own
+    // color, so the 50% feedback resolve returns the current color exactly.
+    // Feedback blending inside a varied neighborhood is covered by the scene
+    // renderer temporal tests.
     const std::size_t temporal_center = (4U * 8U + 4U) * 4U;
-    REQUIRE(temporal_pixels.value()[temporal_center] > 0.49F &&
-            temporal_pixels.value()[temporal_center] < 0.51F);
-    REQUIRE(temporal_pixels.value()[temporal_center + 1U] > 0.49F &&
-            temporal_pixels.value()[temporal_center + 1U] < 0.51F);
-    REQUIRE(temporal_pixels.value()[temporal_center + 2U] > 0.49F &&
-            temporal_pixels.value()[temporal_center + 2U] < 0.51F);
+    REQUIRE(temporal_pixels.value()[temporal_center] > 0.19F &&
+            temporal_pixels.value()[temporal_center] < 0.21F);
+    REQUIRE(temporal_pixels.value()[temporal_center + 1U] > 0.39F &&
+            temporal_pixels.value()[temporal_center + 1U] < 0.41F);
+    REQUIRE(temporal_pixels.value()[temporal_center + 2U] > 0.59F &&
+            temporal_pixels.value()[temporal_center + 2U] < 0.61F);
     REQUIRE(temporal_pixels.value()[temporal_center + 3U] > 0.99F);
     const auto graph_receipt = graph_parity.finish();
     REQUIRE(graph_receipt.pass_order.size() == 6U);
@@ -2382,7 +2387,7 @@ void d3d12_accepts_8k_temporal_resolve() {
         gpu::Format::rg16_float,
         gpu::TextureDimension::texture_2d,
         gpu::TextureUsage::sampled | gpu::TextureUsage::color_attachment,
-        {0.0F, 0.0F, 0.0F, 0.0F},
+        {1.0e6F, 0.0F, 0.0F, 0.0F},
         1.0F,
     });
     const auto temporal_resolved = device.create_texture(gpu::TextureDesc{
@@ -2427,10 +2432,10 @@ void d3d12_accepts_8k_temporal_resolve() {
     };
     clear_input(temporal_current.value(), {0.2F, 0.4F, 0.6F, 1.0F});
     clear_input(temporal_history.value(), {0.8F, 0.6F, 0.4F, 1.0F});
-    // Infinite flow must fail closed to current HDR instead of reaching the
-    // float-to-integer reprojection conversion.
-    clear_input(temporal_motion.value(), {
-        std::numeric_limits<float>::infinity(), 0.0F, 0.0F, 0.0F});
+    // Out-of-range flow must fail closed to current HDR. Clear values must be
+    // finite, so clear with a float32 value beyond the RG16F range: it stores
+    // as +INF (and in any case lies far outside the 8K frame bound).
+    clear_input(temporal_motion.value(), {1.0e6F, 0.0F, 0.0F, 0.0F});
     setup.append(device_ir::CmdTransitionResource{
         device_ir::ResourceHandle{temporal_resolved.value()},
         device_ir::ResourceState::undefined,

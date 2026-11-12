@@ -50,12 +50,17 @@ struct D3D12BentNormalBakeReport {
         }
         const production::BentNormalMapArtifact& artifact = *bake.artifact;
         const D3D12ProjectionReport& worker = *projection;
+        // The worker projects the shared AO rays, so it carries the recipe
+        // digest. The bent-normal artifact's own settings digest is
+        // domain-separated from it and is checked by artifact validation.
+        const auto recipe_digest = artifact.recipe.canonical_digest();
+        if (!recipe_digest) return false;
         return !artifact.settings_digest.is_zero() &&
             artifact.artifact_digest == *cpu_reference_artifact_digest &&
             worker.worker_version == kD3D12ProjectionWorkerVersion &&
             worker.source_digest == artifact.recipe.binding.source.content_digest &&
             worker.target_digest == artifact.recipe.binding.target.content_digest &&
-            worker.settings_digest == artifact.settings_digest &&
+            worker.settings_digest == recipe_digest.value() &&
             worker.output_digest_matches() &&
             worker.evidence_digest_matches() &&
             !worker.request_digest.is_zero() && !worker.output_digest.is_zero() &&

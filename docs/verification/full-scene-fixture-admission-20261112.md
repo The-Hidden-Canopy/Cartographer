@@ -47,8 +47,20 @@ Release build (LLVM-MinGW Clang, D3D12 on): authoring material, full D3D12
 scene renderer, the four focused material GPU gates and the scene-render CLI
 test passed, 7/7. The CPU-only suite passed 228/228.
 
-The full D3D12-enabled suite passed 248/250. The two failures do not use the
-scene library or the changed shader: the multi-tile bent-normal D3D12 CLI bake
-(`D3D12 tile compiler failed without an error diagnostic`, from `bake_graph.cpp`)
-and the authored-PBR readback tolerance in `cartographer_d3d12_tests`. Both
-repeat when run serially on the NVIDIA Quadro P5200 and remain open.
+The full D3D12-enabled suite first passed 248/250. The two failures predated
+this run and are now fixed:
+
+- D3D12 bent-normal bakes never succeeded. The report compared the projection
+  worker's settings digest, which is the recipe digest, with the bent-normal
+  artifact's domain-separated settings digest. It now binds the worker to the
+  recipe digest; artifact validation still binds the artifact's own digest.
+- `cartographer_d3d12_tests` targeted the realism material contract, but
+  `cartographer_pbr.hlsl` still held the earlier shader with an ambient
+  surrogate and in-shader exposure. The file is now the define-free path of
+  `cartographer_authoring_pbr.hlsl`. The same suite also expected a 50% temporal
+  blend that the 3x3 neighborhood clamp forbids for a uniform frame, and
+  cleared a motion target to infinity, which device commands refuse. Both
+  expectations now match the shipped contracts.
+
+After these fixes the D3D12-enabled suite passed 250/250 on the NVIDIA Quadro
+P5200.

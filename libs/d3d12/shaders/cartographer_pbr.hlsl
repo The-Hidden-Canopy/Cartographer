@@ -8,7 +8,9 @@ cbuffer PushConstants : register(b0)
 {
     float4x4 view_projection;
     float4x4 model;
-    float4 camera_position_exposure;
+    // xyz is the perspective camera position.
+    // w is reserved for authored view/identity metadata, never exposure.
+    float4 camera_position_and_view;
     float4 base_color_factor;
     float4 emissive_radiance_and_f0;
     float4 surface_factors;
@@ -76,8 +78,9 @@ float distribution_ggx(float n_dot_h, float roughness)
 
 float geometry_schlick_ggx(float n_dot_x, float roughness)
 {
-    const float k = ((roughness + 1.0) * (roughness + 1.0)) / 8.0;
-    return n_dot_x / max(n_dot_x * (1.0 - k) + k, 1e-5);
+    const float alpha = max(0.045, roughness * roughness);
+    const float k = ((alpha + 1.0) * (alpha + 1.0)) / 8.0;
+    return n_dot_x / max(n_dot_x * (1.0 - k) + k, 1e-12);
 }
 
 float3 fresnel_schlick(float cos_theta, float3 f0)
@@ -85,7 +88,7 @@ float3 fresnel_schlick(float cos_theta, float3 f0)
     return f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
 }
 
-float4 PSMain(VertexOutput input) : SV_TARGET
+float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID) : SV_TARGET
 {
     const float3 geometric_normal = normalize(input.world_normal);
     const float3 tangent = normalize(
@@ -98,23 +101,22 @@ float4 PSMain(VertexOutput input) : SV_TARGET
     const float3 normal = normalize(
         tangent * tangent_normal.x + bitangent * tangent_normal.y +
         geometric_normal * tangent_normal.z);
-    const float3 view = normalize(camera_position_exposure.xyz - input.world_position);
+    const float3 view = normalize(camera_position_and_view.xyz - input.world_position);
     const float3 light_direction = normalize(light_direction_intensity.xyz);
     const float n_dot_l = max(dot(normal, light_direction), 0.0);
     const float n_dot_v = max(dot(normal, view), 0.0);
-    const float4 sampled_base = base_color_texture.Sample(
-        linear_clamp_sampler, input.uv);
+    const float4 sampled_base = base_color_texture.Sample(linear_clamp_sampler, input.uv);
     const float3 base_color = sampled_base.rgb * base_color_factor.rgb;
-    const float metallic = saturate(surface_factors.x *
-        metallic_roughness_texture.Sample(linear_clamp_sampler, input.uv).b);
-    const float roughness = saturate(surface_factors.y *
-        metallic_roughness_texture.Sample(linear_clamp_sampler, input.uv).g);
+    const float metallic = saturate(surface_factors.x * metallic_roughness_texture.Sample(linear_clamp_sampler, input.uv).b);
+    const float roughness = saturate(surface_factors.y * metallic_roughness_texture.Sample(linear_clamp_sampler, input.uv).g);
     const float dielectric_f0 = saturate(emissive_radiance_and_f0.w);
     const float clearcoat = saturate(clearcoat_factors.x);
     const float clearcoat_roughness = saturate(clearcoat_factors.y);
     const float3 f0 = lerp(
         float3(dielectric_f0, dielectric_f0, dielectric_f0), base_color, metallic);
-    const float3 half_vector = normalize(view + light_direction);
+    const float3 sum_direction = view + light_direction;
+    const float3 half_vector = dot(sum_direction, sum_direction) > 1e-12
+        ? normalize(sum_direction) : normal;
     const float n_dot_h = max(dot(normal, half_vector), 0.0);
     const float v_dot_h = max(dot(view, half_vector), 0.0);
     const float3 fresnel = fresnel_schlick(v_dot_h, f0);
@@ -124,7 +126,7 @@ float4 PSMain(VertexOutput input) : SV_TARGET
     const float geometry = geometry_schlick_ggx(n_dot_l, roughness) *
         geometry_schlick_ggx(n_dot_v, roughness);
     const float3 specular = fresnel * distribution * geometry * base_attenuation /
-        max(4.0 * n_dot_l * n_dot_v, 1e-5);
+        max(4.0 * n_dot_l * n_dot_v, 1e-12);
     const float3 diffuse_weight = (1.0 - fresnel) * (1.0 - metallic);
     const float3 diffuse = diffuse_weight * base_color * base_attenuation / 3.14159265;
     const float clearcoat_distribution = distribution_ggx(
@@ -134,23 +136,20 @@ float4 PSMain(VertexOutput input) : SV_TARGET
         geometry_schlick_ggx(n_dot_v, clearcoat_roughness);
     const float3 clearcoat_specular = clearcoat * clearcoat_fresnel *
         clearcoat_distribution * clearcoat_geometry /
-        max(4.0 * n_dot_l * n_dot_v, 1e-5);
+        max(4.0 * n_dot_l * n_dot_v, 1e-12);
     const float shadow = saturate(light_radiance_range.w);
-    const float occlusion = lerp(
-        1.0,
-        saturate(occlusion_texture.Sample(linear_clamp_sampler, input.uv).r),
-        saturate(surface_factors.w));
     const float3 direct = (diffuse + specular + clearcoat_specular) *
         (n_dot_l * light_radiance_range.rgb * shadow);
-    const float3 ambient = base_color * (0.03 * occlusion);
-    const float3 emissive = emissive_texture.Sample(linear_clamp_sampler, input.uv).rgb *
-        emissive_radiance_and_f0.rgb;
+    const float3 emissive = emissive_texture.Sample(linear_clamp_sampler, input.uv).rgb * emissive_radiance_and_f0.rgb;
     const float alpha = sampled_base.a * base_color_factor.a;
     // A negative light-direction w encodes masked alpha and its cutoff. The
     // positive path remains opaque/blended-compatible for the current pass.
     if (light_direction_intensity.w < 0.0 &&
         alpha < -light_direction_intensity.w) discard;
-    const float3 hdr = max(direct + ambient + emissive, 0.0) *
-        exp2(camera_position_exposure.w);
+    // Direct-light material evaluation always produces unexposed linear HDR.
+    // Environment light is not replaced by an ambient color/AO surrogate.
+    // Camera exposure, tone mapping and encoding belong to the display pass.
+    float3 hdr = ((n_dot_l > 0.0 && n_dot_v > 0.0) ? direct : 0.0) + emissive;
     return float4(hdr, alpha);
 }
+
