@@ -67,11 +67,11 @@ checkout.
   recipe identity, population bounds, and canonical persistence fail closed;
   runtime materialization and adaptive selection are deliberately absent.
 - `carto_project` persists authoring state in a versioned, deterministic text
-  format with pre-commit validation and atomic replacement. New saves use v9,
-  including optional graph reference, topology lineage, mesh attributes/UVs,
-  generic scientific state, the five-primitive world model, and durable source
-  texture/material/sampler/variant assignments plus a stable project source
-  namespace; v1-v8 projects remain readable.
+  format with pre-commit validation and atomic replacement. New saves use schema
+  v40; the reader accepts versions v1-v40 subject to each version's validation
+  and migration rules. The format retains graph references, topology lineage,
+  mesh attributes/UVs, scientific and world records, material assignments, and
+  the stable project source namespace. Older readers may reject newer saves.
   Render caches are not serialized as project truth.
 - `carto_scientific` provides typed, provider-neutral regions, fields, studies,
   results, probes, parameters, provenance, a bounded morphology structure graph,

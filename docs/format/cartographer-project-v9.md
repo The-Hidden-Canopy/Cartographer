@@ -1,8 +1,9 @@
 # Cartographer project format v9
 
-Cartographer v9 is the current deterministic `.carto` authoring format. It
+Cartographer v9 is a historical deterministic `.carto` authoring format. It
 retains every v8 record and adds one required stable source namespace near the
-document header:
+document header. The current writer uses schema v40; v9 remains a supported
+input subject to its validation and migration rules:
 
 ```text
 CARTOGRAPHER_PROJECT 9

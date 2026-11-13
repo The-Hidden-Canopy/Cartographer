@@ -19,20 +19,20 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 
 ## 0.1 - current foundation
 
-- [ ] validate glTF/GLB float32 geometry orientation and large-coordinate admission: implementation and regression source exist; build, geometry-parity tests, consumer import, and visual acceptance remain pending ([scope and evidence](verification/gltf-float32-geometry-fidelity.md))
+- [ ] validate glTF/GLB float32 geometry orientation and large-coordinate admission: the 2026-11-12 integrated build and headless suite are recorded above; target-consumer import and visual acceptance remain pending ([scope and evidence](verification/gltf-float32-geometry-fidelity.md))
 
-- [ ] validate glTF/GLB float32 UV preservation using the shared orientation gate: code and regression cases are implemented; build, format-level tests, consumer import, and visual acceptance remain pending ([scope and evidence](verification/gltf-float32-uv-fidelity.md))
+- [ ] validate glTF/GLB float32 UV preservation using the shared orientation gate: the 2026-11-12 integrated build and headless suite are recorded above; target-consumer import and visual acceptance remain pending ([scope and evidence](verification/gltf-float32-uv-fidelity.md))
 
-- [ ] validate native PBR float32 geometry/UV orientation preservation: fail-closed upload checks and regression cases are implemented, with build, CTest, and GPU/visual acceptance pending ([scope and evidence](verification/pbr-float32-fidelity.md))
+- [ ] validate native PBR float32 geometry/UV orientation preservation: the 2026-11-12 integrated headless suite includes local D3D12 scene-renderer cases; interactive native-window and visual acceptance remain pending ([scope and evidence](verification/pbr-float32-fidelity.md))
 
-- [ ] validate mirrored-UV generated tangent-domain preservation: source and regression cases are implemented, but build, CTest, and normal-map visual acceptance remain pending ([scope and evidence](verification/mirrored-uv-tangent-domains.md))
+- [ ] validate mirrored-UV generated tangent-domain preservation: the 2026-11-12 integrated build and headless suite are recorded above; normal-map visual acceptance remains pending ([scope and evidence](verification/mirrored-uv-tangent-domains.md))
 
 - [ ] Accept source-only signed saved-scene anisotropy: explicit UV0 tangents,
   zero-preserving specular mixture, source/cache identity and direct-light
   reference/axis/persistence checks. The bounded UV0 normal-map continuation
   adds shortest-rotation shading frames and both conventions; rotated/reflected
-  maps, anisotropic environment integration, shader/build execution and
-  visual/energy acceptance remain open. See
+  maps, anisotropic environment integration and visual/energy acceptance remain
+  open. The integrated build and headless suite are recorded above. See
   [the normal-map handoff](verification/saved-scene-anisotropic-normal-20261112.md)
   and [the original handoff](verification/saved-scene-anisotropy-20261112.md).
 
@@ -40,13 +40,14 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
   graph scalar, bounded Charlie/Neubelt base-layer mixture, exact request/cache
   binding, direct-light reference/pixel and persistence coverage. No sheen IBL,
   independent sheen roughness/color texture, measured cloth or energy acceptance;
-  build and execution remain pending. See
+  the integrated build and headless suite are recorded above. See
   [the handoff](verification/saved-scene-sheen-20261112.md).
 
 - [ ] Accept the source-only saved-scene graph opacity continuation: independent
   alpha/opacity bounds, multiplicative coverage, unchanged authored alpha mode
-  and cutoff, saved-project replay and native masked/blended parity. Build,
-  focused preparation tests and GPU acceptance remain unrun; see
+  and cutoff, saved-project replay and native masked/blended parity. The
+  integrated headless suite and local D3D12 cases are recorded above;
+  interactive visual acceptance remains open. See
   [the handoff](verification/saved-scene-graph-opacity-20261112.md).
 
 - [x] projection-aware Front/Right surface and edge picking preserves affine source anchors and foreground ordering while retaining perspective reciprocal interpolation and existing source-admission gates

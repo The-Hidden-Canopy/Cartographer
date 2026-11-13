@@ -1,9 +1,10 @@
 # Cartographer project format v1
 
-This is the legacy format. Cartographer continues to read it for migration,
-but new saves use [project format v9](cartographer-project-v9.md), which adds
-the v2 authoring/units/coordinate-system envelope, the optional graph
-reference, and the bounded topology receipt ledger.
+This is the legacy v1 format. The current reader accepts it subject to v1
+validation and migration, while new saves use project schema v40. The later
+[v9 format](cartographer-project-v9.md) added a stable source namespace on top
+of the earlier authoring, coordinate-system, graph, and topology records.
+Newer-schema saves need a reader that supports their version.
 
 The 0.1 project format is a deterministic, line-oriented text format intended
 to make failures diagnosable before a binary chunk store exists. It is not
