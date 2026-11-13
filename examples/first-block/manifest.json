@@ -1,0 +1,18 @@
+{
+  "example": "First Block",
+  "generator": 2,
+  "generator_cli_version": "0.1.0",
+  "project_format": "CARTOGRAPHER_PROJECT 34",
+  "source_namespace": "cartographer.project.examples.first-block",
+  "external_asset_dependencies": [],
+  "files": {
+    "first-block.carto": {
+      "bytes": 2579,
+      "sha256": "e8c3a15fe7f8274a0eab0f7bcfcaf037a6cba09dd8db69efd15802d25442936f"
+    },
+    "first-block.obj": {
+      "bytes": 607,
+      "sha256": "01ecf3fe69a8451f676492111b5981de5ba9a0b3d49cf621c5ab8cc2d52cc012"
+    }
+  }
+}

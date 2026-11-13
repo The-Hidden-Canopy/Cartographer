@@ -1,0 +1,24 @@
+# First Block - original Cartographer first-use example
+# Created for this package; no external source assets or textures.
+# Units: meters. Coordinate system: right-handed, +Y up.
+# CARTOGRAPHER_FACE_MATERIAL_REGIONS 1 condition.material_region
+# CARTOGRAPHER_FACE_MATERIAL 1 1
+# CARTOGRAPHER_FACE_MATERIAL 2 1
+# CARTOGRAPHER_FACE_MATERIAL 3 1
+# CARTOGRAPHER_FACE_MATERIAL 4 1
+# CARTOGRAPHER_FACE_MATERIAL 5 1
+# CARTOGRAPHER_FACE_MATERIAL 6 1
+v -1 0 -0.75
+v 1 0 -0.75
+v 1 0.5 -0.75
+v -1 0.5 -0.75
+v -1 0 0.75
+v 1 0 0.75
+v 1 0.5 0.75
+v -1 0.5 0.75
+f 1 4 3 2
+f 5 6 7 8
+f 1 2 6 5
+f 4 8 7 3
+f 1 5 8 4
+f 2 3 7 6

@@ -131,3 +131,6 @@ imgui.ini
 
 # Local-only work queue; never publish workstation task tracking.
 /docs/CARTOGRAPHER_WORK_QUEUE.local.md
+
+# This OBJ is a source example, not a compiler object file.
+!examples/first-block/first-block.obj
