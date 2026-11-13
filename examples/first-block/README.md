@@ -10,7 +10,7 @@ First Block is an original practice asset: one rectangular block, 2 x 0.5 x 1.5 
 - `generate_example.py`: standard-library-only regeneration script; requires a Cartographer CLI.
 - `PROVENANCE.md`: asset origin and format notes.
 
-The current source declares schema 40 and a minimum readable schema of 1. Opening and re-saving this example in the current native application has not been revalidated. The OBJ can also be used to exercise mesh import; its `CARTOGRAPHER_FACE_MATERIAL*` comments are Cartographer metadata that other OBJ readers may ignore. It contains no material library or textures.
+The current source declares schema 40 and a minimum readable schema of 1. The native desktop application opens this example and re-saves it as schema 40 (2026-11-13): the re-saved project validates through the CLI with the same object, mesh, identity and material regions, adding only the newer format's catalog versions and empty sections. Keep the committed file at schema 34 so its manifest hashes stay valid. The OBJ can also be used to exercise mesh import; its `CARTOGRAPHER_FACE_MATERIAL*` comments are Cartographer metadata that other OBJ readers may ignore. It contains no material library or textures.
 
 ## Rebuild without downloads
 
