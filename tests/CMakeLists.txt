@@ -2447,3 +2447,7 @@ add_test(NAME cartographer_starter_material_library_tests
     COMMAND cartographer_starter_material_library_tests
             "${CMAKE_SOURCE_DIR}/examples/material-libraries/starter-surfaces.gltf")
 
+add_executable(cartographer_sculpt_export_tests sculpt_export_tests.cpp)
+target_link_libraries(cartographer_sculpt_export_tests PRIVATE carto_application)
+carto_target(cartographer_sculpt_export_tests)
+add_test(NAME cartographer_sculpt_export_tests COMMAND cartographer_sculpt_export_tests)

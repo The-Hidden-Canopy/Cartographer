@@ -1,6 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #define VK_USE_PLATFORM_WIN32_KHR
+
+#include <carto/application/sculpt_export.hpp>
 #define IMGUI_DEFINE_MATH_OPERATORS
 
 #if defined(CARTO_DESKTOP_D3D12_UI) && !defined(CARTO_DESKTOP_D3D12_COMPILE_CHECK)
@@ -8937,6 +8939,12 @@ struct DesktopState {
                         L"Cartographer export failed", MB_OK | MB_ICONERROR);
             return;
         }
+        // Scene export currently consumes source meshes, not evaluated sculpt.
+        if (!document.value().sculpt_stacks().empty()) {
+            MessageBoxW(window, L"glTF/GLB export cannot yet include authored sculpt. With a sculpt evaluator installed, export an evaluated OBJ, PLY, or STL mesh instead.",
+                        L"Cartographer export unavailable", MB_OK | MB_ICONWARNING);
+            return;
+        }
         const auto report = binary_container
             ? carto::io::export_glb(document.value(), *path, carto::io::GltfExportOptions{*snapshot.project_path,{},export_bake_graphs?export_bake_resolution:0U})
             : carto::io::export_gltf(document.value(), *path, carto::io::GltfExportOptions{*snapshot.project_path,{},export_bake_graphs?export_bake_resolution:0U});
@@ -9237,8 +9245,38 @@ struct DesktopState {
                         L"Cartographer export scope required", MB_OK | MB_ICONWARNING);
             return;
         }
+        const auto& source_mesh = document.value().meshes().at(resolved_mesh.value());
+        std::optional<carto::geometry::EditableMesh> evaluated_mesh;
+        const auto stored_sculpt = document.value().sculpt_stacks().find(resolved_mesh.value());
+        if (stored_sculpt != document.value().sculpt_stacks().end()) {
+#ifdef CARTO_HAS_SCULPT_PREVIEW_PROVIDER
+            auto stack = carto::production::SculptStack::deserialize(stored_sculpt->second.bytes);
+            if (!stack) {
+                MessageBoxW(window, wide(stack.error().message).c_str(),
+                            L"Cartographer sculpt export failed", MB_OK | MB_ICONERROR);
+                return;
+            }
+            auto provider = carto::sculpt_preview::make_provider();
+            if (!provider) {
+                MessageBoxW(window, L"The sculpt evaluator is unavailable; export was not written.",
+                            L"Cartographer sculpt export failed", MB_OK | MB_ICONERROR);
+                return;
+            }
+            auto result = carto::application::materialize_sculpt_for_export(source_mesh, stack.value(), *provider);
+            if (!result) {
+                MessageBoxW(window, wide(result.error().message).c_str(),
+                            L"Cartographer sculpt export failed", MB_OK | MB_ICONERROR);
+                return;
+            }
+            evaluated_mesh = std::move(result.value());
+#else
+            MessageBoxW(window, L"This mesh has authored sculpt, but this build has no sculpt evaluator. Export was not written.",
+                        L"Cartographer export unavailable", MB_OK | MB_ICONWARNING);
+            return;
+#endif
+        }
         const auto export_mesh = [&]() -> carto::core::Result<carto::io::IoReport> {
-            const auto& mesh = document.value().meshes().at(resolved_mesh.value());
+            const auto& mesh = evaluated_mesh.has_value() ? *evaluated_mesh : source_mesh;
             if (format == StandardMeshExport::obj) return carto::io::export_obj(mesh, *path);
             if (format == StandardMeshExport::ply) return carto::io::export_ply(mesh, *path);
             return carto::io::export_stl(mesh, *path);

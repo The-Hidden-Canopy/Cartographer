@@ -14,7 +14,8 @@ namespace carto::application {
 // provider; its evaluator is not part of this repository. Implementations must
 // not mutate the source mesh or the stack, must keep the source's vertex and
 // face identities, and must fail instead of returning the unevaluated source.
-// The result is disposable display geometry, never authoring truth.
+// The result is disposable derived geometry, never authoring truth. It may also
+// be materialized for explicit mesh export after identity/topology validation.
 class SculptPreviewProvider {
 public:
     virtual ~SculptPreviewProvider() = default;
