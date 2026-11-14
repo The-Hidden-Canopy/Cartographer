@@ -2441,8 +2441,9 @@ endif()
 
 # Ensure the shipped starter library stays within the actual material-import profile.
 add_executable(cartographer_starter_material_library_tests starter_material_library_smoke.cpp)
-target_link_libraries(cartographer_starter_material_library_tests PRIVATE carto_io)
+target_link_libraries(cartographer_starter_material_library_tests PRIVATE carto_io carto_application)
 carto_target(cartographer_starter_material_library_tests)
 add_test(NAME cartographer_starter_material_library_tests
     COMMAND cartographer_starter_material_library_tests
             "${CMAKE_SOURCE_DIR}/examples/material-libraries/starter-surfaces.gltf")
+
