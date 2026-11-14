@@ -31,6 +31,11 @@ template <class T> T need(core::Result<T> r) {
 }
 using Object = std::vector<core::json::Member>;
 Object object(std::string_view s) { return need(core::json::parse_object(s)); }
+// Allow only the exporter provenance path, capped at the face admission limit.
+// Each caller supplies the remaining path when reparsing a nested object.
+Object provenance_object(std::string_view s, std::vector<std::string_view> path) {
+    return need(core::json::parse_object_with_numeric_array_limit(s, std::move(path), 200000U));
+}
 std::string_view get(const Object &o, std::string_view key, std::string_view fallback = "") {
     const auto *p = core::json::find_member(o, key);
     return p ? p->raw_value : fallback;
@@ -269,7 +274,7 @@ core::Result<std::vector<std::uint8_t>> capture_gltf_scene_source(
     try {
         const auto contents = container(bytes);
         if (!contents.external.empty()) throw std::runtime_error("source packages cannot be recaptured as files");
-        const auto root = object(contents.json);
+        const auto root = provenance_object(contents.json, {"meshes", "primitives", "extras", "cartographer_triangle_faces"});
         std::vector<std::pair<std::string, std::vector<std::uint8_t>>> captured;
         std::uint64_t total = bytes.size();
         const auto capture_uri = [&](std::string_view uri, std::size_t limit) {
@@ -316,7 +321,7 @@ core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::u
         if (bytes.empty() || bytes.size() > 128U * 1024U * 1024U)
             throw std::runtime_error("material library source must be within 128 MiB");
         const auto contents = container(bytes);
-        const auto root = object(contents.json);
+        const auto root = provenance_object(contents.json, {"meshes", "primitives", "extras", "cartographer_triangle_faces"});
         const auto asset = object(get(root, "asset"));
         const auto profile = object(get(object(get(root, "extras", "{}")), "cartographer", "{}"));
         if (text(get(asset, "version")) != "2.0" ||
@@ -645,7 +650,7 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
                                                   GltfSceneImportOptions options) {
     try {
         const auto contents = container(bytes);
-        const auto root = object(contents.json);
+        const auto root = provenance_object(contents.json, {"meshes", "primitives", "extras", "cartographer_triangle_faces"});
         fields(root,
                {"asset", "scene", "scenes", "nodes", "meshes", "buffers", "bufferViews",
                 "accessors", "materials", "textures", "images", "samplers", "extensionsUsed",
@@ -737,7 +742,7 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
         const auto source_material_count = result.materials.catalog.materials().size();
         std::optional<std::uint64_t> default_material;
         for (auto raw_mesh : mesh_sources) {
-            const auto source = object(raw_mesh);
+            const auto source = provenance_object(raw_mesh, {"primitives", "extras", "cartographer_triangle_faces"});
             fields(source, {"name", "primitives", "extras"});
             if (const auto extra = get(source, "extras"); !extra.empty() && extra.front() == '{')
                 omitted_source_regions = omitted_source_regions ||
@@ -749,10 +754,10 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
             std::set<attributes::UvSetId> uv_ids;
             bool any_uv = false, any_tangent = false, missing_tangent = false;
             for (auto raw : array(get(source, "primitives"), 128)) {
-                const auto primitive = object(raw);
+                const auto primitive = provenance_object(raw, {"extras", "cartographer_triangle_faces"});
                 fields(primitive, {"attributes", "indices", "material", "mode", "extras"});
                 if (const auto extra = get(primitive, "extras"); !extra.empty() && extra.front() == '{') {
-                    const auto metadata = object(extra);
+                    const auto metadata = provenance_object(extra, {"cartographer_triangle_faces"});
                     omitted_source_regions = omitted_source_regions ||
                         !get(metadata, "cartographer_material_region").empty() ||
                         !get(metadata, "condition_material_region").empty() ||

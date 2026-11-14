@@ -135,7 +135,10 @@ inline Result<std::string> decode_string_token(std::string_view token) {
 
 class Parser {
 public:
-    explicit Parser(std::string_view text) : text_(text) {}
+    explicit Parser(std::string_view text, std::vector<std::string_view> large_numeric_array_path = {},
+                    std::size_t large_numeric_array_limit = 0U)
+        : text_(text), large_numeric_array_path_(std::move(large_numeric_array_path)),
+          large_numeric_array_limit_(large_numeric_array_limit) {}
 
     [[nodiscard]] Result<std::vector<Member>> parse_object() {
         skip_space();
@@ -243,7 +246,7 @@ private:
         return Result<void>::success();
     }
 
-    [[nodiscard]] Result<void> parse_array_body() {
+    [[nodiscard]] Result<void> parse_array_body(bool large_numeric_array = false) {
         if (depth_ >= kMaxDepth) {
             return Result<void>::failure(malformed("JSON nesting exceeds the safety limit"));
         }
@@ -260,8 +263,14 @@ private:
         }
         std::size_t elements = 0U;
         while (true) {
-            if (++elements > kMaxMembers) {
+            if (++elements > (large_numeric_array ? large_numeric_array_limit_ : kMaxMembers)) {
                 return Result<void>::failure(malformed("JSON array exceeds the member limit"));
+            }
+            // The exception is only for scalar numeric provenance, never nested
+            // objects or arrays that could multiply parser work or allocations.
+            if (large_numeric_array && (cursor_ >= text_.size() ||
+                (text_[cursor_] != '-' && (text_[cursor_] < '0' || text_[cursor_] > '9')))) {
+                return Result<void>::failure(malformed("JSON provenance array must contain numbers"));
             }
             if (auto result = parse_value(); !result) return result;
             skip_space();
@@ -344,9 +353,14 @@ private:
             ++cursor_;
             skip_space();
             const std::size_t value_start = cursor_;
-            if (auto result = parse_value(); !result) {
-                return Result<std::vector<Member>>::failure(result.error());
-            }
+            path_.push_back(key.value());
+            const bool large_array = !large_numeric_array_path_.empty() &&
+                path_.size() == large_numeric_array_path_.size() &&
+                std::equal(path_.begin(), path_.end(), large_numeric_array_path_.begin()) &&
+                cursor_ < text_.size() && text_[cursor_] == '[';
+            auto parsed = large_array ? parse_array_body(true) : parse_value();
+            path_.pop_back();
+            if (!parsed) return Result<std::vector<Member>>::failure(parsed.error());
             const std::size_t value_end = cursor_;
             if (std::any_of(members.begin(), members.end(), [&key](const Member& member) {
                     return member.key == key.value();
@@ -371,6 +385,9 @@ private:
     }
 
     std::string_view text_;
+    std::vector<std::string_view> large_numeric_array_path_;
+    std::vector<std::string> path_;
+    std::size_t large_numeric_array_limit_;
     std::size_t cursor_ = 0U;
     std::size_t depth_ = 0U;
 };
@@ -379,6 +396,12 @@ private:
 
 [[nodiscard]] inline Result<std::vector<Member>> parse_object(std::string_view text) {
     return detail::Parser(text).parse_object();
+}
+
+// Opt-in for one path to a numeric array; all other JSON safety limits remain unchanged.
+[[nodiscard]] inline Result<std::vector<Member>> parse_object_with_numeric_array_limit(
+    std::string_view text, std::vector<std::string_view> path, std::size_t limit) {
+    return detail::Parser(text, std::move(path), limit).parse_object();
 }
 
 [[nodiscard]] inline Result<std::string> decode_string(std::string_view token) {

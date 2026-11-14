@@ -2,6 +2,7 @@
 #include "gltf_test_payload.hpp"
 #include "scene_import_test_support.hpp"
 #include <carto/io/generated_mesh.hpp>
+#include <carto/core/json.hpp>
 #include <carto/io/gltf_scene_import.hpp>
 #include <carto/production/authoring_viewport.hpp>
 #include <sstream>
@@ -79,6 +80,37 @@ void reject(const std::vector<std::uint8_t> &bytes, const char *reason) {
 } // namespace
 int main(int argc, char **argv) {
     try {
+        // The large exception is bounded, numeric-only and opt-in. Ordinary
+        // arrays and all default parser users retain the original limit.
+        const auto make_array = [](std::size_t count) {
+            std::string a = "[";
+            for (std::size_t i = 0; i < count; ++i) { if (i) a += ','; a += '1'; }
+            return a + "]";
+        };
+        const auto large = make_array(107390);
+        const auto metadata = std::string("{\"cartographer_triangle_faces\":") + large + "}";
+        check(!core::json::parse_object(metadata), "default JSON limit remains intact");
+        check(bool(core::json::parse_object_with_numeric_array_limit(metadata, {"cartographer_triangle_faces"}, 200000)),
+              "large numeric provenance is accepted");
+        check(!core::json::parse_object_with_numeric_array_limit(
+                  std::string("{\"cartographer_triangle_faces\":") + make_array(200001) + "}",
+                  {"cartographer_triangle_faces"}, 200000), "provenance bound enforced");
+        check(!core::json::parse_object_with_numeric_array_limit(
+                  "{\"cartographer_triangle_faces\":[[1]]}", {"cartographer_triangle_faces"}, 200000),
+              "nested provenance entries rejected");
+        check(!core::json::parse_object_with_numeric_array_limit(
+                  std::string("{\"unrelated\":") + make_array(4097) + "}",
+                  {"cartographer_triangle_faces"}, 200000), "unrelated array bound preserved");
+        check(!core::json::parse_object_with_numeric_array_limit(
+                  "{\"cartographer_triangle_faces\":[1],\"cartographer_triangle_faces\":[2]}",
+                  {"cartographer_triangle_faces"}, 200000), "duplicate provenance keys rejected");
+        check(!core::json::parse_object_with_numeric_array_limit(
+                  std::string("{\"other\":{\"cartographer_triangle_faces\":") + make_array(4097) + "}}",
+                  {"meshes", "primitives", "extras", "cartographer_triangle_faces"}, 200000),
+              "same key outside the schema path remains bounded");
+        const auto with_metadata = replace(fixture(), "\"indices\":4,\"material\":0}",
+                  std::string("\"indices\":4,\"material\":0,\"extras\":") + metadata + "}");
+        check(bool(io::import_gltf_scene(with_metadata)), "large provenance scene imports");
         const auto root =
             std::filesystem::temp_directory_path() /
             ("static-gltf-import-" +
