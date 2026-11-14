@@ -4635,6 +4635,23 @@ void explicit_temporal_resolve_uses_bound_history_and_resets_on_cut(
 void graph_occlusion_values_reach_native_pixels(d3d12::D3D12Device& device) {
     for (double occlusion : {0.0, 0.25, 1.0}) {
         auto document = room_project(); auto catalog = document.material_catalog();
+        std::vector<d3d12::SceneRenderTexture> source_textures;
+        if (occlusion == 0.25) {
+            auto map = texture(52U, {0U, 0U, 0U, 255U}, assets::TextureSemantic::occlusion);
+            project::TextureSourceRecord source;
+            source.id = map.asset; source.name = "Synthetic AO";
+            source.relative_locator = "fixtures/ao.tga";
+            source.content_digest = map.current_source_digest;
+            source.format = assets::TextureSourceFormat::tga;
+            source.width = source.height = 1U; source.provenance = "synthetic AO test";
+            take(catalog.insert_texture(source));
+            auto authored = catalog.materials().at(1U);
+            authored.definition.occlusion.asset = source.id;
+            authored.definition.occlusion_strength = 0.5;
+            authored.revision = authored.revision.next();
+            take(catalog.replace_material(authored));
+            source_textures.push_back(std::move(map));
+        }
         project::MaterialGraph graph; graph.identity = "fixture/occlusion"; graph.revision = core::Revision{1U};
         project::MaterialGraphNode color; color.id = 1U; color.kind = project::MaterialGraphNodeKind::constant_color;
         color.value_type = project::MaterialGraphValueType::color; color.constants = {1.0, 1.0, 1.0, 1.0};
@@ -4649,8 +4666,14 @@ void graph_occlusion_values_reach_native_pixels(d3d12::D3D12Device& device) {
             static_cast<bool>(document.set_material_catalog(std::move(catalog))), "source graph occlusion fixture admits");
         const auto before = document.serialize();
         d3d12::SceneRenderCamera camera; camera.position = {0.0, 5.0, 3.0}; camera.target = {0.0, -0.1, 0.0};
-        auto prepared = take(d3d12::prepare_project_scene_render("graph-occlusion", document, camera, 96U, 96U, {},
+        auto prepared = take(d3d12::prepare_project_scene_render("graph-occlusion", document, camera, 96U, 96U, source_textures,
             {{0.0, 1.0, 0.0}, {0.0, 0.0, 0.0}}));
+        if (occlusion == 0.25) {
+            const auto& binding = prepared.objects.front().materials.front();
+            require(binding.graph_occlusion == 0.25 &&
+                binding.current_material.definition.occlusion_strength == 0.5,
+                "graph AO preparation retains independent authored map strength");
+        }
         std::erase_if(prepared.objects, [&](const auto& rendered) {
             return document.scene().find(rendered.object)->name != "Floor";
         });
@@ -4658,7 +4681,7 @@ void graph_occlusion_values_reach_native_pixels(d3d12::D3D12Device& device) {
         const std::size_t center = (48U * 96U + 48U) * 4U;
         require(image.depth[center / 4U] < 1.0F, "occlusion test covers actual floor geometry");
         for (std::size_t channel = 0U; channel < 3U; ++channel)
-            require(std::abs(image.linear_hdr_rgba[center + channel] - 0.03 * occlusion) < 0.000001,
+            require(std::abs(image.linear_hdr_rgba[center + channel] - 0.03 * occlusion * (occlusion == 0.25 ? 0.5 : 1.0)) < 0.000001,
                 "graph occlusion must affect native ambient pixels, not only prepared metadata");
         require(document.serialize() == before, "native graph rendering never edits the source project");
     }
@@ -4676,6 +4699,35 @@ void graph_occlusion_values_reach_native_pixels(d3d12::D3D12Device& device) {
     const auto image = capture(device, bound);
     require(std::abs(image.linear_hdr_rgba[center] - 0.03) < 0.000001,
         "zero authored texture strength still disables the bound occlusion map");
+    material.occlusion = {}; material.occlusion_strength = 0.0;
+    bound.textures.clear();
+    rebind(bound.objects[0U]);
+    const auto no_map = capture(device, bound);
+    require(std::abs(no_map.linear_hdr_rgba[center] - 0.03) < 0.000001,
+        "unbound map strength must not darken ambient light");
+    material.occlusion.asset = 52U; material.occlusion_strength = 0.5;
+    bound.textures.push_back(texture(52U, {0U, 0U, 0U, 255U}, assets::TextureSemantic::occlusion));
+    bound.objects[0U].materials[0U].graph_occlusion = 0.25;
+    rebind(bound.objects[0U]);
+    const auto composed = capture(device, bound);
+    require(std::abs(composed.linear_hdr_rgba[center] - 0.00375) < 0.000001,
+        "graph AO multiplies the independently strength-weighted texture AO");
+    const auto composed_digest = take(bound.digest());
+    d3d12::SceneRenderCache cache;
+    const auto cached_before = take(d3d12::render_scene_cached(device, cache, bound, CARTO_D3D12_SHADER_DIR));
+    bound.objects[0U].materials[0U].graph_occlusion = 0.5;
+    require(take(bound.digest()) != composed_digest,
+        "graph AO changes request identity");
+    const auto cached_after = take(d3d12::render_scene_cached(device, cache, bound, CARTO_D3D12_SHADER_DIR));
+    const auto fresh_after = capture(device, bound);
+    require(cached_after.linear_hdr_rgba == fresh_after.linear_hdr_rgba &&
+            cached_after.pixel_digest == fresh_after.pixel_digest &&
+            cached_after.linear_hdr_rgba != cached_before.linear_hdr_rgba,
+        "AO-only change invalidates cached mesh payload and matches fresh render");
+    for (double invalid : {-0.01, 1.01, std::numeric_limits<double>::quiet_NaN()}) {
+        bound.objects[0U].materials[0U].graph_occlusion = invalid;
+        require(!bound.validate(), "invalid graph AO refuses before rendering");
+    }
 }
 
 void graph_opacity_reaches_native_coverage(d3d12::D3D12Device& device) {

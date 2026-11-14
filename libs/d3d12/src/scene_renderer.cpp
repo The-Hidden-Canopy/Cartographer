@@ -171,6 +171,7 @@ struct SceneMaterialUvState {
     std::array<std::array<float, 4U>, 5U> channel_mappings{};
     float sheen_weight = 0.0F;
     float anisotropy = 0.0F;
+    float graph_occlusion = 1.0F;
 };
 
 Result<UvAffine> texture_uv_affine(const render::TextureTransform& transform) {
@@ -640,6 +641,7 @@ assets::Sha256Digest request_digest(const SceneRenderRequest& request) {
                 ? static_cast<std::uint64_t>(*binding.material_slot) + 1U : 0U);
             append_double(data, binding.sheen_weight);
             append_double(data, binding.anisotropy);
+            append_double(data, binding.graph_occlusion);
             for (const auto sampler : material_draw_samplers(
                      binding.current_material.definition))
                 append_u64(data, sampler);
@@ -705,7 +707,7 @@ assets::Sha256Digest request_digest(const SceneRenderRequest& request) {
 }
 
 assets::Sha256Digest mesh_cache_identity(const SceneRenderRequest& request) {
-    constexpr std::string_view domain = "carto.d3d12.scene-mesh-cache.v9";
+    constexpr std::string_view domain = "carto.d3d12.scene-mesh-cache.v10";
     std::vector<std::uint8_t> data(domain.begin(), domain.end());
     append_u64(data, request.source_revision.value());
     append_digest(data, request.source_digest);
@@ -738,6 +740,7 @@ assets::Sha256Digest mesh_cache_identity(const SceneRenderRequest& request) {
                 ? static_cast<std::uint64_t>(*binding.material_slot) + 1U : 0U);
             append_double(data, binding.sheen_weight);
             append_double(data, binding.anisotropy);
+            append_double(data, binding.graph_occlusion);
             for (const auto& mapping : material_draw_channel_mappings(
                      binding.current_material.definition)) {
                 for (const float selector : mapping)
@@ -1662,6 +1665,10 @@ Result<void> SceneRenderRequest::validate() const {
                     binding.material, binding.source_identity,
                     binding.current_material); !valid) return valid;
             const auto& definition = binding.current_material.definition;
+            if (!std::isfinite(binding.graph_occlusion) || binding.graph_occlusion < 0.0 ||
+                binding.graph_occlusion > 1.0) {
+                return core::Result<void>::failure(invalid("scene graph occlusion must be in [0, 1]"));
+            }
             if (!std::isfinite(binding.anisotropy) || binding.anisotropy < -1.0 ||
                 binding.anisotropy > 1.0) {
                 return Result<void>::failure(invalid(
@@ -1855,7 +1862,8 @@ Result<SceneRenderImage> render_scene_impl(
                         material_draw_channel_mappings(
                             binding.current_material.definition),
                         static_cast<float>(binding.sheen_weight),
-                        static_cast<float>(binding.anisotropy)}).second) {
+                        static_cast<float>(binding.anisotropy),
+                        static_cast<float>(binding.graph_occlusion)}).second) {
                 return Result<SceneRenderImage>::failure(invalid(
                     "scene material UV transforms contain a duplicate slot"));
             }
@@ -2507,7 +2515,9 @@ Result<SceneRenderImage> render_scene_impl(
                 if (texture_id(material, 2U) == 0U) surface_factors[2U] = 0.0F;
                 const auto& channel_mappings = transforms.value().channel_mappings;
                 const std::array<float, 4U> material_flags{
-                    texture_id(material, 3U) != 0U ? 1.0F : 0.0F,
+                    texture_id(material, 3U) != 0U
+                        ? 1.0F + transforms.value().graph_occlusion
+                        : -transforms.value().graph_occlusion,
                     channel_mappings[0U][0U], channel_mappings[0U][1U],
                     channel_mappings[0U][2U]};
                 const std::array<float, 4U> channel_mapping_a{

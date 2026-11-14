@@ -93,7 +93,7 @@ core::Result<void> apply_evaluated_material_graph(
     const project::MaterialGraph& graph,
     const project::MaterialGraphEvaluation& evaluation,
     render::StandardMaterial& material,
-    double& sheen_weight, double& anisotropy) {
+    double& sheen_weight, double& anisotropy, double& graph_occlusion) {
     const auto& outputs = graph.outputs;
     if (outputs.normal != 0U) {
         return core::Result<void>::failure({core::ErrorCode::unsupported,
@@ -152,8 +152,11 @@ core::Result<void> apply_evaluated_material_graph(
     material.metallic = metallic.components[0U];
 
     if (outputs.occlusion != 0U) {
-        material.occlusion_strength =
-            evaluation.node_values.at(outputs.occlusion).components[0U];
+        graph_occlusion = evaluation.node_values.at(outputs.occlusion).components[0U];
+        if (!coverage_in_range(graph_occlusion)) {
+            return core::Result<void>::failure({core::ErrorCode::validation_failed,
+                "native scene graph occlusion must be in [0, 1]"});
+        }
     }
     if (outputs.emissive != 0U) {
         const auto& emissive = evaluation.node_values.at(outputs.emissive);
@@ -426,6 +429,7 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
         assets::Sha256Digest digest;
         double sheen_weight = 0.0;
         double anisotropy = 0.0;
+        double graph_occlusion = 1.0;
     };
     std::size_t project_graph_evaluation_nodes = 0U;
     std::map<render::MaterialId, GraphMaterialFactors> graph_material_factors;
@@ -488,6 +492,7 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
             material.definition = resolved.value();
             double sheen_weight = 0.0;
             double anisotropy = 0.0;
+            double graph_occlusion = 1.0;
             std::string identity = "project/" + std::string(project_identity) + "/material/" + std::to_string(material.id);
             if (authored.variant.has_value()) identity += "/variant/" + std::to_string(*authored.variant);
 
@@ -547,7 +552,7 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
                     }
                     if (auto applied = apply_evaluated_material_graph(
                             graph->second, evaluation.value(), material.definition,
-                            sheen_weight, anisotropy); !applied) {
+                            sheen_weight, anisotropy, graph_occlusion); !applied) {
                         return Output::failure(applied.error());
                     }
                     const std::string graph_context =
@@ -559,11 +564,12 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
                         graph_context.size()});
                     factors = graph_material_factors.emplace(authored.material,
                         GraphMaterialFactors{material.definition, evaluated_graph_digest,
-                            sheen_weight, anisotropy}).first;
+                            sheen_weight, anisotropy, graph_occlusion}).first;
                 } else {
                     material.definition = factors->second.definition;
                     sheen_weight = factors->second.sheen_weight;
                     anisotropy = factors->second.anisotropy;
+                    graph_occlusion = factors->second.graph_occlusion;
                 }
                 identity += "/graph/" + factors->second.digest.hex();
             }
@@ -585,7 +591,7 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
             const auto artifact = compile_scene_render_material_artifact(identity, material);
             if (!artifact) return Output::failure(artifact.error());
             rendered.materials.push_back({submesh.material_slot, identity, material,
-                artifact.value(), sheen_weight, anisotropy});
+                artifact.value(), sheen_weight, anisotropy, graph_occlusion});
             bindings.push_back({submesh.material_slot, artifact.value()});
         }
         std::set<render::UvSetId> requested_uv_sets;
