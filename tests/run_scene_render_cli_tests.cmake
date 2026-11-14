@@ -90,6 +90,31 @@ foreach(frame first repeat)
         message(FATAL_ERROR "Fixed project/camera/device capture is not reproducible")
     endif()
 endforeach()
+# PFM is an untone-mapped float32 RGB capture. Exposure only affects display.
+foreach(ev 0 3)
+    execute_process(COMMAND "${RENDER}" "${root}/room.carto" "${root}/linear-${ev}.pfm"
+        ${arguments} --exposure ${ev}
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+    if(NOT result EQUAL 0)
+        message(FATAL_ERROR "PFM render refused: ${output}${error}")
+    endif()
+    file(READ "${root}/linear-${ev}.pfm.receipt.json" hdr_receipt)
+    string(JSON hdr_format GET "${hdr_receipt}" output_format)
+    string(JSON hdr_digest GET "${hdr_receipt}" output_digest)
+    file(SHA256 "${root}/linear-${ev}.pfm" actual_hdr_digest)
+    file(SIZE "${root}/linear-${ev}.pfm" hdr_size)
+    file(READ "${root}/linear-${ev}.pfm" hdr_header LIMIT 16 HEX)
+    if(NOT hdr_format STREQUAL "pfm-linear-rgb-f32" OR
+       NOT hdr_digest STREQUAL actual_hdr_digest OR
+       NOT hdr_size EQUAL 3072016 OR NOT hdr_header STREQUAL "50460a363430203430300a2d312e300a")
+        message(FATAL_ERROR "PFM format, dimensions, byte size or digest invalid")
+    endif()
+    if(ev EQUAL 0)
+        set(first_hdr "${actual_hdr_digest}")
+    elseif(NOT first_hdr STREQUAL actual_hdr_digest)
+        message(FATAL_ERROR "Display exposure altered scene-linear PFM output")
+    endif()
+endforeach()
 set(explicit_orthographic_output "${root}/explicit-orthographic.bmp")
 execute_process(COMMAND "${RENDER}" "${root}/room.carto"
     "${explicit_orthographic_output}" --identity fixture-room

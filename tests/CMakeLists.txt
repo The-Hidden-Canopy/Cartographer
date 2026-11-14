@@ -2456,3 +2456,9 @@ add_executable(cartographer_sculpt_gltf_export_tests sculpt_gltf_export_tests.cp
 target_link_libraries(cartographer_sculpt_gltf_export_tests PRIVATE carto_application carto_ui)
 carto_target(cartographer_sculpt_gltf_export_tests)
 add_test(NAME cartographer_sculpt_gltf_export_tests COMMAND cartographer_sculpt_gltf_export_tests)
+
+# Strict float PFM round trip: values above one and malformed payloads.
+add_executable(cartographer_linear_pfm_tests linear_pfm_tests.cpp)
+target_include_directories(cartographer_linear_pfm_tests PRIVATE "${PROJECT_SOURCE_DIR}")
+carto_target(cartographer_linear_pfm_tests)
+add_test(NAME cartographer_linear_pfm_tests COMMAND cartographer_linear_pfm_tests)

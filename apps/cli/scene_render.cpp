@@ -2,6 +2,7 @@
 #include <carto/project/project.hpp>
 
 #include <algorithm>
+#include "linear_pfm.hpp"
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -122,13 +123,13 @@ void publish_capture(const std::filesystem::path& output_path,
 
     std::filesystem::rename(cleanup.receipt_path, receipt_path);
     try {
-        // Publish the BMP last so its presence means the complete receipt was written.
+        // Publish the image last so its presence means the complete receipt was written.
         std::filesystem::rename(cleanup.image_path, output_path);
     } catch (const std::exception& publish_error) {
         std::error_code rollback_error;
         static_cast<void>(std::filesystem::remove(receipt_path, rollback_error));
         if (rollback_error)
-            throw std::runtime_error("BMP publication failed and the receipt could not be rolled back: " +
+            throw std::runtime_error("Image publication failed and the receipt could not be rolled back: " +
                 std::string(publish_error.what()));
         throw;
     }
@@ -155,7 +156,7 @@ int main(int argc, char** argv) {
     using namespace carto;
     try {
         if (argc < 3) throw std::runtime_error(
-            "usage: cartographer_scene_render input.carto output.bmp --identity stable-id --shaders directory "
+            "usage: cartographer_scene_render input.carto output.bmp|output.pfm --identity stable-id --shaders directory "
             "(--camera px py pz tx ty tz [--projection perspective|orthographic] "
             "[--orthographic-height world-units] | --authored-camera object-id) "
             "--size width height "
@@ -169,9 +170,9 @@ int main(int argc, char** argv) {
             "[--environment-equirectangular png|jpg|tga|Radiance-HDR --environment-color-space linear|srgb (HDR requires linear)]");
         const std::filesystem::path input_path = argv[1], output_path = argv[2];
         const std::filesystem::path receipt_path = output_path.string() + ".receipt.json";
-        if (output_path.extension() != ".bmp" || path_entry_exists(output_path) ||
+        if ((output_path.extension() != ".bmp" && output_path.extension() != ".pfm") || path_entry_exists(output_path) ||
             path_entry_exists(receipt_path))
-            throw std::runtime_error("output must be a new .bmp path with no existing receipt");
+            throw std::runtime_error("output must be a new .bmp or .pfm path with no existing receipt");
         std::filesystem::path shader_directory;
         std::optional<std::filesystem::path> environment_sh_path;
         std::optional<std::filesystem::path> environment_image_path;
@@ -451,7 +452,8 @@ int main(int argc, char** argv) {
         const auto render_wall_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - render_started).count();
         if (!device->debug_receipts().empty()) throw std::runtime_error("native device reported debug errors; capture refused");
-        const auto encoded = bmp(image);
+        const bool is_hdr = output_path.extension() == ".pfm";
+        const auto encoded = is_hdr ? encode_linear_pfm(image) : bmp(image);
         const std::size_t host_output_payload_bytes =
             image.linear_hdr_rgba.size() * sizeof(float) +
             image.depth.size() * sizeof(float) + image.srgb_rgba.size() + encoded.size();
@@ -466,7 +468,9 @@ int main(int argc, char** argv) {
         else if (image.environment_color_space == assets::ColorSpace::srgb)
             receipt << json("srgb");
         else receipt << "null";
-        receipt << ",\n  \"bmp_digest\": " << json(assets::sha256(encoded).hex())
+        receipt << ",\n  \"output_format\": " << json(is_hdr ? "pfm-linear-rgb-f32" : "bmp-srgb-rgba8")
+            << ",\n  \"output_digest\": " << json(assets::sha256(encoded).hex())
+            << (is_hdr ? "" : ",\n  \"bmp_digest\": " + json(assets::sha256(encoded).hex()))
             << ",\n  \"extent\": [" << width << ", " << height
             << "],\n  \"antialiasing\": " << json(image.antialiasing == d3d12::SceneRenderAntialiasing::fxaa ? "fxaa" : "none")
             << ",\n  \"draw_count\": " << image.draw_count
