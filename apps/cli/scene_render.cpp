@@ -166,7 +166,7 @@ int main(int argc, char** argv) {
             "[--antialias fxaa|none] "
             "[--graph-parameter graph-id name scalar|color|normal values...] "
             "[--graph-surface-input graph-id input-name scalar|color|normal values...] "
-            "[--texture id exact-current-source-mip-artifact] [--diffuse-irradiance-sh file] "
+            "[--texture id exact-current-source-mip-artifact] [--hdr-emissive id linear-float.pfm] [--diffuse-irradiance-sh file] "
             "[--environment-equirectangular png|jpg|tga|Radiance-HDR --environment-color-space linear|srgb (HDR requires linear)]");
         const std::filesystem::path input_path = argv[1], output_path = argv[2];
         const std::filesystem::path receipt_path = output_path.string() + ".receipt.json";
@@ -196,6 +196,7 @@ int main(int argc, char** argv) {
             std::filesystem::path path;
         };
         std::vector<SuppliedMipArtifact> supplied_mip_artifacts;
+        std::vector<SuppliedMipArtifact> float_overrides;
         std::map<std::string, project::MaterialGraphEvaluationInputs> pending_graph_inputs;
         const auto read_graph_value = [&](std::string_view type,
                                           const auto& next) {
@@ -325,6 +326,10 @@ int main(int argc, char** argv) {
                 if (supplied_mip_artifacts.size() >= 1024U)
                     throw std::runtime_error("more than 1024 mip artifacts were supplied");
                 supplied_mip_artifacts.push_back({id, path});
+            } else if (option == "--hdr-emissive") {
+                const auto id=number<std::uint64_t>(next()); const std::filesystem::path path=next();
+                if(float_overrides.size()>=1024U) throw std::runtime_error("too many float overrides");
+                float_overrides.push_back({id,path});
             } else if (option == "--graph-parameter" ||
                        option == "--graph-surface-input") {
                 const std::string graph_identity(next());
@@ -436,6 +441,21 @@ int main(int argc, char** argv) {
                     "supplied mip artifact does not exactly match the current project texture source");
             }
         }
+        std::set<assets::TextureAssetId> float_ids;
+        for (const auto& supplied : float_overrides) {
+            const auto current=std::find_if(textures.begin(),textures.end(),[&](const auto& t){return t.asset==supplied.asset;});
+            if(current==textures.end() || supplied.asset==0U || !float_ids.insert(supplied.asset).second ||
+                current->mips.semantic!=assets::TextureSemantic::emissive)
+                throw std::runtime_error("float override must name one bound emissive texture");
+            std::ifstream file(supplied.path,std::ios::binary|std::ios::ate); const auto size=file.tellg();
+            if(!file || size<=0 || size>static_cast<std::streamoff>(256ULL*1024*1024))
+                throw std::runtime_error("float texture missing or exceeds 256 MiB");
+            std::vector<std::uint8_t> data(static_cast<std::size_t>(size)); file.seekg(0);
+            file.read(reinterpret_cast<char*>(data.data()),static_cast<std::streamsize>(data.size()));
+            if(!file) throw std::runtime_error("float texture read failed");
+            const auto digest=assets::sha256(data);
+            current->linear_float_mips=assets::generate_linear_float_mips(assets::decode_linear_pfm(data),digest);
+        }
         auto request = take(d3d12::prepare_project_scene_render(
             identity, document, camera, width, height, std::move(textures), light,
             std::move(graph_inputs)));
@@ -468,6 +488,16 @@ int main(int argc, char** argv) {
         else if (image.environment_color_space == assets::ColorSpace::srgb)
             receipt << json("srgb");
         else receipt << "null";
+        receipt << ",\n  \"float_emissive_overrides\": [";
+        bool first_float = true;
+        for (const auto& texture : request.textures) if (texture.linear_float_mips) {
+            if (!first_float) receipt << ",";
+            first_float = false;
+            receipt << "{\"asset\":" << texture.asset << ",\"source_digest\":"
+                << json(texture.linear_float_mips->source_digest.hex())
+                << ",\"mip_digest\":" << json(texture.linear_float_mips->artifact_digest.hex()) << "}";
+        }
+        receipt << "]";
         receipt << ",\n  \"output_format\": " << json(is_hdr ? "pfm-linear-rgb-f32" : "bmp-srgb-rgba8")
             << ",\n  \"output_digest\": " << json(assets::sha256(encoded).hex())
             << (is_hdr ? "" : ",\n  \"bmp_digest\": " + json(assets::sha256(encoded).hex()))

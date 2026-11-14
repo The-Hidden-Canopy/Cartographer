@@ -16,3 +16,9 @@ A bounded strict PFM decoder is staged as an independent float-image building
 block. It accepts only RGB, little-endian unit-scale float PFM, rejects
 nonfinite values and malformed lengths, and keeps values above one. It is not
 yet connected to texture admission, persistence, material slots or the GPU.
+
+The experimental CLI option `--hdr-emissive ID file.pfm` substitutes a strict
+scene-linear float PFM for one already-bound emissive texture during capture.
+It generates float mips and uploads RGBA32F; the receipt binds source and mip
+digests. This is a per-capture override, not a saved project import or EXR
+decoder. Other material slots continue to use the legacy RGBA8 path.

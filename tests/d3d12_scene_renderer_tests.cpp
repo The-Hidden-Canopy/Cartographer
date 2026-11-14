@@ -4632,6 +4632,25 @@ void explicit_temporal_resolve_uses_bound_history_and_resets_on_cut(
                 wrong_motion_format.temporal->motion_vectors)),
         "temporal test destroys only its caller-owned fixtures");
 }
+void float_emissive_reaches_native_pixels(d3d12::D3D12Device& device) {
+    auto bound=request(); bound.light.radiance={};
+    auto& material=bound.objects[0U].materials[0U].current_material.definition;
+    material.emissive.asset=77U; material.emissive_factor={1.0,1.0,1.0}; material.emissive_strength=1.0;
+    rebind(bound.objects[0U]);
+    bound.textures.push_back(texture(77U,{255U,255U,255U,255U},assets::TextureSemantic::emissive));
+    assets::LinearFloatImage input{1U,1U,{4.0f,2.0f,0.5f,1.0f}};
+    const std::vector<std::uint8_t> fixture{1U,2U,3U};
+    bound.textures.back().linear_float_mips=assets::generate_linear_float_mips(input,assets::sha256(fixture));
+    const auto image=capture(device,bound); const std::size_t center=(48U*96U+48U)*4U;
+    require(image.depth[center/4U]<1.0f && image.linear_hdr_rgba[center]>3.9f &&
+        image.linear_hdr_rgba[center+1U]>1.9f && image.linear_hdr_rgba[center+2U]>0.49f,
+        "float emissive texels above one reach scene-linear GPU output");
+    bound.textures.back().linear_float_mips.reset();
+    const auto legacy=capture(device,bound);
+    require(legacy.linear_hdr_rgba[center]<image.linear_hdr_rgba[center],
+        "legacy RGBA8 texture path remains distinct");
+}
+
 void graph_occlusion_values_reach_native_pixels(d3d12::D3D12Device& device) {
     for (double occlusion : {0.0, 0.25, 1.0}) {
         auto document = room_project(); auto catalog = document.material_catalog();
@@ -5338,6 +5357,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--material-gpu-only") {
             auto device = take(d3d12::D3D12Device::create({{}, false, true}));
+            float_emissive_reaches_native_pixels(*device);
             graph_occlusion_values_reach_native_pixels(*device);
             std::cout << "PASS focused graph occlusion pixels\n";
             graph_opacity_reaches_native_coverage(*device);

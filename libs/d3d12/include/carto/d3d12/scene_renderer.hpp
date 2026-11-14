@@ -1,5 +1,6 @@
 #pragma once
 
+#include <carto/assets/linear_float_image.hpp>
 #include <carto/assets/texture_mip.hpp>
 #include <carto/device_ir/command.hpp>
 #include <carto/d3d12/device.hpp>
@@ -153,6 +154,8 @@ struct SceneRenderTexture {
     // from a previous source cannot silently satisfy the current source.
     assets::Sha256Digest current_source_digest;
     assets::Rgba8MipChain mips;
+    // Optional explicit linear PFM override, supported only for emissive slots.
+    std::optional<assets::LinearFloatMipChain> linear_float_mips;
 };
 
 struct SceneRenderEnvironmentMipLevel {
