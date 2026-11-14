@@ -442,6 +442,7 @@ int main(int argc, char** argv) {
             }
         }
         std::set<assets::TextureAssetId> float_ids;
+        std::uint64_t float_payload_bytes = 0U;
         for (const auto& supplied : float_overrides) {
             const auto current=std::find_if(textures.begin(),textures.end(),[&](const auto& t){return t.asset==supplied.asset;});
             if(current==textures.end() || supplied.asset==0U || !float_ids.insert(supplied.asset).second ||
@@ -454,7 +455,18 @@ int main(int argc, char** argv) {
             file.read(reinterpret_cast<char*>(data.data()),static_cast<std::streamsize>(data.size()));
             if(!file) throw std::runtime_error("float texture read failed");
             const auto digest=assets::sha256(data);
-            current->linear_float_mips=assets::generate_linear_float_mips(assets::decode_linear_pfm(data),digest);
+            auto decoded=assets::decode_linear_pfm(data);
+            // Bound the full derived chain before allocating it.
+            std::uint64_t mip_bytes=0U; auto w=decoded.width,h=decoded.height;
+            while (true) {
+                mip_bytes += static_cast<std::uint64_t>(w)*h*16U;
+                if(w==1U && h==1U) break;
+                w=std::max(1U,w/2U);h=std::max(1U,h/2U);
+            }
+            if(mip_bytes>kMaxSuppliedMipArtifactBytes-float_payload_bytes)
+                throw std::runtime_error("aggregate float texture mips exceed 512 MiB");
+            float_payload_bytes+=mip_bytes;
+            current->linear_float_mips=assets::generate_linear_float_mips(std::move(decoded),digest);
         }
         auto request = take(d3d12::prepare_project_scene_render(
             identity, document, camera, width, height, std::move(textures), light,

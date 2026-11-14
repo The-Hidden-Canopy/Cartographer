@@ -5197,6 +5197,34 @@ void orthographic_viewport_zoom_changes_projection_height() {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 3 && std::string_view(argv[1]) == "--write-hdr-emissive-fixture") {
+            const std::filesystem::path project_path=argv[2]; const auto root=project_path.parent_path();
+            const auto encoded=one_pixel_tga(); const auto admission=take(assets::inspect_texture_source(encoded,"image/x-tga"));
+            assets::BlobStore store(root / ".carto-assets" / "source-blobs");
+            const auto blob=take(store.put(encoded,"image/x-tga"));
+            project::TextureSourceRecord source; source.id=501U; source.name="HDR override fixture";
+            source.relative_locator=store.path_for(blob.digest).lexically_relative(root).generic_string();
+            source.content_digest=admission.source.digest;source.format=admission.format;
+            source.width=admission.width;source.height=admission.height;source.provenance="synthetic HDR override fixture";
+            auto document=room_project();auto catalog=document.material_catalog();take(catalog.insert_texture(source));
+            auto material=catalog.materials().at(1U);material.definition.emissive.asset=source.id;
+            material.definition.emissive_factor={1.0,1.0,1.0};material.definition.emissive_strength=1.0;
+            material.revision=core::Revision{2U};take(catalog.replace_material(material));
+            take(document.set_material_catalog(std::move(catalog)));take(document.save_atomic(project_path));
+            std::ofstream out(root / "fixture-float.pfm",std::ios::binary);out << "PF\n1 1\n-1.0\n";
+            for(float value:{4.0f,2.0f,0.5f}) { const auto bits=std::bit_cast<std::uint32_t>(value);
+                for(unsigned b=0;b<4;++b) out.put(static_cast<char>(bits>>(b*8))); }
+            out.close();require(static_cast<bool>(out),"write HDR fixture");return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--verify-hdr-pfm") {
+            std::ifstream in(argv[2],std::ios::binary|std::ios::ate);const auto size=in.tellg();
+            require(static_cast<bool>(in) && size>0,"read float capture");
+            std::vector<std::uint8_t> data(static_cast<std::size_t>(size));in.seekg(0);
+            in.read(reinterpret_cast<char*>(data.data()),static_cast<std::streamsize>(data.size()));
+            const auto decoded=assets::decode_linear_pfm(data);
+            require(*std::max_element(decoded.rgba.begin(),decoded.rgba.end())>3.5f,
+                "saved-project CLI override must produce HDR values above one");return 0;
+        }
         if (argc == 3 && std::string_view(argv[1]) == "--write-fixture") {
             take(room_project().save_atomic(argv[2])); return 0;
         }

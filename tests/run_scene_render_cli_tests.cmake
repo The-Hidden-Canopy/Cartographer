@@ -115,6 +115,29 @@ foreach(ev 0 3)
         message(FATAL_ERROR "Display exposure altered scene-linear PFM output")
     endif()
 endforeach()
+execute_process(COMMAND "${FIXTURE}" --write-hdr-emissive-fixture "${root}/hdr-scene.carto"
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "HDR project fixture refused: ${output}${error}")
+endif()
+execute_process(COMMAND "${RENDER}" "${root}/hdr-scene.carto" "${root}/hdr-scene.pfm"
+    ${arguments} --hdr-emissive 501 "${root}/fixture-float.pfm"
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "HDR emissive CLI override refused: ${output}${error}")
+endif()
+execute_process(COMMAND "${FIXTURE}" --verify-hdr-pfm "${root}/hdr-scene.pfm"
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "HDR emissive pixels not preserved: ${output}${error}")
+endif()
+file(READ "${root}/hdr-scene.pfm.receipt.json" hdr_override_receipt)
+string(JSON hdr_override_id GET "${hdr_override_receipt}" float_emissive_overrides 0 asset)
+string(JSON hdr_source_digest GET "${hdr_override_receipt}" float_emissive_overrides 0 source_digest)
+file(SHA256 "${root}/fixture-float.pfm" expected_hdr_source_digest)
+if(NOT hdr_override_id EQUAL 501 OR NOT hdr_source_digest STREQUAL expected_hdr_source_digest)
+    message(FATAL_ERROR "HDR override receipt did not bind its source")
+endif()
 set(explicit_orthographic_output "${root}/explicit-orthographic.bmp")
 execute_process(COMMAND "${RENDER}" "${root}/room.carto"
     "${explicit_orthographic_output}" --identity fixture-room
