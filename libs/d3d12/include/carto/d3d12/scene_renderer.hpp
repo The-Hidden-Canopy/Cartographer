@@ -19,6 +19,7 @@
 
 namespace carto::d3d12 {
 
+// V36 separates graph occlusion from source texture strength.
 // V35 compares PCF taps on the receiver plane and decodes LDR environment blue.
 // V34 transports direct anisotropy axes to bounded UV0 normal-map normals.
 // V33 adds UV0-tangent-bound direct anisotropy with explicit unsupported inputs.
@@ -35,7 +36,7 @@ namespace carto::d3d12 {
 // environment integration, per-texture affine transforms, bounded UV streams,
 // primary-stream normal-map tangents, both conventions, and material samplers.
 inline constexpr std::string_view kSceneRenderAlgorithm =
-    "carto.d3d12.scene-direct-capture.v35";
+    "carto.d3d12.scene-direct-capture.v36";
 inline constexpr std::uint32_t kSceneRenderEnvironmentPrefilterSampleCount = 32U;
 inline constexpr double kSceneRenderLocalLightDistanceFloorMeters = 0.01;
 inline constexpr double kSceneRenderMaximumLocalLightIntensity = 1.0e20;
@@ -106,6 +107,9 @@ struct SceneRenderMaterialBinding {
     // positive axis scales carry those axes to the mapped shading normal by
     // shortest rotation; rotated/reflected maps remain unsupported.
     double anisotropy = 0.0;
+    // Scene-only graph ambient-occlusion multiplier, independent of the
+    // source material's occlusion texture strength. Neutral when absent.
+    double graph_occlusion = 1.0;
 };
 
 // D3D12 scene-only material compilation keeps the exact authored source digest

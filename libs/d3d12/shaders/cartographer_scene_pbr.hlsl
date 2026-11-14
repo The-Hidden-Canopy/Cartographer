@@ -521,15 +521,19 @@ float4 PSMain(VertexOutput input) : SV_TARGET
         clearcoat_distribution * clearcoat_geometry /
         max(4.0 * n_dot_l * n_dot_v, 1e-5);
     const float shadow = shadow_visibility(input.light_position, normal, light_direction, receiver_gradient);
-    const bool has_occlusion_map = input.material_flags.x > 0.5;
+    // Packed per draw: [1,2] means map present; [-1,0] means no map.
+    // The remaining magnitude is independent graph AO (neutral = 1).
+    const bool has_occlusion_map = input.material_flags.x >= 1.0;
+    const float graph_occlusion = has_occlusion_map
+        ? input.material_flags.x - 1.0 : -input.material_flags.x;
     const float occlusion_parameter = input.material_surface_factors.w;
-    const float occlusion = has_occlusion_map
+    const float occlusion = saturate(graph_occlusion) * (has_occlusion_map
         ? lerp(
             1.0,
             saturate(mapped_channel(occlusion_texture.Sample(occlusion_sampler,
                 input.occlusion_uv), input.channel_mapping_b.z)),
             saturate(occlusion_parameter))
-        : saturate(occlusion_parameter);
+        : 1.0);
     const float3 sheen = base_color * (sheen_weight * base_attenuation *
         sheen_charlie_neubelt(roughness, n_dot_l, n_dot_v, n_dot_h));
     const float3 direct = ((diffuse + specular) * (1.0 - sheen_weight) +
