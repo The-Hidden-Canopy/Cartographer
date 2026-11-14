@@ -5844,6 +5844,9 @@ core::Result<DispatchReceipt> ApplicationSession::append_sculpt_stroke(
     production::SculptStroke request_validation;
     request_validation.identity = "preview.validation";
     request_validation.mode = action.mode;
+    request_validation.symmetry = action.symmetry;
+    request_validation.radial_symmetry_count = action.radial_symmetry_count;
+    request_validation.symmetry_axis_local = action.symmetry_axis_local;
     request_validation.radius = action.radius;
     request_validation.strength = action.strength;
     request_validation.samples.push_back({{}, 1.0});
@@ -5889,6 +5892,9 @@ core::Result<DispatchReceipt> ApplicationSession::append_sculpt_stroke(
 
     production::SculptStroke stroke;
     stroke.mode = action.mode;
+    stroke.symmetry = action.symmetry;
+    stroke.radial_symmetry_count = action.radial_symmetry_count;
+    stroke.symmetry_axis_local = action.symmetry_axis_local;
     stroke.radius = action.radius;
     stroke.strength = action.strength;
     stroke.samples.push_back(production::SculptStrokeSample{vertex->position, 1.0});
@@ -5930,6 +5936,9 @@ core::Result<DispatchReceipt> ApplicationSession::append_sculpt_surface_stroke(
     production::SculptStroke request_validation;
     request_validation.identity = "preview.validation";
     request_validation.mode = action.mode;
+    request_validation.symmetry = action.symmetry;
+    request_validation.radial_symmetry_count = action.radial_symmetry_count;
+    request_validation.symmetry_axis_local = action.symmetry_axis_local;
     request_validation.radius = action.radius;
     request_validation.strength = action.strength;
     request_validation.samples = action.samples;
@@ -5955,6 +5964,9 @@ core::Result<DispatchReceipt> ApplicationSession::append_sculpt_surface_stroke(
     }
     production::SculptStroke stroke;
     stroke.mode = action.mode;
+    stroke.symmetry = action.symmetry;
+    stroke.radial_symmetry_count = action.radial_symmetry_count;
+    stroke.symmetry_axis_local = action.symmetry_axis_local;
     stroke.radius = action.radius;
     stroke.strength = action.strength;
     stroke.samples = action.samples;

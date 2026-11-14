@@ -4601,6 +4601,97 @@ void sculpt_preview_provider_displays_evaluated_geometry_without_authoring() {
     REQUIRE(same_positions(broken.viewport.scene.find(object)->mesh->positions, source_positions));
 }
 
+// Symmetry is authored stroke source: the selected local mirror or radial
+// setting must reach the stack exactly, survive save/reopen and undo/redo,
+// and invalid settings must be refused without changing the project.
+void sculpt_symmetry_settings_are_persisted_stroke_source() {
+    using carto::production::SculptSymmetryMode;
+    TempDirectory temp;
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::NewProjectAction{"Sculpt symmetry test"}));
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{"Sculpt mesh", {2.0, 2.0, 2.0}}));
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::sculpt));
+    auto snapshot = ui.snapshot();
+    const carto::scene::ObjectId object = snapshot.objects.front().object.id;
+    const std::uint64_t mesh_asset = *snapshot.objects.front().object.mesh_asset;
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{object}));
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::vertex}));
+    REQUIRE(ui.dispatch(carto::application::SelectVertexAction{
+        object, carto::geometry::VertexId{1U}}));
+
+    const auto stroke = [&](SculptSymmetryMode mode, std::uint32_t copies,
+                            carto::core::Vec3d axis) {
+        const auto current = ui.snapshot();
+        return ui.dispatch(carto::application::AppendSculptStrokeAction{
+            current.project_revision, carto::production::SculptStrokeMode::add, 0.5, 0.05,
+            current.project_generation, mode, copies, axis});
+    };
+    const auto refused = [&](SculptSymmetryMode mode, std::uint32_t copies,
+                             carto::core::Vec3d axis) {
+        const auto before = ui.snapshot();
+        REQUIRE(!stroke(mode, copies, axis));
+        const auto after = ui.snapshot();
+        REQUIRE(after.project_revision == before.project_revision);
+        REQUIRE(after.sculpt_layers.size() == before.sculpt_layers.size());
+    };
+    refused(SculptSymmetryMode::radial, 1U, {0.0, 0.0, 1.0});
+    refused(SculptSymmetryMode::radial, carto::production::kMaxSculptRadialSymmetryCopies + 1U,
+            {0.0, 0.0, 1.0});
+    refused(SculptSymmetryMode::mirror_plane, 4U, {0.0, 0.0, 0.0});
+    refused(SculptSymmetryMode::mirror_x, 4U, {0.0, 1.0, 0.0});
+    refused(static_cast<SculptSymmetryMode>(9U), 4U, {1.0, 0.0, 0.0});
+
+    REQUIRE(stroke(SculptSymmetryMode::mirror_x, 4U, {1.0, 0.0, 0.0}));
+    REQUIRE(stroke(SculptSymmetryMode::mirror_plane, 4U, {0.0, 1.0, 0.0}));
+    REQUIRE(stroke(SculptSymmetryMode::radial, 2U, {0.0, 0.0, 1.0}));
+    REQUIRE(stroke(SculptSymmetryMode::radial,
+                   carto::production::kMaxSculptRadialSymmetryCopies, {1.0, 0.0, 0.0}));
+
+    const auto stored = [&](const carto::project::ProjectDocument& document) {
+        const auto found = document.sculpt_stacks().find(mesh_asset);
+        REQUIRE(found != document.sculpt_stacks().end());
+        auto stack = carto::production::SculptStack::deserialize(found->second.bytes);
+        REQUIRE(stack);
+        std::vector<carto::production::SculptStroke> strokes;
+        for (const auto& layer : stack.value().layers)
+            strokes.insert(strokes.end(), layer.strokes.begin(), layer.strokes.end());
+        return strokes;
+    };
+    const auto expect_authored = [&](const std::vector<carto::production::SculptStroke>& strokes) {
+        REQUIRE(strokes.size() == 4U);
+        REQUIRE(strokes[0].symmetry == SculptSymmetryMode::mirror_x &&
+                strokes[0].symmetry_plane_x == 0.0 && strokes[0].radial_symmetry_count == 4U);
+        REQUIRE(strokes[1].symmetry == SculptSymmetryMode::mirror_plane &&
+                strokes[1].symmetry_axis_local.x == 0.0 && strokes[1].symmetry_axis_local.y == 1.0 &&
+                strokes[1].symmetry_axis_local.z == 0.0 && strokes[1].radial_symmetry_count == 4U);
+        REQUIRE(strokes[2].symmetry == SculptSymmetryMode::radial &&
+                strokes[2].radial_symmetry_count == 2U && strokes[2].symmetry_axis_local.z == 1.0);
+        REQUIRE(strokes[3].symmetry == SculptSymmetryMode::radial &&
+                strokes[3].radial_symmetry_count == carto::production::kMaxSculptRadialSymmetryCopies &&
+                strokes[3].symmetry_axis_local.x == 1.0);
+    };
+    // ApplicationSession exposes no document accessor; verify the authored
+    // source through save and an independent reopen at each history step.
+    int saves = 0;
+    const auto saved = [&]() {
+        const auto path = temp.path() / ("symmetry-" + std::to_string(saves++) + ".carto");
+        REQUIRE(ui.dispatch(carto::application::SaveProjectAction{path}));
+        auto reopened = carto::project::ProjectDocument::load(path);
+        REQUIRE(reopened);
+        return stored(reopened.value());
+    };
+    expect_authored(saved());
+
+    const auto authored_revision = ui.snapshot().project_revision;
+    REQUIRE(ui.dispatch(carto::application::UndoAction{}));
+    REQUIRE(saved().size() == 3U);
+    REQUIRE(ui.dispatch(carto::application::RedoAction{}));
+    expect_authored(saved());
+    REQUIRE(ui.snapshot().project_revision > authored_revision);
+}
+
 void sculpt_point_strokes_are_revision_bound_human_commands() {
     TempDirectory temp;
     carto::application::ApplicationSession session;
@@ -5468,6 +5559,7 @@ int main() {
         knife_viewport_sampling_snaps_endpoints_and_stays_on_the_selected_face();
         sculpt_surface_strokes_commit_anchored_samples_through_human_commands();
         sculpt_point_strokes_are_revision_bound_human_commands();
+        sculpt_symmetry_settings_are_persisted_stroke_source();
         sculpt_preview_provider_displays_evaluated_geometry_without_authoring();
         sculpt_layer_weight_and_order_edits_are_revision_bound_human_commands();
         decal_projection_outlines_require_exact_bounded_source_identity();

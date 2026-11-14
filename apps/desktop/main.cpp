@@ -2677,7 +2677,38 @@ find_d3d12_scene_shader_directory() {
 }
 #endif
 
+// Axis and origin are in source-mesh local coordinates. The evaluator owns
+// the actual symmetry realization; these are authored settings only.
+struct NativeSculptSymmetrySettings {
+    carto::production::SculptSymmetryMode mode = carto::production::SculptSymmetryMode::none;
+    carto::core::Vec3d axis{1.0, 0.0, 0.0};
+    std::uint32_t copies = 4U;
+};
+
+[[nodiscard]] NativeSculptSymmetrySettings native_sculpt_symmetry_settings(
+    int index, int radial_copies) {
+    using carto::production::SculptSymmetryMode;
+    NativeSculptSymmetrySettings result;
+    switch (index) {
+    case 1: result.mode = SculptSymmetryMode::mirror_x; break;
+    case 2: result.mode = SculptSymmetryMode::mirror_plane; result.axis = {0.0, 1.0, 0.0}; break;
+    case 3: result.mode = SculptSymmetryMode::mirror_plane; result.axis = {0.0, 0.0, 1.0}; break;
+    case 4: result.mode = SculptSymmetryMode::radial; break;
+    case 5: result.mode = SculptSymmetryMode::radial; result.axis = {0.0, 1.0, 0.0}; break;
+    case 6: result.mode = SculptSymmetryMode::radial; result.axis = {0.0, 0.0, 1.0}; break;
+    default: break;
+    }
+    if (result.mode == SculptSymmetryMode::radial) {
+        result.copies = static_cast<std::uint32_t>(std::clamp(radial_copies, 2,
+            static_cast<int>(carto::production::kMaxSculptRadialSymmetryCopies)));
+    }
+    return result;
+}
+
 struct NativeSculptStrokeCapture {
+    carto::production::SculptSymmetryMode symmetry = carto::production::SculptSymmetryMode::none;
+    std::uint32_t radial_symmetry_count = 4U;
+    carto::core::Vec3d symmetry_axis_local{1.0, 0.0, 0.0};
     carto::core::Revision project_revision;
     std::uint64_t project_generation = 0U;
     bool perspective_camera = false;
@@ -3485,6 +3516,8 @@ struct DesktopState {
     double extrude_distance = 0.25;
     double inset_distance = 0.15;
     double custom_face_normal[3]{0.0, 0.0, 1.0};
+    int sculpt_symmetry_index = 0;
+    int sculpt_radial_symmetry_count = 4;
     int sculpt_mode_index = 0;
     double sculpt_radius = 0.25;
     double sculpt_strength = 0.05;
@@ -7626,6 +7659,11 @@ struct DesktopState {
         capture.mesh_asset = *object->object.mesh_asset;
         capture.mode = static_cast<carto::production::SculptStrokeMode>(
             std::clamp(sculpt_mode_index, 0, 11));
+        const auto symmetry = native_sculpt_symmetry_settings(
+            sculpt_symmetry_index, sculpt_radial_symmetry_count);
+        capture.symmetry = symmetry.mode;
+        capture.radial_symmetry_count = symmetry.copies;
+        capture.symmetry_axis_local = symmetry.axis;
         capture.radius = sculpt_radius;
         capture.strength = sculpt_strength;
         capture.viewport = viewport;
@@ -7786,7 +7824,10 @@ struct DesktopState {
             capture.radius,
             capture.strength,
             std::move(samples.value()),
-            capture.project_generation}));
+            capture.project_generation,
+            capture.symmetry,
+            capture.radial_symmetry_count,
+            capture.symmetry_axis_local}));
         return true;
     }
 
@@ -19722,6 +19763,15 @@ struct DesktopState {
                 static_cast<int>(sizeof(sculpt_modes) / sizeof(sculpt_modes[0]));
             sculpt_mode_index = std::clamp(sculpt_mode_index, 0, sculpt_mode_count - 1);
             ImGui::Combo("Brush mode", &sculpt_mode_index, sculpt_modes, sculpt_mode_count);
+            static constexpr const char* sculpt_symmetries[]{
+                "None", "Mirror local X = 0", "Mirror local Y = 0", "Mirror local Z = 0",
+                "Radial around local X", "Radial around local Y", "Radial around local Z"};
+            sculpt_symmetry_index = std::clamp(sculpt_symmetry_index, 0, 6);
+            ImGui::Combo("Symmetry", &sculpt_symmetry_index, sculpt_symmetries, 7);
+            if (sculpt_symmetry_index >= 4) {
+                ImGui::SliderInt("Radial copies", &sculpt_radial_symmetry_count, 2,
+                    static_cast<int>(carto::production::kMaxSculptRadialSymmetryCopies));
+            }
             ImGui::InputDouble("Radius", &sculpt_radius, 0.01, 0.1, "%.4f");
             ImGui::InputDouble("Strength", &sculpt_strength, 0.01, 0.1, "%.4f");
             const bool one_vertex =
@@ -19730,12 +19780,17 @@ struct DesktopState {
                 snapshot.selection.component_object.has_value();
             ImGui::BeginDisabled(!one_vertex);
             if (ImGui::Button("Add stroke at selected vertex", ImVec2(-1, 34))) {
+                const auto symmetry = native_sculpt_symmetry_settings(
+                    sculpt_symmetry_index, sculpt_radial_symmetry_count);
                 const bool accepted = dispatch(carto::application::AppendSculptStrokeAction{
                     snapshot.project_revision,
                     static_cast<carto::production::SculptStrokeMode>(sculpt_mode_index),
                     sculpt_radius,
                     sculpt_strength,
-                    snapshot.project_generation});
+                    snapshot.project_generation,
+                    symmetry.mode,
+                    symmetry.copies,
+                    symmetry.axis});
                 if (accepted) {
                     action_feedback = "Sculpt stroke recorded in the project-bound stack.";
                     action_feedback_error = false;

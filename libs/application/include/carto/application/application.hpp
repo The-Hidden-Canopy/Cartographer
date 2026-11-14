@@ -1202,6 +1202,9 @@ struct AppendSculptStrokeAction {
     double radius = 0.25;
     double strength = 0.05;
     std::uint64_t expected_project_generation = 0U;
+    production::SculptSymmetryMode symmetry = production::SculptSymmetryMode::none;
+    std::uint32_t radial_symmetry_count = 4U;
+    core::Vec3d symmetry_axis_local{1.0, 0.0, 0.0};
 };
 
 // Commits samples captured against a viewport generation/revision snapshot.
@@ -1216,6 +1219,9 @@ struct AppendSculptSurfaceStrokeAction {
     double strength = 0.05;
     std::vector<production::SculptStrokeSample> samples;
     std::uint64_t expected_project_generation = 0U;
+    production::SculptSymmetryMode symmetry = production::SculptSymmetryMode::none;
+    std::uint32_t radial_symmetry_count = 4U;
+    core::Vec3d symmetry_axis_local{1.0, 0.0, 0.0};
 };
 
 // Updates one layer on the currently selected mesh. Layer edits are
