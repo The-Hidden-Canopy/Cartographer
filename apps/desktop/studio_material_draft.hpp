@@ -27,10 +27,14 @@ enum class MaterialDraftState { reload, current, stale };
 
 // Selecting a replacement source changes the asset, not its authored mapping.
 // Clearing the source deliberately restores the default unbound reference.
-inline void set_base_color_texture_source(
+inline void set_material_texture_source(
     render::TextureRef& binding, assets::TextureAssetId asset) noexcept {
     if (asset == 0U) binding = {};
     else binding.asset = asset;
+}
+inline void set_base_color_texture_source(
+    render::TextureRef& binding, assets::TextureAssetId asset) noexcept {
+    set_material_texture_source(binding, asset);
 }
 
 template <typename Materials>

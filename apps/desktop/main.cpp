@@ -18575,6 +18575,67 @@ struct DesktopState {
                         material_draft_dirty = true;
                     }
                 }
+                // Standard PBR slots share source selection while preserving mapping.
+                const auto draw_texture_slot = [&](const char* label, carto::render::TextureRef& binding) {
+                    std::string preview = "None";
+                    if (binding.asset != 0U) {
+                        const auto found = std::find_if(snapshot.texture_sources.begin(), snapshot.texture_sources.end(),
+                            [&](const auto& source) { return source.id == binding.asset; });
+                        preview = found == snapshot.texture_sources.end() ? "Missing texture source"
+                            : found->name + " - " + found->content_digest.hex().substr(0U, 12U);
+                    }
+                    ImGui::PushID(label);
+                    ImGui::BeginDisabled(material_draft_stale);
+                    if (ImGui::BeginCombo("Texture", preview.c_str())) {
+                        if (ImGui::Selectable("None", binding.asset == 0U) && binding.asset != 0U) {
+                            carto::studio::set_material_texture_source(binding, 0U);
+                            material_draft_dirty = true;
+                        }
+                        for (const auto& texture : snapshot.texture_sources) {
+                            const auto id = carto::studio::material_source_widget_id(snapshot.project_generation, texture.id);
+                            ImGui::PushID(id.c_str());
+                            const std::string item = texture.name + " - " + texture.content_digest.hex().substr(0U, 12U);
+                            if (ImGui::Selectable(item.c_str(), binding.asset == texture.id) && binding.asset != texture.id) {
+                                carto::studio::set_material_texture_source(binding, texture.id);
+                                material_draft_dirty = true;
+                            }
+                            ImGui::PopID();
+                        }
+                        ImGui::EndCombo();
+                    }
+                    ImGui::EndDisabled();
+                    ImGui::PopID();
+                };
+                ImGui::TextDisabled("Metallic-roughness (default: G roughness, B metallic)");
+                draw_texture_slot("Metallic-roughness", material_draft.metallic_roughness);
+                ImGui::TextDisabled("Normal map");
+                draw_texture_slot("Normal", material_draft.normal);
+                if (material_draft.normal.asset != 0U) {
+                    ImGui::BeginDisabled(material_draft_stale);
+                    int convention = material_draft.normal.normal_convention == carto::render::NormalConvention::opengl_y_plus ? 1 : 0;
+                    if (ImGui::Combo("Normal map convention", &convention, "DirectX (Y-)\0OpenGL (Y+)\0")) {
+                        material_draft.normal.normal_convention = convention == 1 ? carto::render::NormalConvention::opengl_y_plus : carto::render::NormalConvention::directx_y_minus;
+                        material_draft_dirty = true;
+                    }
+                    float scale = static_cast<float>(material_draft.normal_scale);
+                    if (ImGui::SliderFloat("Normal strength", &scale, 0.0F, 2.0F, "%.3f")) {
+                        material_draft.normal_scale = scale; material_draft_dirty = true;
+                    }
+                    ImGui::EndDisabled();
+                }
+                ImGui::TextDisabled("Occlusion (default: red channel)");
+                draw_texture_slot("Occlusion", material_draft.occlusion);
+                if (material_draft.occlusion.asset != 0U) {
+                    ImGui::BeginDisabled(material_draft_stale);
+                    float strength = static_cast<float>(material_draft.occlusion_strength);
+                    if (ImGui::SliderFloat("Occlusion strength", &strength, 0.0F, 1.0F, "%.3f")) {
+                        material_draft.occlusion_strength = strength; material_draft_dirty = true;
+                    }
+                    ImGui::EndDisabled();
+                }
+                ImGui::TextDisabled("Emissive texture (default: sRGB)");
+                draw_texture_slot("Emissive", material_draft.emissive);
+                ImGui::TextWrapped("New slots use default UV0 and sampling. Replacing a source retains its mapping. Maps multiply material factors; metallic and emissive factors must be above zero to see those maps. The ordinary workspace does not preview texture shading.");
                 ImGui::ColorButton("Current source color", ImVec4(
                     swatch[0], swatch[1], swatch[2], swatch[3]),
                     ImGuiColorEditFlags_NoTooltip, ImVec2(-1, 28));
