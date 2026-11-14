@@ -15,7 +15,7 @@
 
 namespace carto::assets {
 // Strict scene-linear RGB PFM input. Values are float32, not normalized bytes.
-// This is a building block only; project material binding is not yet wired to it.
+// Material bindings use an explicit source semantic and retain float precision.
 struct LinearFloatImage {
     std::uint32_t width{}, height{};
     std::vector<float> rgba;
@@ -59,7 +59,7 @@ inline LinearFloatImage decode_linear_pfm(std::span<const std::uint8_t> bytes) {
         }
     return out;
 }
-// Explicit scene-linear float emissive artifact. The canonical digest binds
+// Scene-linear float color artifact. The canonical digest binds
 // dimensions, all float bits and source digest; mips are never quantized.
 struct LinearFloatMipChain {
     Sha256Digest source_digest;
@@ -109,7 +109,11 @@ inline bool validate_linear_float_mips(const LinearFloatMipChain& chain) {
     if(chain.source_digest.is_zero() || chain.levels.empty() || chain.levels.size()>13 || chain.artifact_digest.is_zero()) return false;
     auto w=chain.levels.front().width, h=chain.levels.front().height;
     if (!w || !h || w>4096 || h>4096) return false;
-    for(const auto& level : chain.levels) {
+    for(std::size_t level_index=0; level_index<chain.levels.size(); ++level_index) {
+        const auto& level=chain.levels[level_index];
+        // A valid chain stops at its first 1x1 level; an extra terminal
+        // subresource would exceed the GPU's legal mip count.
+        if(w==1U && h==1U && level_index+1U!=chain.levels.size()) return false;
         if(level.width!=w || level.height!=h || level.rgba.size()!=std::size_t(w)*h*4U) return false;
         for(std::size_t i=0; i<level.rgba.size(); ++i) {
             const float v=level.rgba[i];
