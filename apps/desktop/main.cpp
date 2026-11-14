@@ -20118,6 +20118,14 @@ struct DesktopState {
             run_selection(carto::ui::selection_commands::all_boundary_edges);
         ImGui::TextDisabled("Replaces the edge selection on each selected mesh.");
         ImGui::EndDisabled();
+        ImGui::BeginDisabled(snapshot.selection.mode != carto::editor::SelectionMode::face);
+        if (ImGui::Button("Triangles")) run_selection(carto::ui::selection_commands::triangle_faces);
+        ImGui::SameLine();
+        if (ImGui::Button("Quads")) run_selection(carto::ui::selection_commands::quad_faces);
+        ImGui::SameLine();
+        if (ImGui::Button("N-gons")) run_selection(carto::ui::selection_commands::ngon_faces);
+        ImGui::TextDisabled("Replace selection with faces of that size on each selected mesh.");
+        ImGui::EndDisabled();
         ImGui::EndDisabled();
         if (!has_components) ImGui::TextDisabled("Select mesh components to convert or expand them.");
 

@@ -35,6 +35,9 @@ enum class SelectionExpansion {
     ring,
     boundary,
     all_boundary_edges,
+    triangle_faces,
+    quad_faces,
+    ngon_faces,
 };
 
 struct ComponentSelectionGroup {

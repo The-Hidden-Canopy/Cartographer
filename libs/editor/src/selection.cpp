@@ -43,7 +43,10 @@ bool valid_expansion(SelectionExpansion expansion) noexcept {
         expansion == SelectionExpansion::loop ||
         expansion == SelectionExpansion::ring ||
         expansion == SelectionExpansion::boundary ||
-        expansion == SelectionExpansion::all_boundary_edges;
+        expansion == SelectionExpansion::all_boundary_edges ||
+        expansion == SelectionExpansion::triangle_faces ||
+        expansion == SelectionExpansion::quad_faces ||
+        expansion == SelectionExpansion::ngon_faces;
 }
 
 } // namespace
@@ -333,6 +336,12 @@ core::Result<void> SelectionState::expand(
         return core::Result<void>::failure(invalid(
             "loop, ring, and boundary selection require edge selection mode"));
     }
+    const bool face_sides_selection = expansion == SelectionExpansion::triangle_faces ||
+        expansion == SelectionExpansion::quad_faces || expansion == SelectionExpansion::ngon_faces;
+    if (face_sides_selection && mode_ != SelectionMode::face) {
+        return core::Result<void>::failure(invalid(
+            "face-side selection requires face selection mode"));
+    }
     if (auto result = validate(mesh); !result) {
         return result;
     }
@@ -341,6 +350,23 @@ core::Result<void> SelectionState::expand(
     if (!topology) {
         return core::Result<void>::failure(topology.error().with_context(
             "selection expansion topology"));
+    }
+
+    if (face_sides_selection) {
+        std::set<geometry::FaceId> matches;
+        for (const auto& face : mesh.faces_sorted()) {
+            const auto sides = face.vertices.size();
+            if ((expansion == SelectionExpansion::triangle_faces && sides == 3U) ||
+                (expansion == SelectionExpansion::quad_faces && sides == 4U) ||
+                (expansion == SelectionExpansion::ngon_faces && sides > 4U)) {
+                matches.insert(face.id);
+            }
+        }
+        vertices_.clear();
+        vertex_selection_order_.clear();
+        edges_.clear();
+        faces_ = std::move(matches);
+        return core::Result<void>::success();
     }
 
     if (expansion == SelectionExpansion::all_boundary_edges) {
@@ -546,6 +572,12 @@ core::Result<void> SelectionState::expand(
          expansion == SelectionExpansion::all_boundary_edges) && mode_ != SelectionMode::edge) {
         return core::Result<void>::failure(invalid(
             "loop, ring, and boundary selection require edge selection mode"));
+    }
+    if ((expansion == SelectionExpansion::triangle_faces ||
+         expansion == SelectionExpansion::quad_faces ||
+         expansion == SelectionExpansion::ngon_faces) && mode_ != SelectionMode::face) {
+        return core::Result<void>::failure(invalid(
+            "face-side selection requires face selection mode"));
     }
     if (auto result = validate(scene, meshes); !result) return result;
 

@@ -11965,6 +11965,9 @@ core::Result<application::DispatchReceipt> UiController::run_selection_command(
         {selection_commands::ring, editor::SelectionExpansion::ring},
         {selection_commands::boundary, editor::SelectionExpansion::boundary},
         {selection_commands::all_boundary_edges, editor::SelectionExpansion::all_boundary_edges},
+        {selection_commands::triangle_faces, editor::SelectionExpansion::triangle_faces},
+        {selection_commands::quad_faces, editor::SelectionExpansion::quad_faces},
+        {selection_commands::ngon_faces, editor::SelectionExpansion::ngon_faces},
     };
     for (const auto& [id, expansion] : expansions) {
         if (command_id == id) return dispatch(application::ExpandSelectionAction{expansion});
@@ -12340,6 +12343,14 @@ std::vector<CommandView> UiController::command_views(
              std::pair{selection_commands::ring, "Select Edge Ring"}}) {
         commands.push_back({std::string(id), label, {}, edges,
             edges ? "" : "Select mesh edges first"});
+    }
+    const bool faces = components && current.selection.mode == editor::SelectionMode::face;
+    for (const auto& [id, label] : {
+             std::pair{selection_commands::triangle_faces, "Select Triangle Faces"},
+             std::pair{selection_commands::quad_faces, "Select Quad Faces"},
+             std::pair{selection_commands::ngon_faces, "Select N-gon Faces"}}) {
+        commands.push_back({std::string(id), label, {}, faces,
+            faces ? "" : "Select mesh faces first"});
     }
     const bool path = components && current.selection.mode == editor::SelectionMode::vertex &&
         current.selection.component_groups.size() == 1U &&
