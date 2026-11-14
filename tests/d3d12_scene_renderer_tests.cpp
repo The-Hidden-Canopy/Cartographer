@@ -966,6 +966,29 @@ void project_scene_texture_loader_binds_verified_sources_and_fails_closed() {
         "fixture-room", document, {}, 64U, 64U, loaded));
     require(request.textures.size() == 1U,
         "verified project pixels reach the native render request");
+    // Historical glTF imports stamped +Y on every texture slot. Reopen an
+    // actual saved project with that legacy metadata and preserve its bytes.
+    auto legacy_document = document;
+    auto legacy_catalog = legacy_document.material_catalog();
+    auto legacy_material = legacy_catalog.materials().at(1U);
+    legacy_material.definition.base_color.normal_convention = render::NormalConvention::opengl_y_plus;
+    legacy_material.revision = core::Revision{3U};
+    take(legacy_catalog.replace_material(legacy_material));
+    take(legacy_document.set_material_catalog(std::move(legacy_catalog)));
+    const auto legacy_bytes = legacy_document.serialize();
+    const auto legacy_path = temporary.path() / "legacy-nonnormal.carto";
+    { std::ofstream out(legacy_path, std::ios::binary); out << legacy_bytes; require(bool(out), "legacy fixture saved"); }
+    const auto reopened_legacy = take(project::ProjectDocument::load(legacy_path));
+    const auto reopened_before = reopened_legacy.serialize();
+    const auto legacy_request = take(d3d12::prepare_project_scene_render(
+        "fixture-room", reopened_legacy, {}, 64U, 64U, loaded));
+    require(reopened_legacy.serialize() == reopened_before &&
+        std::any_of(legacy_request.objects.begin(), legacy_request.objects.end(), [](const auto& object) {
+            return std::any_of(object.materials.begin(), object.materials.end(), [](const auto& binding) {
+                return binding.current_material.definition.base_color.normal_convention ==
+                    render::NormalConvention::opengl_y_plus;
+            });
+        }), "legacy non-normal convention prepares without rewriting saved source");
     auto mapped_channel_document = document;
     auto mapped_channel_catalog = mapped_channel_document.material_catalog();
     auto mapped_channel_material = mapped_channel_catalog.materials().at(1U);
@@ -3127,6 +3150,16 @@ void scene_render_uses_independent_material_slot_samplers(
         "distinct current samplers admit on base-color and metallic/roughness slots");
 
     const auto direct = capture(device, input);
+    auto legacy = input;
+    legacy.objects[0U].materials[0U].current_material.definition.base_color.normal_convention =
+        render::NormalConvention::opengl_y_plus;
+    legacy.objects[0U].materials[0U].current_material.definition.metallic_roughness.normal_convention =
+        render::NormalConvention::opengl_y_plus;
+    rebind(legacy.objects[0U]);
+    const auto legacy_pixels = capture(device, legacy);
+    require(legacy_pixels.linear_hdr_rgba == direct.linear_hdr_rgba &&
+            legacy_pixels.pixel_digest == direct.pixel_digest,
+        "historical non-normal +Y metadata is inert and produces identical pixels");
     d3d12::SceneRenderCache cache;
     const auto cached = take(d3d12::render_scene_cached(
         device, cache, input, CARTO_D3D12_SHADER_DIR));
@@ -5400,6 +5433,15 @@ int main(int argc, char** argv) {
             equirectangular_environment_derives_digest_bound_sh();
             radiance_hdr_environment_preserves_linear_specular_mips();
             std::cout << "PASS LDR/HDR environment source admission and prefiltering\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--legacy-nonnormal-only") {
+            project_scene_texture_loader_binds_verified_sources_and_fails_closed();
+            auto device = take(d3d12::D3D12Device::create({{}, false, true}));
+            scene_render_uses_independent_material_slot_samplers(*device);
+            require(device->debug_receipts().empty() && !device->device_lost(),
+                "legacy texture compatibility preserves a clean native device");
+            std::cout << "PASS legacy saved texture metadata and native pixel parity\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--material-gpu-only") {

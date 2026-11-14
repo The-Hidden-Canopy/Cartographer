@@ -79,9 +79,9 @@ Result<void> validate_executed_texture_binding(
             "scene PBR does not execute the authored " + std::string(slot_name) +
                 " texture " + std::string(setting)});
     };
-    if (semantic != assets::TextureSemantic::normal &&
-        binding.normal_convention != render::NormalConvention::directx_y_minus)
-        return unsupported("normal convention outside the normal-map slot");
+    // Normal Y convention has no meaning for non-normal slots. Historical
+    // glTF imports populated +Y there as well; retaining that metadata must
+    // not reject an otherwise valid color/data texture or change its pixels.
 
     const assets::ColorSpace expected = assets::expected_color_space(semantic);
     const assets::ColorSpace requested = binding.interpretation ==
