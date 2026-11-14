@@ -20,8 +20,8 @@ struct GltfSceneImportOptions {
     // two-sided, so callers must explicitly accept this visual projection.
     bool allow_default_material_projection = false;
 };
-// Snapshots the exact document and referenced external sibling buffers into a
-// single bounded source artifact. External images remain unsupported.
+// Snapshots the exact document and referenced external sibling buffers and PNG/JPEG images into a
+// single bounded source artifact.
 [[nodiscard]] core::Result<std::vector<std::uint8_t>> capture_gltf_scene_source(
     const std::filesystem::path& document_path, std::span<const std::uint8_t> bytes);
 // Static triangle scenes, embedded glTF/GLB or an owned captured source.
