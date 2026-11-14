@@ -136,6 +136,18 @@ int main(int argc, char **argv) {
             const auto captured_scene = take(io::capture_gltf_scene_source(path, scene_source));
             std::filesystem::remove(root / "albedo.png");
             const auto scene = take(io::import_gltf_scene(captured_scene));
+            auto all_slots_source = replace(scene_source, "\"baseColorTexture\":{\"index\":0},", "\"baseColorTexture\":{\"index\":0},\"metallicRoughnessTexture\":{\"index\":0},");
+            all_slots_source = replace(all_slots_source, "\"pbrMetallicRoughness\":{", "\"normalTexture\":{\"index\":0},\"occlusionTexture\":{\"index\":0},\"emissiveTexture\":{\"index\":0},\"pbrMetallicRoughness\":{");
+            { std::ofstream out(root / "albedo.png", std::ios::binary); out.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size())); }
+            const auto all_slots = take(io::import_gltf_scene(take(io::capture_gltf_scene_source(path, all_slots_source))));
+            std::filesystem::remove(root / "albedo.png");
+            const auto& definition = all_slots.materials.catalog.materials().begin()->second.definition;
+            check(definition.normal.normal_convention == render::NormalConvention::opengl_y_plus &&
+                  definition.base_color.normal_convention == render::NormalConvention::directx_y_minus &&
+                  definition.metallic_roughness.normal_convention == render::NormalConvention::directx_y_minus &&
+                  definition.occlusion.normal_convention == render::NormalConvention::directx_y_minus &&
+                  definition.emissive.normal_convention == render::NormalConvention::directx_y_minus,
+                  "glTF +Y convention applies only to the normal texture slot");
             check(scene.materials.encoded_images.size() == 1 && scene.meshes.size() == 1,
                   "textured external-image scene imports after its sibling is removed");
             check(!io::import_gltf_materials(source, false), "uncaptured external image is refused");
