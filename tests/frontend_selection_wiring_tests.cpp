@@ -636,8 +636,8 @@ void multi_vertex_bevel_controls_use_atomic_project_history() {
 void multi_object_vertex_merge_controls_match_per_object_cardinality() {
     using namespace carto;
     for (const bool by_distance : {false, true}) {
-        for (const auto mode : {geometry::VertexMergeMode::target, geometry::VertexMergeMode::center}) {
-            if (by_distance && mode == geometry::VertexMergeMode::center) continue;
+        for (const auto mode : {geometry::VertexMergeMode::target, geometry::VertexMergeMode::center, geometry::VertexMergeMode::last_selected}) {
+            if (by_distance && mode != geometry::VertexMergeMode::target) continue;
             Fixture fixture;
             REQUIRE(fixture.ui.dispatch(application::CreateMeshObjectAction{"Second quad", quad()}));
             const auto objects = fixture.session.snapshot().objects;
@@ -674,8 +674,18 @@ void multi_object_vertex_merge_controls_match_per_object_cardinality() {
             availability = studio::vertex_tool_availability(fixture.session.snapshot().selection);
             REQUIRE(availability.selected_vertices == 4U && availability.merge_pair && availability.merge_by_distance);
             before = fixture.truth();
-            const auto merged = fixture.ui.dispatch(application::InvokeToolAction{command, arguments});
+            if (mode == geometry::VertexMergeMode::last_selected) REQUIRE(availability.merge_last_selected);
+            const auto merged = mode == geometry::VertexMergeMode::last_selected
+                ? fixture.ui.dispatch(studio::merge_at_last_selected_action())
+                : fixture.ui.dispatch(application::InvokeToolAction{command, arguments});
             REQUIRE(merged && merged.value().affected.objects.size() == 2U);
+            if (mode == geometry::VertexMergeMode::last_selected) {
+                for (const auto asset : {*first.mesh_asset, *second.mesh_asset}) {
+                    const auto& mesh = fixture.session.document_.meshes().at(asset);
+                    REQUIRE(mesh.find_vertex(geometry::VertexId{1U}) == nullptr);
+                    REQUIRE(mesh.find_vertex(geometry::VertexId{2U}) != nullptr);
+                }
+            }
             REQUIRE(fixture.session.snapshot().undo_count == before.snapshot.undo_count + 1U);
             REQUIRE(fixture.session.document_.meshes().at(*first.mesh_asset).vertex_count() == 3U);
             REQUIRE(fixture.session.document_.meshes().at(*second.mesh_asset).vertex_count() == 3U);
@@ -706,6 +716,16 @@ void multi_object_vertex_merge_controls_match_per_object_cardinality() {
     availability = studio::vertex_tool_availability(selection);
     REQUIRE(!availability.merge_pair && !availability.merge_by_distance);
     selection.component_groups[1].vertices.resize(2U);
+    REQUIRE(!studio::vertex_tool_availability(selection).merge_last_selected);
+    selection.component_groups[0].vertices = {geometry::VertexId{1U}, geometry::VertexId{2U}};
+    selection.component_groups[1].vertices = {geometry::VertexId{3U}, geometry::VertexId{4U}};
+    selection.component_groups[0].vertex_selection_order = {geometry::VertexId{2U}, geometry::VertexId{1U}};
+    selection.component_groups[1].vertex_selection_order = {geometry::VertexId{3U}, geometry::VertexId{4U}};
+    REQUIRE(studio::vertex_tool_availability(selection).merge_last_selected);
+    selection.component_groups[1].vertex_selection_order = {geometry::VertexId{3U}, geometry::VertexId{3U}};
+    REQUIRE(!studio::vertex_tool_availability(selection).merge_last_selected);
+    selection.component_groups[1].vertex_selection_order = {geometry::VertexId{3U}, geometry::VertexId{9U}};
+    REQUIRE(!studio::vertex_tool_availability(selection).merge_last_selected);
     selection.mode = editor::SelectionMode::face;
     availability = studio::vertex_tool_availability(selection);
     REQUIRE(!availability.merge_pair && !availability.merge_by_distance);

@@ -20775,6 +20775,12 @@ struct DesktopState {
                     "mesh.merge-vertices", arguments}));
             }
             ImGui::EndDisabled();
+            ImGui::BeginDisabled(!vertex_tools.merge_last_selected);
+            if (ImGui::Button("Merge at last selected", ImVec2(-1, 30))) {
+                static_cast<void>(dispatch(carto::studio::merge_at_last_selected_action()));
+            }
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("Select two vertices per object; the last selected stays in place.");
             ImGui::BeginDisabled(!vertex_tools.merge_by_distance);
             ImGui::InputDouble("Merge distance", &merge_distance, 0.0001, 0.001, "%.5f");
             merge_distance = std::max(merge_distance, 1e-9);
