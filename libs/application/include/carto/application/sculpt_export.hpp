@@ -1,9 +1,16 @@
 #pragma once
 #include <carto/application/sculpt_preview_provider.hpp>
 namespace carto::application {
+enum class SculptExportFramePolicy {
+    // Required for consumers that may emit authored normals or tangents.
+    require_current,
+    // Only for exporters that omit authored normals and tangents entirely.
+    geometry_only,
+};
 // Materialize an identity-preserving sculpt preview into a disposable mesh for
 // explicit export. Source and stack remain unchanged; never persist this copy.
 [[nodiscard]] core::Result<geometry::EditableMesh> materialize_sculpt_for_export(
     const geometry::EditableMesh& source, const production::SculptStack& stack,
-    const SculptPreviewProvider& provider);
+    const SculptPreviewProvider& provider,
+    SculptExportFramePolicy frames = SculptExportFramePolicy::require_current);
 }

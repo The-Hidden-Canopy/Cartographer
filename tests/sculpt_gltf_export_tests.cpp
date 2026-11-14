@@ -96,9 +96,8 @@ int main(){try {
  auto normal_path=path; normal_path += ".normals.carto"; CHECK(normal_ui.dispatch(carto::application::SaveProjectAction{normal_path}));
  auto nd=carto::project::ProjectDocument::load(normal_path); CHECK(nd); auto ni=*nd.value().scene().find(no)->mesh_asset;
  const auto& nm=nd.value().meshes().at(ni); auto nstack=carto::production::SculptStack::deserialize(nd.value().sculpt_stacks().at(ni).bytes); CHECK(nstack);
- auto np=carto::application::materialize_sculpt_for_export(nm,nstack.value(),provider); CHECK(np);
- auto nv=nm.vertices_sorted(), na=np.value().vertices_sorted(); carto::geometry::MeshPatch n_patch; n_patch.expected_revision=nm.revision();
- for(size_t i=0;i<nv.size();++i) n_patch.vertex_changes.push_back({nv[i].id,nv[i].position,na[i].position});
+ auto nv=nm.vertices_sorted(); carto::geometry::MeshPatch n_patch; n_patch.expected_revision=nm.revision();
+ for(const auto& vertex:nv) {auto changed=vertex.position; changed.x+=0.25; n_patch.vertex_changes.push_back({vertex.id,vertex.position,changed});}
  auto nbytes=nd.value().serialize(); carto::io::GltfExportOptions noptions;
  noptions.evaluated_sculpt.emplace(ni,carto::io::GltfEvaluatedSculpt{carto::assets::sha256({reinterpret_cast<const std::uint8_t*>(nbytes.data()),nbytes.size()}),nd.value().sculpt_stacks().at(ni).digest,n_patch});
  CHECK(!carto::io::export_glb(nd.value(),missing,noptions));

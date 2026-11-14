@@ -2,7 +2,11 @@
 namespace carto::application {
 core::Result<geometry::EditableMesh> materialize_sculpt_for_export(
     const geometry::EditableMesh& source, const production::SculptStack& stack,
-    const SculptPreviewProvider& provider) {
+    const SculptPreviewProvider& provider, SculptExportFramePolicy frames) {
+    if (frames != SculptExportFramePolicy::require_current &&
+        frames != SculptExportFramePolicy::geometry_only)
+        return core::Result<geometry::EditableMesh>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument, "invalid sculpt export frame policy"));
     auto original = source.compile();
     if (!original) return core::Result<geometry::EditableMesh>::failure(original.error());
     auto evaluated = provider.evaluate(source, stack);
@@ -21,6 +25,18 @@ core::Result<geometry::EditableMesh> materialize_sculpt_for_export(
         const auto& before=base.positions[i]; const auto& after=product.positions[i];
         if (before.x!=after.x || before.y!=after.y || before.z!=after.z)
             patch.vertex_changes.push_back({base.vertex_ids[i],before,after});
+    }
+    // Authored corner frames describe the source surface. Preserving them
+    // after deformation would silently export stale shading. Unchanged or
+    // hidden sculpt remains safe, but changed surfaces require rebaking.
+    if (!patch.vertex_changes.empty() && frames == SculptExportFramePolicy::require_current) {
+        for (const auto& [id, layer] : source.attributes().layers()) {
+            (void)layer;
+            if (id == "cartographer.normal0" || id.starts_with("cartographer.tangent."))
+                return core::Result<geometry::EditableMesh>::failure(core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "sculpt export cannot preserve authored normals or tangents after deformation"));
+        }
     }
     auto output=source;
     if (!patch.vertex_changes.empty()) {

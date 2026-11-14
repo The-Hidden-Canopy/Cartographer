@@ -9308,7 +9308,11 @@ struct DesktopState {
                             L"Cartographer sculpt export failed", MB_OK | MB_ICONERROR);
                 return;
             }
-            auto result = carto::application::materialize_sculpt_for_export(source_mesh, stack.value(), *provider);
+            auto result = carto::application::materialize_sculpt_for_export(
+                source_mesh, stack.value(), *provider,
+                format == StandardMeshExport::obj
+                    ? carto::application::SculptExportFramePolicy::require_current
+                    : carto::application::SculptExportFramePolicy::geometry_only);
             if (!result) {
                 MessageBoxW(window, wide(result.error().message).c_str(),
                             L"Cartographer sculpt export failed", MB_OK | MB_ICONERROR);
