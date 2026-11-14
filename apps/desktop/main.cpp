@@ -20099,8 +20099,12 @@ struct DesktopState {
             }
         }
         ImGui::BeginDisabled(selection_path_goal == 0U);
-        if (ImGui::Button("Select shortest path", ImVec2(-1, 28)) && path_available) {
+        if (ImGui::Button("Select shortest path (edges)", ImVec2(-1, 28)) && path_available) {
             run_selection(carto::ui::selection_commands::shortest_path,
+                carto::geometry::VertexId{selection_path_goal}, path_groups.front().object);
+        }
+        if (ImGui::Button("Select shortest path (local length)", ImVec2(-1, 28)) && path_available) {
+            run_selection(carto::ui::selection_commands::shortest_path_length,
                 carto::geometry::VertexId{selection_path_goal}, path_groups.front().object);
         }
         ImGui::EndDisabled();

@@ -422,6 +422,7 @@ inline constexpr std::string_view loop = "selection.loop";
 inline constexpr std::string_view ring = "selection.ring";
 inline constexpr std::string_view boundary = "selection.boundary";
 inline constexpr std::string_view shortest_path = "selection.shortest-path";
+inline constexpr std::string_view shortest_path_length = "selection.shortest-path-length";
 } // namespace selection_commands
 
 enum class MeshImportFormat {

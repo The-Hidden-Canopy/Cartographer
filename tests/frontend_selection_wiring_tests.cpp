@@ -77,7 +77,7 @@ struct Truth {
 
 class Fixture {
 public:
-    Fixture() : ui(session) {
+    explicit Fixture(carto::geometry::EditableMesh mesh = quad()) : ui(session) {
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
         directory = std::filesystem::current_path() /
             ("cartographer-frontend-selection-" + std::to_string(stamp));
@@ -85,7 +85,7 @@ public:
         path = directory / "selection.carto";
         REQUIRE(ui.dispatch(carto::application::NewProjectAction{"Selection wiring", false}));
         REQUIRE(ui.dispatch(carto::application::CreateMeshObjectAction{
-            "Quad", quad(), std::nullopt, std::nullopt}));
+            "Quad", std::move(mesh), std::nullopt, std::nullopt}));
         REQUIRE(ui.dispatch(carto::application::SaveProjectAction{path}));
         source = session.snapshot().objects.front().object.id;
     }
@@ -176,6 +176,31 @@ void shared_selection_commands_convert_and_expand_without_authoring() {
     fixture.unchanged(before);
 }
 
+void weighted_path_command_selects_length_not_hops() {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    const auto a = mesh.add_vertex({0, 0, 0});
+    const auto b = mesh.add_vertex({1, -0.1, 0});
+    const auto c = mesh.add_vertex({2, -0.1, 0});
+    const auto d = mesh.add_vertex({3, 0, 0});
+    const auto e = mesh.add_vertex({1.5, 10, 0});
+    REQUIRE(a && b && c && d && e);
+    REQUIRE(mesh.add_face({a.value(), b.value(), c.value(), d.value(), e.value()}));
+    Fixture fixture(std::move(mesh));
+    fixture.select_vertex(a.value().value);
+    auto before = fixture.truth();
+    REQUIRE(fixture.run(ui::selection_commands::shortest_path, d.value()));
+    REQUIRE((fixture.session.snapshot().selection.component_groups.front().vertex_selection_order ==
+        std::vector<geometry::VertexId>{a.value(), e.value(), d.value()}));
+    fixture.unchanged(before);
+    fixture.select_vertex(a.value().value);
+    before = fixture.truth();
+    REQUIRE(fixture.run(ui::selection_commands::shortest_path_length, d.value()));
+    REQUIRE((fixture.session.snapshot().selection.component_groups.front().vertex_selection_order ==
+        std::vector<geometry::VertexId>{a.value(), b.value(), c.value(), d.value()}));
+    fixture.unchanged(before);
+}
+
 void shared_shortest_path_keeps_backend_ties_and_refuses_bad_context() {
     using namespace carto;
     Fixture fixture;
@@ -205,6 +230,13 @@ void shared_shortest_path_keeps_backend_ties_and_refuses_bad_context() {
     REQUIRE((path.vertex_selection_order ==
         std::vector<geometry::VertexId>{{1U}, {2U}, {3U}}));
     fixture.unchanged(before);
+    fixture.select_vertex(1U);
+    const auto weighted_before = fixture.truth();
+    REQUIRE(fixture.run(ui::selection_commands::shortest_path_length, geometry::VertexId{3U}));
+    const auto weighted = fixture.session.snapshot().selection.component_groups.front();
+    REQUIRE((weighted.vertex_selection_order ==
+        std::vector<geometry::VertexId>{{1U}, {2U}, {3U}}));
+    fixture.unchanged(weighted_before);
 
     const auto captured = fixture.session.snapshot();
     REQUIRE(fixture.ui.dispatch(application::CreateBoxAction{"Later edit", {1.0, 1.0, 1.0}}));
@@ -684,6 +716,7 @@ void multi_object_vertex_merge_controls_match_per_object_cardinality() {
 int main() {
     try {
         shared_selection_commands_convert_and_expand_without_authoring();
+        weighted_path_command_selects_length_not_hops();
         shared_shortest_path_keeps_backend_ties_and_refuses_bad_context();
         shared_batch_duplicate_is_bounded_journaled_and_undoable();
         batch_availability_matches_refusal_for_ineligible_authored_sources();

@@ -73,12 +73,13 @@ public:
         const std::map<scene::ObjectId, const geometry::EditableMesh*>& meshes);
     [[nodiscard]] core::Result<void> select_shortest_path(
         geometry::VertexId goal,
-        const geometry::EditableMesh& mesh);
+        const geometry::EditableMesh& mesh, bool by_length = false);
     [[nodiscard]] core::Result<void> select_shortest_path(
         scene::ObjectId owner,
         geometry::VertexId goal,
         const scene::Scene& scene,
-        const std::map<scene::ObjectId, const geometry::EditableMesh*>& meshes);
+        const std::map<scene::ObjectId, const geometry::EditableMesh*>& meshes,
+        bool by_length = false);
     void clear() noexcept;
 
     [[nodiscard]] core::Result<void> select_object(

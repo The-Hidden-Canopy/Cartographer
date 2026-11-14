@@ -446,6 +446,10 @@ public:
 
     [[nodiscard]] core::Result<void> validate() const;
     [[nodiscard]] core::Result<TopologySnapshot> topology() const;
+    // Shortest edge-connected route measured in object-space Euclidean length.
+    // Equal-length alternatives are resolved deterministically by vertex ID.
+    [[nodiscard]] core::Result<std::vector<VertexId>> shortest_edge_path(
+        VertexId start, VertexId goal) const;
     [[nodiscard]] core::Result<CompiledMesh> compile() const;
 
     [[nodiscard]] core::Revision revision() const noexcept { return revision_; }

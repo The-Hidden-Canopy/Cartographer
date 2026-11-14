@@ -6936,6 +6936,66 @@ core::Result<std::vector<VertexId>> TopologySnapshot::shortest_path(
         Diagnostic(ErrorCode::not_found, "topology vertices are not linked by a path"));
 }
 
+core::Result<std::vector<VertexId>> EditableMesh::shortest_edge_path(
+    VertexId start, VertexId goal) const {
+    using PathResult = core::Result<std::vector<VertexId>>;
+    if (!start || !goal) return PathResult::failure(invalid("path endpoints must be non-zero"));
+    if (!find_vertex(start) || !find_vertex(goal)) return PathResult::failure(
+        Diagnostic(ErrorCode::not_found, "path endpoint was not found"));
+    const auto snapshot = topology();
+    if (!snapshot) return PathResult::failure(snapshot.error());
+    if (start == goal) return PathResult::success({start});
+    std::map<VertexId, std::vector<std::pair<VertexId, double>>> adjacency;
+    for (const auto& edge : snapshot.value().edges) {
+        const auto* a = find_vertex(edge.first);
+        const auto* b = find_vertex(edge.second);
+        if (!a || !b) return PathResult::failure(Diagnostic(ErrorCode::stale_data,
+            "path edge references a missing vertex"));
+        const double length = std::hypot(a->position.x - b->position.x,
+            a->position.y - b->position.y, a->position.z - b->position.z);
+        adjacency[edge.first].emplace_back(edge.second, length);
+        adjacency[edge.second].emplace_back(edge.first, length);
+    }
+    for (auto& [id, neighbors] : adjacency) {
+        static_cast<void>(id);
+        std::sort(neighbors.begin(), neighbors.end());
+    }
+    // Ordered frontier gives deterministic tie handling without changing an
+    // already chosen predecessor, preventing zero-cost predecessor cycles.
+    std::set<std::pair<double, VertexId>> frontier{{0.0, start}};
+    std::map<VertexId, double> distances{{start, 0.0}};
+    std::map<VertexId, VertexId> predecessor;
+    while (!frontier.empty()) {
+        const auto [distance, current] = *frontier.begin();
+        frontier.erase(frontier.begin());
+        if (current == goal) {
+            std::vector<VertexId> path{goal};
+            for (auto cursor = goal; cursor != start;) {
+                cursor = predecessor.at(cursor);
+                path.push_back(cursor);
+            }
+            std::reverse(path.begin(), path.end());
+            return PathResult::success(std::move(path));
+        }
+        const auto found = adjacency.find(current);
+        if (found == adjacency.end()) continue;
+        for (const auto& [next, weight] : found->second) {
+            if (!std::isfinite(weight) || weight <= 0.0) return PathResult::failure(invalid(
+                "path requires finite, positive edge lengths"));
+            const double candidate = distance + weight;
+            if (!std::isfinite(candidate)) return PathResult::failure(invalid(
+                "path length exceeds supported numeric range"));
+            const auto previous = distances.find(next);
+            if (previous != distances.end() && candidate >= previous->second) continue;
+            if (previous != distances.end()) frontier.erase({previous->second, next});
+            distances[next] = candidate;
+            predecessor[next] = current;
+            frontier.emplace(candidate, next);
+        }
+    }
+    return PathResult::failure(Diagnostic(ErrorCode::not_found, "vertices are not linked by a path"));
+}
+
 core::Result<CompiledMesh> EditableMesh::compile() const {
     if (auto result = validate(); !result) {
         return core::Result<CompiledMesh>::failure(result.error());

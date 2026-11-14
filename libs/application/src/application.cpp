@@ -5146,7 +5146,7 @@ core::Result<DispatchReceipt> ApplicationSession::select_shortest_path(
         }
         const core::Revision before = document_.revision();
         if (auto result = selection_.select_shortest_path(
-                *action.owner, action.goal, document_.scene(), owner_meshes); !result) {
+                *action.owner, action.goal, document_.scene(), owner_meshes, action.by_length); !result) {
             return failure(result.error().with_context("owner-scoped shortest-path selection"));
         }
         return accepted("Select Shortest Path", before);
@@ -5175,7 +5175,7 @@ core::Result<DispatchReceipt> ApplicationSession::select_shortest_path(
             "shortest-path selection owner references a missing mesh"));
     }
     const core::Revision before = document_.revision();
-    if (auto result = selection_.select_shortest_path(action.goal, mesh->second); !result) {
+    if (auto result = selection_.select_shortest_path(action.goal, mesh->second, action.by_length); !result) {
         return failure(result.error().with_context("shortest-path selection"));
     }
     return accepted("Select Shortest Path", before);

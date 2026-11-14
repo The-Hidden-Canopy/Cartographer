@@ -967,6 +967,7 @@ struct ExpandSelectionAction {
 struct SelectShortestPathAction {
     geometry::VertexId goal;
     std::optional<scene::ObjectId> owner = std::nullopt;
+    bool by_length = false;
 };
 
 struct SelectObjectAction {

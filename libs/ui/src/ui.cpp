@@ -11968,11 +11968,13 @@ core::Result<application::DispatchReceipt> UiController::run_selection_command(
     for (const auto& [id, expansion] : expansions) {
         if (command_id == id) return dispatch(application::ExpandSelectionAction{expansion});
     }
-    if (command_id == selection_commands::shortest_path) {
+    if (command_id == selection_commands::shortest_path ||
+        command_id == selection_commands::shortest_path_length) {
         if (!path_goal || !path_owner.has_value() || !*path_owner) {
             return refuse(invalid("shortest path requires an explicit owner and goal vertex"));
         }
-        return dispatch(application::SelectShortestPathAction{path_goal, path_owner});
+        return dispatch(application::SelectShortestPathAction{path_goal, path_owner,
+            command_id == selection_commands::shortest_path_length});
     }
     return refuse(core::Diagnostic(core::ErrorCode::not_found, "selection command is unknown"));
 }
