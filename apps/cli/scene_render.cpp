@@ -166,7 +166,7 @@ int main(int argc, char** argv) {
             "[--antialias fxaa|none] "
             "[--graph-parameter graph-id name scalar|color|normal values...] "
             "[--graph-surface-input graph-id input-name scalar|color|normal values...] "
-            "[--texture id exact-current-source-mip-artifact] [--hdr-emissive id linear-float.pfm] [--diffuse-irradiance-sh file] "
+            "[--texture id exact-current-source-mip-artifact] [--hdr-emissive id linear-float.pfm] [--hdr-base-color id linear-float.pfm] [--diffuse-irradiance-sh file] "
             "[--environment-equirectangular png|jpg|tga|Radiance-HDR --environment-color-space linear|srgb (HDR requires linear)]");
         const std::filesystem::path input_path = argv[1], output_path = argv[2];
         const std::filesystem::path receipt_path = output_path.string() + ".receipt.json";
@@ -196,7 +196,12 @@ int main(int argc, char** argv) {
             std::filesystem::path path;
         };
         std::vector<SuppliedMipArtifact> supplied_mip_artifacts;
-        std::vector<SuppliedMipArtifact> float_overrides;
+        struct FloatOverride {
+            assets::TextureAssetId asset = 0U;
+            std::filesystem::path path;
+            assets::TextureSemantic semantic = assets::TextureSemantic::emissive;
+        };
+        std::vector<FloatOverride> float_overrides;
         std::map<std::string, project::MaterialGraphEvaluationInputs> pending_graph_inputs;
         const auto read_graph_value = [&](std::string_view type,
                                           const auto& next) {
@@ -326,10 +331,11 @@ int main(int argc, char** argv) {
                 if (supplied_mip_artifacts.size() >= 1024U)
                     throw std::runtime_error("more than 1024 mip artifacts were supplied");
                 supplied_mip_artifacts.push_back({id, path});
-            } else if (option == "--hdr-emissive") {
+            } else if (option == "--hdr-emissive" || option == "--hdr-base-color") {
                 const auto id=number<std::uint64_t>(next()); const std::filesystem::path path=next();
                 if(float_overrides.size()>=1024U) throw std::runtime_error("too many float overrides");
-                float_overrides.push_back({id,path});
+                const auto semantic=option == "--hdr-base-color" ? assets::TextureSemantic::base_color : assets::TextureSemantic::emissive;
+                float_overrides.push_back({id,path,semantic});
             } else if (option == "--graph-parameter" ||
                        option == "--graph-surface-input") {
                 const std::string graph_identity(next());
@@ -446,8 +452,8 @@ int main(int argc, char** argv) {
         for (const auto& supplied : float_overrides) {
             const auto current=std::find_if(textures.begin(),textures.end(),[&](const auto& t){return t.asset==supplied.asset;});
             if(current==textures.end() || supplied.asset==0U || !float_ids.insert(supplied.asset).second ||
-                (!current->mips.levels.empty() && current->mips.semantic!=assets::TextureSemantic::emissive))
-                throw std::runtime_error("float override must name one bound emissive texture");
+                current->mips.levels.empty() || current->mips.semantic!=supplied.semantic)
+                throw std::runtime_error("float override must name one bound RGBA8 texture of the requested color semantic; reimport saved PFM sources instead");
             std::ifstream file(supplied.path,std::ios::binary|std::ios::ate); const auto size=file.tellg();
             if(!file || size<=0 || size>static_cast<std::streamoff>(256ULL*1024*1024))
                 throw std::runtime_error("float texture missing or exceeds 256 MiB");
@@ -467,6 +473,7 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("aggregate float texture mips exceed 512 MiB");
             float_payload_bytes+=mip_bytes;
             current->linear_float_mips=assets::generate_linear_float_mips(std::move(decoded),digest);
+            current->linear_float_semantic=supplied.semantic;
         }
         auto request = take(d3d12::prepare_project_scene_render(
             identity, document, camera, width, height, std::move(textures), light,
@@ -502,9 +509,21 @@ int main(int argc, char** argv) {
         else receipt << "null";
         receipt << ",\n  \"float_emissive_textures\": [";
         bool first_float = true;
-        for (const auto& texture : request.textures) if (texture.linear_float_mips) {
+        for (const auto& texture : request.textures) if (texture.linear_float_mips &&
+                texture.linear_float_semantic == assets::TextureSemantic::emissive) {
             if (!first_float) receipt << ",";
             first_float = false;
+            receipt << "{\"asset\":" << texture.asset << ",\"source_digest\":"
+                << json(texture.linear_float_mips->source_digest.hex())
+                << ",\"mip_digest\":" << json(texture.linear_float_mips->artifact_digest.hex()) << "}";
+        }
+        receipt << "]";
+        receipt << ",\n  \"float_base_color_textures\": [";
+        bool first_float_base = true;
+        for (const auto& texture : request.textures) if (texture.linear_float_mips &&
+                texture.linear_float_semantic == assets::TextureSemantic::base_color) {
+            if (!first_float_base) receipt << ",";
+            first_float_base = false;
             receipt << "{\"asset\":" << texture.asset << ",\"source_digest\":"
                 << json(texture.linear_float_mips->source_digest.hex())
                 << ",\"mip_digest\":" << json(texture.linear_float_mips->artifact_digest.hex()) << "}";

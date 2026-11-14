@@ -81,7 +81,11 @@ inline LinearFloatMipChain generate_linear_float_mips(LinearFloatImage image, Sh
     if (source.is_zero() || !image.width || !image.height || image.width>4096 || image.height>4096 ||
         image.rgba.size()!=std::size_t(image.width)*image.height*4U)
         throw std::runtime_error("invalid float texture source");
-    for (float v : image.rgba) if (!std::isfinite(v) || v < 0.0f) throw std::runtime_error("invalid float emissive texel");
+    for (std::size_t i=0; i<image.rgba.size(); ++i) {
+        const float v=image.rgba[i];
+        if (!std::isfinite(v) || v<0.0f || (i%4U==3U && v>1.0f))
+            throw std::runtime_error("invalid linear float color or alpha texel");
+    }
     LinearFloatMipChain out; out.source_digest=source; out.levels.push_back(std::move(image));
     while (out.levels.back().width>1 || out.levels.back().height>1) {
         const auto& src=out.levels.back(); LinearFloatImage dst;
@@ -107,7 +111,10 @@ inline bool validate_linear_float_mips(const LinearFloatMipChain& chain) {
     if (!w || !h || w>4096 || h>4096) return false;
     for(const auto& level : chain.levels) {
         if(level.width!=w || level.height!=h || level.rgba.size()!=std::size_t(w)*h*4U) return false;
-        for(float v:level.rgba) if(!std::isfinite(v) || v<0) return false;
+        for(std::size_t i=0; i<level.rgba.size(); ++i) {
+            const float v=level.rgba[i];
+            if(!std::isfinite(v) || v<0.0f || (i%4U==3U && v>1.0f)) return false;
+        }
         w=std::max(1U,w/2); h=std::max(1U,h/2);
     }
     return chain.levels.back().width==1 && chain.levels.back().height==1 && linear_float_mip_digest(chain)==chain.artifact_digest;

@@ -154,8 +154,10 @@ struct SceneRenderTexture {
     // from a previous source cannot silently satisfy the current source.
     assets::Sha256Digest current_source_digest;
     assets::Rgba8MipChain mips;
-    // Optional explicit linear PFM override, supported only for emissive slots.
+    // Scene-linear float PFM, interpreted as base color or emissive radiance.
+    // The slot is explicit so a float source cannot silently change meaning.
     std::optional<assets::LinearFloatMipChain> linear_float_mips;
+    assets::TextureSemantic linear_float_semantic = assets::TextureSemantic::emissive;
 };
 
 struct SceneRenderEnvironmentMipLevel {

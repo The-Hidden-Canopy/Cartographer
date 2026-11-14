@@ -659,7 +659,11 @@ assets::Sha256Digest request_digest(const SceneRenderRequest& request) {
     for (const auto& texture : request.textures) {
         append_u64(data, texture.asset); append_digest(data, texture.current_source_digest);
         append_digest(data, texture.mips.artifact_digest);
-        if (texture.linear_float_mips) append_digest(data, texture.linear_float_mips->artifact_digest);
+        if (texture.linear_float_mips) {
+            append_u64(data, 0x4633324d49505631ULL); // F32MIPV1 domain separator
+            append_u32(data, static_cast<std::uint32_t>(texture.linear_float_semantic));
+            append_digest(data, texture.linear_float_mips->artifact_digest);
+        }
     }
     append_u64(data, request.samplers.size());
     for (const auto& [identity, sampler] : request.samplers)
@@ -780,7 +784,11 @@ assets::Sha256Digest material_texture_cache_identity(
         append_u64(data, texture.asset);
         append_digest(data, texture.current_source_digest);
         append_digest(data, texture.mips.artifact_digest);
-        if (texture.linear_float_mips) append_digest(data, texture.linear_float_mips->artifact_digest);
+        if (texture.linear_float_mips) {
+            append_u64(data, 0x4633324d49505631ULL); // F32MIPV1 domain separator
+            append_u32(data, static_cast<std::uint32_t>(texture.linear_float_semantic));
+            append_digest(data, texture.linear_float_mips->artifact_digest);
+        }
     }
     append_u64(data, request.samplers.size());
     for (const auto& [identity, sampler] : request.samplers)
@@ -1594,9 +1602,11 @@ Result<void> SceneRenderRequest::validate() const {
             if (auto valid = texture.mips.validate(); !valid) return valid;
         }
         if (texture.linear_float_mips) {
-            if ((!float_only && texture.mips.semantic != assets::TextureSemantic::emissive) ||
+            const auto semantic = texture.linear_float_semantic;
+            if ((semantic != assets::TextureSemantic::base_color && semantic != assets::TextureSemantic::emissive) ||
+                (!float_only && texture.mips.semantic != semantic) ||
                 !assets::validate_linear_float_mips(*texture.linear_float_mips))
-                return Result<void>::failure(invalid("invalid linear float emissive texture"));
+                return Result<void>::failure(invalid("invalid linear float color texture"));
             for (const auto& level : texture.linear_float_mips->levels) {
                 const auto size=static_cast<std::uint64_t>(level.rgba.size())*sizeof(float);
                 if(size>kPayloadLimit-payload) return Result<void>::failure(invalid("float texture payload exceeds 512 MiB"));
@@ -1787,7 +1797,7 @@ Result<void> SceneRenderRequest::validate() const {
                 if (found == available.end()) return Result<void>::failure({core::ErrorCode::not_found, "bound scene texture is unavailable; no fallback permitted"});
                 const auto& mip = found->second->mips;
                 const bool float_only=mip.levels.empty() && found->second->linear_float_mips.has_value();
-                if (float_only ? kSemantics[slot] != assets::TextureSemantic::emissive :
+                if (float_only ? kSemantics[slot] != found->second->linear_float_semantic :
                     (mip.semantic != kSemantics[slot] || mip.color_space != assets::expected_color_space(kSemantics[slot])))
                     return Result<void>::failure(invalid("scene texture semantic/color space differs from material slot"));
                 used_textures.insert(id);

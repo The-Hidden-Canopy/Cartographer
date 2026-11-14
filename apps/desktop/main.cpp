@@ -18419,7 +18419,7 @@ struct DesktopState {
             }
         }
         ImGui::EndDisabled();
-        ImGui::TextDisabled("PFM: scene-linear Rec.709 RGB float, emissive slot only.");
+        ImGui::TextDisabled("PFM: scene-linear Rec.709 RGB float, base-color or emissive slot.");
         if (!snapshot.project_path.has_value()) {
             ImGui::TextDisabled("Save this project before importing texture sources.");
         }

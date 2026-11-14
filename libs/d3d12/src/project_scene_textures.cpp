@@ -223,9 +223,10 @@ core::Result<std::vector<SceneRenderTexture>> load_project_scene_textures(
                 "saved material texture bytes differ from the current source record"});
         }
         if (source->second.format == assets::TextureSourceFormat::pfm) {
-            if (requested_texture.semantic != assets::TextureSemantic::emissive)
+            if (requested_texture.semantic != assets::TextureSemantic::base_color &&
+                requested_texture.semantic != assets::TextureSemantic::emissive)
                 return Output::failure({core::ErrorCode::unsupported,
-                    "scene-linear float PFM material sources are supported only for emissive slots"});
+                    "scene-linear float PFM sources are supported only for base-color or emissive slots"});
             const auto count=mip_payload_bytes(source->second.width,source->second.height,limits.max_mip_levels);
             if(!count || count.value()> (kMaxSceneTextureBytes-aggregate_mip_bytes)/4U)
                 return Output::failure(invalid("saved float mip payload exceeds the native 512 MiB bound"));
@@ -233,7 +234,9 @@ core::Result<std::vector<SceneRenderTexture>> load_project_scene_textures(
                 auto decoded=assets::decode_linear_pfm(bytes.value());
                 auto float_mips=assets::generate_linear_float_mips(std::move(decoded),source->second.content_digest);
                 SceneRenderTexture texture;texture.asset=identity;texture.current_source_digest=source->second.content_digest;
-                texture.linear_float_mips=std::move(float_mips);loaded.push_back(std::move(texture));
+                texture.linear_float_mips=std::move(float_mips);
+                texture.linear_float_semantic=requested_texture.semantic;
+                loaded.push_back(std::move(texture));
                 aggregate_mip_bytes+=count.value()*4U;
             } catch(const std::exception& e) {
                 return Output::failure(invalid(std::string("saved float texture decode failed: ")+e.what()));

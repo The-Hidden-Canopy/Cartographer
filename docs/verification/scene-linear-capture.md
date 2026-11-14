@@ -1,30 +1,31 @@
-# Scene-linear float capture
+# Scene-linear float color and capture
 
-`cartographer_scene_render` accepts a new `.pfm` output in addition to the
-existing `.bmp`. PFM contains scene-linear RGB, IEEE-754 binary32, little-endian,
-bottom scanline first, with unit scale. Alpha is not stored. Values above 1 are
-preserved; exposure, display tone mapping, and FXAA do not change this buffer.
-The adjacent receipt records the output format and SHA-256 digest. BMP remains
-an 8-bit, tone-mapped sRGB preview and retains its existing `bmp_digest` field.
+`cartographer_scene_render` can write a `.pfm` capture as well as `.bmp`.
+PFM contains scene-linear RGB, IEEE-754 binary32, little-endian, bottom row
+first, with unit scale; alpha is omitted. Values above 1 are preserved before
+exposure, tone mapping and FXAA. The receipt includes the output digest. BMP
+remains a tone-mapped 8-bit sRGB preview.
 
-This is an offline scene-render capture, not an HDR display signal, and does
-not make material texture inputs HDR: those still use RGBA8 mip chains. EXR
-source inspection does not imply EXR pixel decoding. Radiance RGBE environment
-lighting follows its existing separate HDR import path.
+Strict RGB `.pfm` sources can be imported as content-addressed project textures
+and bound to base-color or emissive slots. The source is interpreted as
+scene-linear Rec.709 RGB because PFM contains no color-profile metadata. The
+caller must provide that interpretation. Float mips are filtered in linear
+light and uploaded as RGBA32F, not converted through an 8-bit sRGB path. PFM
+carries no alpha here: its alpha is opaque. RGB values above 1 are preserved,
+including for base color; such base colors are an artistic HDR choice and do
+not represent energy-conserving reflectance. Negative and nonfinite material
+values are rejected. Normal, metallic/roughness, and occlusion slots do not
+accept float PFM in this path.
 
-A bounded strict PFM decoder is staged as an independent float-image building
-block. It accepts only RGB, little-endian unit-scale float PFM, rejects
-nonfinite values and malformed lengths, and keeps values above one. It is not
-yet connected to texture admission, persistence, material slots or the GPU.
+For a saved RGBA8 texture, `--hdr-base-color ID file.pfm` or `--hdr-emissive
+ID file.pfm` can supply a per-capture float override for the corresponding slot.
+The receipt binds source and mip digests. Saved PFM sources should be reimported
+instead of overridden. Source identity and semantic are part of the render and
+GPU cache identity.
 
-The experimental CLI option `--hdr-emissive ID file.pfm` substitutes a strict
-scene-linear Rec.709 RGB float PFM for one already-bound emissive texture during capture.
-PFM has no embedded color profile, so the caller supplies values in that space.
-It generates float mips and uploads RGBA32F; the receipt binds source and mip
-digests. This is a per-capture override, not a saved project import or EXR
-decoder. Other material slots continue to use the legacy RGBA8 path.
-A strict `.pfm` can also be imported as a content-addressed project texture and
-bound to an emissive material slot. Its bytes remain in the project asset store;
-the renderer verifies the source hash and regenerates float mips after reload.
-No RGBA8 fallback is used. Other material slots reject PFM for now. Existing
-8-bit PNG/JPEG/TGA behavior is unchanged, and inspected EXR is still not decoded.
+The native project keeps its source blob and regenerates float mips after reload;
+this is not an HDR display signal. The glTF writer refuses PFM material textures
+rather than silently quantizing them to its RGBA8 PNG path. It supports the
+`KHR_materials_emissive_strength` extension for representable emissive factors,
+but recipient extension support varies and is not established by this feature.
+EXR inspection does not imply pixel decoding or a particular color space.
