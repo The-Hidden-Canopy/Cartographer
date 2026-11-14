@@ -84,6 +84,38 @@ int main(int argc, char **argv) {
             ("static-gltf-import-" +
              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         std::filesystem::create_directories(root);
+        // A filesystem-dependent .gltf is snapshotted once; subsequent parsing
+        // must use the captured bytes even if the sibling changes or disappears.
+        {
+            const std::string json = R"({"asset":{"version":"2.0"},"images":[{"uri":"albedo.png"}]})";
+            const std::vector<std::uint8_t> source(json.begin(), json.end());
+            const std::vector<std::uint8_t> png = {137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,1,0,0,0,1,8,6,0,0,0,31,21,196,137,0,0,0,13,73,68,65,84,120,156,99,248,207,192,240,31,0,5,0,1,255,137,153,61,29,0,0,0,0,73,69,78,68,174,66,96,130};
+            const auto path = root / "external.gltf";
+            { std::ofstream out(root / "albedo.png", std::ios::binary); out.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size())); }
+            const auto captured = take(io::capture_gltf_scene_source(path, source));
+            std::filesystem::remove(root / "albedo.png");
+            const auto materials = take(io::import_gltf_materials(captured, false));
+            check(materials.encoded_images.size() == 1 && materials.encoded_images[0] == png,
+                  "external image is captured and imported without filesystem access");
+            // Exercise the same captured image through the scene material path.
+            { std::ofstream out(root / "albedo.png", std::ios::binary); out.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size())); }
+            auto scene_source = replace(fixture(), "\"materials\":[", "\"images\":[{\"uri\":\"albedo.png\"}],\"textures\":[{\"source\":0}],\"materials\":[");
+            scene_source = replace(scene_source, "\"pbrMetallicRoughness\":{", "\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0},");
+            const auto captured_scene = take(io::capture_gltf_scene_source(path, scene_source));
+            std::filesystem::remove(root / "albedo.png");
+            const auto scene = take(io::import_gltf_scene(captured_scene));
+            check(scene.materials.encoded_images.size() == 1 && scene.meshes.size() == 1,
+                  "textured external-image scene imports after its sibling is removed");
+            check(!io::import_gltf_materials(source, false), "uncaptured external image is refused");
+            const auto mismatch = replace(source, "\"uri\":\"albedo.png\"", "\"uri\":\"albedo.png\",\"mimeType\":\"image/jpeg\"");
+            { std::ofstream out(root / "albedo.png", std::ios::binary); out.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size())); }
+            const auto mismatch_package = take(io::capture_gltf_scene_source(path, mismatch));
+            check(!io::import_gltf_materials(mismatch_package, false), "conflicting MIME is refused");
+            std::filesystem::remove(root / "albedo.png");
+            const std::string escape = R"({"asset":{"version":"2.0"},"images":[{"uri":"../albedo.png"}]})";
+            check(!io::capture_gltf_scene_source(path, {reinterpret_cast<const std::uint8_t*>(escape.data()), escape.size()}),
+                  "external image path traversal is refused");
+        }
         for (bool binary : {false, true}) {
             auto bytes = fixture(binary);
             auto parsed = take(io::import_gltf_scene(bytes));

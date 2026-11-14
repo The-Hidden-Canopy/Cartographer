@@ -172,7 +172,7 @@ GltfContainer container(std::span<const std::uint8_t> bytes) {
         };
         const auto document_size = take_u32();
         const auto count = take_u32();
-        if (!document_size || count == 0U || count > 16U || document_size > bytes.size() - cursor)
+        if (!document_size || count == 0U || count > 80U || document_size > bytes.size() - cursor)
             throw std::runtime_error("invalid glTF source package header");
         const auto document = bytes.subspan(cursor, document_size);
         cursor += document_size;
@@ -272,20 +272,22 @@ core::Result<std::vector<std::uint8_t>> capture_gltf_scene_source(
         const auto root = object(contents.json);
         std::vector<std::pair<std::string, std::vector<std::uint8_t>>> captured;
         std::uint64_t total = bytes.size();
-        for (auto raw : array(get(root, "buffers", "[]"), 16)) {
-            const auto entry = object(raw);
-            const auto uri = get(entry, "uri");
-            if (uri.empty()) continue;
+        const auto capture_uri = [&](std::string_view uri, std::size_t limit) {
+            if (uri.empty()) return;
             const auto name = text(uri);
-            if (name.starts_with("data:")) continue;
+            if (name.starts_with("data:")) return;
             if (std::any_of(captured.begin(), captured.end(), [&](const auto& item) { return item.first == name; }))
-                continue;
-            auto data = detail::read_gltf_sibling(path, name, 64U * 1024U * 1024U);
-            if (!data) return Result::failure(data.error());
+                return;
+            auto data = detail::read_gltf_sibling(path, name, limit);
+            if (!data) throw std::runtime_error(data.error().message);
             if (data.value().empty() || (total += data.value().size() + name.size() + 8U) > 128U * 1024U * 1024U - 20U)
                 throw std::runtime_error("glTF source package exceeds its size limit");
             captured.emplace_back(name, std::move(data.value()));
-        }
+        };
+        for (auto raw : array(get(root, "buffers", "[]"), 16))
+            capture_uri(get(object(raw), "uri"), 64U * 1024U * 1024U);
+        for (auto raw : array(get(root, "images", "[]"), 64))
+            capture_uri(get(object(raw), "uri"), 18U * 1024U * 1024U);
         if (captured.empty()) return Result::success({bytes.begin(), bytes.end()});
         std::vector<std::uint8_t> result(kSourcePackageMagic.begin(), kSourcePackageMagic.end());
         const auto append_u32 = [&](std::uint32_t value) {
@@ -350,13 +352,26 @@ core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::u
                 const auto skip = uri.starts_with(png)    ? png.size()
                                   : uri.starts_with(jpeg) ? jpeg.size()
                                                           : 0;
-                if (!skip)
-                    throw std::runtime_error("material import accepts embedded PNG/JPEG "
-                                             "only; external images are not read");
-                declared = uri.starts_with(png) ? "image/png" : "image/jpeg";
+                if (skip) {
+                    declared = uri.starts_with(png) ? "image/png" : "image/jpeg";
+                    encoded = base64(std::string_view(uri).substr(skip));
+                } else {
+                    const auto found = std::find_if(contents.external.begin(), contents.external.end(),
+                        [&](const auto& entry) { return entry.uri == uri; });
+                    if (found == contents.external.end())
+                        throw std::runtime_error("external glTF image was not captured in the source package");
+                    if (found->bytes.size() > 18U * 1024U * 1024U)
+                        throw std::runtime_error("external image exceeds source limit");
+                    encoded.assign(found->bytes.begin(), found->bytes.end());
+                    constexpr std::array<std::uint8_t, 8> png_signature{137,80,78,71,13,10,26,10};
+                    if (encoded.size() >= png_signature.size() && std::equal(png_signature.begin(), png_signature.end(), encoded.begin()))
+                        declared = "image/png";
+                    else if (encoded.size() >= 3 && encoded[0] == 0xff && encoded[1] == 0xd8 && encoded[2] == 0xff)
+                        declared = "image/jpeg";
+                    else throw std::runtime_error("external image is not PNG/JPEG");
+                }
                 if (auto mime = get(image, "mimeType"); !mime.empty() && text(mime) != declared)
-                    throw std::runtime_error("image MIME type conflicts with embedded URI");
-                encoded = base64(std::string_view(uri).substr(skip));
+                    throw std::runtime_error("image MIME type conflicts with image bytes");
             } else {
                 const auto mime = text(get(image, "mimeType"));
                 if (mime != "image/png" && mime != "image/jpeg")
