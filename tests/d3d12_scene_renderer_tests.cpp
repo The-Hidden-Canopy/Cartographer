@@ -4684,6 +4684,51 @@ void float_emissive_reaches_native_pixels(d3d12::D3D12Device& device) {
         "legacy RGBA8 texture path remains distinct");
 }
 
+// Float base color keeps per-channel identity and linear scale, reaches the
+// GPU as RGBA32F instead of the RGBA8 texture, and must match its slot.
+void float_base_color_reaches_native_pixels(d3d12::D3D12Device& device) {
+    const std::size_t center=(48U*96U+48U)*4U;
+    std::uint8_t fixture_id=0U;
+    const auto render=[&](std::array<float,3U> color, bool keep_float) {
+        auto bound=request();
+        auto& material=bound.objects[0U].materials[0U].current_material.definition;
+        material.base_color.asset=78U; material.base_color_factor={1.0,1.0,1.0,1.0};
+        rebind(bound.objects[0U]);
+        bound.textures.push_back(texture(78U,{255U,255U,255U,255U},assets::TextureSemantic::base_color));
+        const std::vector<std::uint8_t> fixture{0xB0U,++fixture_id};
+        bound.textures.back().linear_float_mips=assets::generate_linear_float_mips(
+            assets::LinearFloatImage{1U,1U,{color[0U],color[1U],color[2U],1.0f}},assets::sha256(fixture));
+        bound.textures.back().linear_float_semantic=assets::TextureSemantic::base_color;
+        if(!keep_float) bound.textures.back().linear_float_mips.reset();
+        return capture(device,bound);
+    };
+    const auto red=render({0.8f,0.0f,0.0f},true);
+    const auto green=render({0.0f,0.8f,0.0f},true);
+    require(red.depth[center/4U]<1.0f &&
+        red.linear_hdr_rgba[center]>2.0f*red.linear_hdr_rgba[center+1U] &&
+        green.linear_hdr_rgba[center+1U]>2.0f*green.linear_hdr_rgba[center],
+        "float base color keeps per-channel identity in scene-linear output");
+    const auto dim=render({0.25f,0.25f,0.25f},true);
+    const auto bright=render({1.0f,1.0f,1.0f},true);
+    const auto over=render({2.0f,2.0f,2.0f},true);
+    require(dim.linear_hdr_rgba[center]<bright.linear_hdr_rgba[center] &&
+        bright.linear_hdr_rgba[center]<over.linear_hdr_rgba[center],
+        "float base color scales with authored linear values, including above one");
+    const auto legacy=render({0.25f,0.25f,0.25f},false);
+    require(legacy.linear_hdr_rgba[center]>dim.linear_hdr_rgba[center],
+        "float base color replaces the white RGBA8 texture rather than being ignored");
+
+    auto mismatched=request();
+    auto& material=mismatched.objects[0U].materials[0U].current_material.definition;
+    material.base_color.asset=79U; rebind(mismatched.objects[0U]);
+    mismatched.textures.push_back(texture(79U,{255U,255U,255U,255U},assets::TextureSemantic::base_color));
+    const std::vector<std::uint8_t> fixture{0xB1U};
+    mismatched.textures.back().linear_float_mips=assets::generate_linear_float_mips(
+        assets::LinearFloatImage{1U,1U,{0.5f,0.5f,0.5f,1.0f}},assets::sha256(fixture));
+    mismatched.textures.back().linear_float_semantic=assets::TextureSemantic::emissive;
+    require(!mismatched.validate(), "float texture semantic must match the RGBA8 slot it overrides");
+}
+
 void graph_occlusion_values_reach_native_pixels(d3d12::D3D12Device& device) {
     for (double occlusion : {0.0, 0.25, 1.0}) {
         auto document = room_project(); auto catalog = document.material_catalog();
@@ -5447,6 +5492,8 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--material-gpu-only") {
             auto device = take(d3d12::D3D12Device::create({{}, false, true}));
             float_emissive_reaches_native_pixels(*device);
+            float_base_color_reaches_native_pixels(*device);
+            std::cout << "PASS focused float emissive and base-color pixels\n";
             graph_occlusion_values_reach_native_pixels(*device);
             std::cout << "PASS focused graph occlusion pixels\n";
             graph_opacity_reaches_native_coverage(*device);
@@ -5535,6 +5582,9 @@ int main(int argc, char** argv) {
         std::cout << "PASS explicit D3D12 temporal history, reset, provenance and state wiring\n";
         direct_target_matches_capture_and_preserves_caller_ownership(*device);
         std::cout << "PASS direct GPU target pixel parity, stale-state refusal and caller ownership\n";
+        float_emissive_reaches_native_pixels(*device);
+        float_base_color_reaches_native_pixels(*device);
+        std::cout << "PASS scene-linear float emissive and base-color textures reach native pixels\n";
         graph_occlusion_values_reach_native_pixels(*device);
         std::cout << "PASS material graph occlusion reaches native pixels without source mutation\n";
         graph_opacity_reaches_native_coverage(*device);
