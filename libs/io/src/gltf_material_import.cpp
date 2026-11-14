@@ -475,7 +475,6 @@ core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::u
                 ref.sampler = default_sampler;
             }
             ref.uv_set = uv;
-            ref.normal_convention = render::NormalConvention::opengl_y_plus;
             if (!result.catalog.textures().contains(ref.asset) ||
                 !result.catalog.samplers().contains(ref.sampler))
                 throw std::runtime_error("material texture refers to a missing image or sampler");
@@ -530,6 +529,9 @@ core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::u
             put(pbr, "baseColorTexture", v.base_color);
             put(pbr, "metallicRoughnessTexture", v.metallic_roughness);
             put(material, "normalTexture", v.normal);
+            // glTF's +Y normal convention applies only to normal maps. Other
+            // slots retain their neutral non-normal binding metadata.
+            if (v.normal) v.normal.normal_convention = render::NormalConvention::opengl_y_plus;
             put(material, "occlusionTexture", v.occlusion);
             put(material, "emissiveTexture", v.emissive);
             if (v.normal)
