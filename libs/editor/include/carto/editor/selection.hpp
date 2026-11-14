@@ -34,6 +34,7 @@ enum class SelectionExpansion {
     loop,
     ring,
     boundary,
+    all_boundary_edges,
 };
 
 struct ComponentSelectionGroup {

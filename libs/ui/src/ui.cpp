@@ -11964,6 +11964,7 @@ core::Result<application::DispatchReceipt> UiController::run_selection_command(
         {selection_commands::loop, editor::SelectionExpansion::loop},
         {selection_commands::ring, editor::SelectionExpansion::ring},
         {selection_commands::boundary, editor::SelectionExpansion::boundary},
+        {selection_commands::all_boundary_edges, editor::SelectionExpansion::all_boundary_edges},
     };
     for (const auto& [id, expansion] : expansions) {
         if (command_id == id) return dispatch(application::ExpandSelectionAction{expansion});
@@ -12334,6 +12335,7 @@ std::vector<CommandView> UiController::command_views(
     const bool edges = components && current.selection.mode == editor::SelectionMode::edge;
     for (const auto& [id, label] : {
              std::pair{selection_commands::boundary, "Select Component Boundary"},
+             std::pair{selection_commands::all_boundary_edges, "Select All Open Boundary Edges"},
              std::pair{selection_commands::loop, "Select Edge Loop"},
              std::pair{selection_commands::ring, "Select Edge Ring"}}) {
         commands.push_back({std::string(id), label, {}, edges,

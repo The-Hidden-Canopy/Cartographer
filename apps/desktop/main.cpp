@@ -20114,6 +20114,9 @@ struct DesktopState {
         if (ImGui::Button("Edge loop")) run_selection(carto::ui::selection_commands::loop);
         ImGui::SameLine();
         if (ImGui::Button("Edge ring")) run_selection(carto::ui::selection_commands::ring);
+        if (ImGui::Button("Select all open boundary edges", ImVec2(-1, 28)))
+            run_selection(carto::ui::selection_commands::all_boundary_edges);
+        ImGui::TextDisabled("Replaces the edge selection on each selected mesh.");
         ImGui::EndDisabled();
         ImGui::EndDisabled();
         if (!has_components) ImGui::TextDisabled("Select mesh components to convert or expand them.");

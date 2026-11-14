@@ -42,7 +42,8 @@ bool valid_expansion(SelectionExpansion expansion) noexcept {
         expansion == SelectionExpansion::invert ||
         expansion == SelectionExpansion::loop ||
         expansion == SelectionExpansion::ring ||
-        expansion == SelectionExpansion::boundary;
+        expansion == SelectionExpansion::boundary ||
+        expansion == SelectionExpansion::all_boundary_edges;
 }
 
 } // namespace
@@ -327,9 +328,10 @@ core::Result<void> SelectionState::expand(
     }
     if ((expansion == SelectionExpansion::loop ||
          expansion == SelectionExpansion::ring ||
-         expansion == SelectionExpansion::boundary) && mode_ != SelectionMode::edge) {
+         expansion == SelectionExpansion::boundary ||
+         expansion == SelectionExpansion::all_boundary_edges) && mode_ != SelectionMode::edge) {
         return core::Result<void>::failure(invalid(
-            "loop, ring, and boundary expansion require edge selection mode"));
+            "loop, ring, and boundary selection require edge selection mode"));
     }
     if (auto result = validate(mesh); !result) {
         return result;
@@ -339,6 +341,20 @@ core::Result<void> SelectionState::expand(
     if (!topology) {
         return core::Result<void>::failure(topology.error().with_context(
             "selection expansion topology"));
+    }
+
+    if (expansion == SelectionExpansion::all_boundary_edges) {
+        // This operation needs only the topology snapshot, not the quadratic
+        // edge-neighbor graph used by linked/grow/shrink selection.
+        std::set<geometry::EdgeId> open_edges;
+        for (const auto& edge : topology.value().edges) {
+            if (!edge.second_half_edge.has_value()) open_edges.insert(edge.id);
+        }
+        vertices_.clear();
+        vertex_selection_order_.clear();
+        faces_.clear();
+        edges_ = std::move(open_edges);
+        return core::Result<void>::success();
     }
 
     std::map<geometry::VertexId, std::set<geometry::VertexId>> vertex_neighbors;
@@ -526,9 +542,10 @@ core::Result<void> SelectionState::expand(
     }
     if ((expansion == SelectionExpansion::loop ||
          expansion == SelectionExpansion::ring ||
-         expansion == SelectionExpansion::boundary) && mode_ != SelectionMode::edge) {
+         expansion == SelectionExpansion::boundary ||
+         expansion == SelectionExpansion::all_boundary_edges) && mode_ != SelectionMode::edge) {
         return core::Result<void>::failure(invalid(
-            "loop, ring, and boundary expansion require edge selection mode"));
+            "loop, ring, and boundary selection require edge selection mode"));
     }
     if (auto result = validate(scene, meshes); !result) return result;
 
