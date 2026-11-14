@@ -14,7 +14,7 @@
 #include <vector>
 
 namespace carto::assets {
-// Strict scene-linear RGB PFM input. Values are float32, not normalized bytes.
+// Scene-linear RGB PFM input. Values are float32, not normalized bytes.
 // Material bindings use an explicit source semantic and retain float precision.
 struct LinearFloatImage {
     std::uint32_t width{}, height{};
@@ -41,8 +41,17 @@ inline LinearFloatImage decode_linear_pfm(std::span<const std::uint8_t> bytes) {
     if (!parse(dimensions.substr(0,split), out.width) || !parse(dimensions.substr(split+1), out.height) ||
         !out.width || !out.height || out.width > 4096 || out.height > 4096 ||
         std::uint64_t(out.width)*out.height > max_pixels) throw std::runtime_error("PFM dimensions exceed bounds");
-    // Deliberately restrict the admitted contract to unit-scale little-endian.
-    if (line() != "-1.0") throw std::runtime_error("PFM requires little-endian unit scale");
+    // PFM's scale sign encodes byte order; its magnitude scales the stored
+    // samples. Parse independently of the host locale and reject values that
+    // cannot describe a finite nonzero scale.
+    const auto scale_text=line();
+    float signed_scale=0.0f;
+    const auto scale_parse=std::from_chars(scale_text.data(),scale_text.data()+scale_text.size(),signed_scale);
+    if(scale_parse.ec!=std::errc{} || scale_parse.ptr!=scale_text.data()+scale_text.size() ||
+        !std::isfinite(signed_scale) || signed_scale==0.0f)
+        throw std::runtime_error("PFM requires a finite nonzero scale");
+    const bool little_endian=signed_scale<0.0f;
+    const double scale=std::abs(static_cast<double>(signed_scale));
     const auto pixels = std::uint64_t(out.width)*out.height;
     if (bytes.size()-cursor != pixels*12U) throw std::runtime_error("PFM payload length mismatch");
     out.rgba.resize(static_cast<std::size_t>(pixels)*4U);
@@ -50,10 +59,17 @@ inline LinearFloatImage decode_linear_pfm(std::span<const std::uint8_t> bytes) {
         for (std::uint32_t x=0; x<out.width; ++x) {
             const auto destination=(std::size_t(out.height-1-file_y)*out.width+x)*4U;
             for (unsigned c=0;c<3;++c) {
-                std::uint32_t bits=0; for(unsigned b=0;b<4;++b) bits|=std::uint32_t(bytes[cursor++])<<(b*8);
-                const float v=std::bit_cast<float>(bits);
-                if (!std::isfinite(v)) throw std::runtime_error("PFM contains nonfinite values");
-                out.rgba[destination+c]=v;
+                std::uint32_t bits=0;
+                for(unsigned b=0;b<4;++b) {
+                    const unsigned shift=little_endian ? b*8U : (3U-b)*8U;
+                    bits|=std::uint32_t(bytes[cursor++])<<shift;
+                }
+                const float encoded=std::bit_cast<float>(bits);
+                const double scaled=static_cast<double>(encoded)*scale;
+                if (!std::isfinite(encoded) || !std::isfinite(scaled) ||
+                    std::abs(scaled)>static_cast<double>(std::numeric_limits<float>::max()))
+                    throw std::runtime_error("PFM contains nonfinite or overflowing scaled values");
+                out.rgba[destination+c]=static_cast<float>(scaled);
             }
             out.rgba[destination+3]=1.0f;
         }
