@@ -1,12 +1,15 @@
 #pragma once
 
+#include <carto/assets/blob_store.hpp>
 #include <carto/core/result.hpp>
 #include <carto/core/revision.hpp>
+#include <carto/geometry/mesh.hpp>
 
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -42,6 +45,12 @@ struct GltfExportReport {
 
 // Disposable source pixels or a saved-project location for the existing
 // digest-addressed asset store. No arbitrary source locator is dereferenced.
+struct GltfEvaluatedSculpt {
+    assets::Sha256Digest source_document_digest;
+    assets::Sha256Digest stack_digest;
+    geometry::MeshPatch positions;
+};
+
 struct GltfExportOptions {
     std::filesystem::path project_path;
     std::shared_ptr<const production::AuthoringTextureLibrary> textures;
@@ -49,6 +58,12 @@ struct GltfExportOptions {
     // Powers of two 4..1024, one [0,1] UV tile, <=1M total sampled texels
     // across unique material/variant bakes. One 1024 bake uses the allowance.
     std::uint32_t graph_bake_resolution = 0;
+    // Explicit, transient position-only products keyed by sculpted mesh asset.
+    // Every stored sculpt stack must have one patch, even if it changes no
+    // positions. Document and stack digests, source revision, and before values
+    // are checked before export so stack-only edits invalidate old products.
+    std::map<std::uint64_t, GltfEvaluatedSculpt> evaluated_sculpt;
+
 };
 
 // Emits a deterministic, single-file glTF 2.0 artifact. The artifact keeps

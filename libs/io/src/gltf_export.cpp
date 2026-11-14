@@ -357,14 +357,58 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
     const bool export_materials = !catalog.empty();
     if (!document.accepted_autorigs().empty() || !document.unadmitted_mode_key_drafts().empty() ||
         !document.kinematic_graphs().empty() || !document.pose_libraries().empty() ||
-        !document.rig_module_templates().empty() || !document.garment_assets().empty() ||
-        !document.sculpt_stacks().empty()) {
+        !document.rig_module_templates().empty() || !document.garment_assets().empty()) {
         return core::Result<GltfExportReport>::failure(validation(
             "glTF export cannot preserve the authored rig or deformation records"));
     }
+    const auto canonical = document.serialize();
+    if (canonical.size() > 128U * 1024U * 1024U)
+        return core::Result<GltfExportReport>::failure(
+            validation("glTF export source identity exceeds 128 MiB"));
+    const auto document_digest = assets::sha256(
+        {reinterpret_cast<const std::uint8_t *>(canonical.data()), canonical.size()});
+    // A position patch is the only accepted override: topology, attributes,
+    // material assignments and the authoritative document remain unchanged.
+    // Require complete coverage, including no-op stacks, to avoid silent loss.
+    if (export_options.evaluated_sculpt.size() != document.sculpt_stacks().size())
+        return core::Result<GltfExportReport>::failure(validation(
+            "glTF export requires an evaluated position product for every sculpt stack"));
+    std::map<std::uint64_t, geometry::EditableMesh> sculpt_meshes;
+    for (const auto& [mesh_id, product] : export_options.evaluated_sculpt) {
+        const auto& patch = product.positions;
+        const auto source = document.meshes().find(mesh_id);
+        const auto stack = document.sculpt_stacks().find(mesh_id);
+        if (source == document.meshes().end() || stack == document.sculpt_stacks().end() ||
+            product.source_document_digest != document_digest || product.stack_digest != stack->second.digest ||
+            patch.expected_revision != source->second.revision())
+            return core::Result<GltfExportReport>::failure(validation(
+                "glTF evaluated sculpt does not match a source mesh and stack"));
+        auto copy = source->second;
+        if (!patch.vertex_changes.empty()) {
+            if (!document.aging_layers().empty())
+                return core::Result<GltfExportReport>::failure(validation(
+                    "glTF evaluated sculpt with aging appearance requires rebaking"));
+            for (const auto& [id, layer] : copy.attributes().layers()) {
+                (void)layer;
+                if (id == "cartographer.normal0" || id.starts_with("cartographer.tangent."))
+                    return core::Result<GltfExportReport>::failure(validation(
+                        "glTF evaluated sculpt cannot preserve authored normals or tangents"));
+            }
+            if (auto applied = copy.apply_patch(patch); !applied)
+                return core::Result<GltfExportReport>::failure(applied.error().with_context(
+                    "glTF evaluated sculpt position patch"));
+        }
+        sculpt_meshes.emplace(mesh_id, std::move(copy));
+    }
+    const auto effective_mesh = [&](std::uint64_t id, const geometry::EditableMesh& source)
+        -> const geometry::EditableMesh& {
+        const auto found = sculpt_meshes.find(id);
+        return found == sculpt_meshes.end() ? source : found->second;
+    };
     std::map<std::uint64_t, std::set<attributes::UvSetId>> authored_tangent_sets;
     bool has_edge_sharp_marks = false;
-    for (const auto& [mesh_id, mesh] : document.meshes()) {
+    for (const auto& [mesh_id, source_mesh] : document.meshes()) {
+        const auto& mesh = effective_mesh(mesh_id, source_mesh);
         for (const auto& [id, layer] : mesh.attributes().layers()) {
             if (id.starts_with("cartographer.tangent.") || id.starts_with("cartographer.tangent_uv.")) {
                 const auto descriptor = std::find_if(mesh.uv_sets().descriptors().begin(),
@@ -457,6 +501,8 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
             ".carto source and do not change exported glTF/GLB normals.");
     }
     if(!document.aging_layers().empty())report.warnings.push_back("Aging is exported as its supported baked material appearance; editable cause recipes and seed/operation identity remain in the .carto source, not glTF/GLB.");
+    if (!sculpt_meshes.empty()) report.warnings.push_back(
+        "Sculpt is exported as evaluated geometry; editable strokes remain in the source project.");
     bool any_active_uv = false;
     bool any_missing_uv = false;
     bool any_missing_tangent = false;
@@ -468,15 +514,10 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
     }
 
     // One enclosing-project identity for the shared viewport/export compiler.
-    const auto canonical = document.serialize();
-    if (canonical.size() > 128U * 1024U * 1024U)
-        return core::Result<GltfExportReport>::failure(
-            validation("glTF export source identity exceeds 128 MiB"));
     const production::AuthoritativeSource source_identity{
-        "gltf.export", document.revision(),
-        assets::sha256(
-            {reinterpret_cast<const std::uint8_t *>(canonical.data()), canonical.size()})};
-    for (const auto &[mesh_id, mesh] : document.meshes()) {
+        "gltf.export", document.revision(), document_digest};
+    for (const auto &[mesh_id, source_mesh] : document.meshes()) {
+        const auto& mesh = effective_mesh(mesh_id, source_mesh);
         auto remaining_authored_tangents = authored_tangent_sets[mesh_id];
         production::RenderMeshCompileOptions base_options;
         auto slots=production::authoring_material_slot_layer(mesh);
@@ -495,7 +536,7 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
         if (mesh.uv_sets().descriptors().size() > 1U)
             report.warnings.push_back("Each material primitive exports its resolved UV set; other authored UV streams remain in the source project");
         MeshRecord record{
-            mesh_id, mesh.revision().value(), slots.value().value_or(""),
+            mesh_id, source_mesh.revision().value(), slots.value().value_or(""),
             "cartographer-mesh-" + std::to_string(mesh_id), {}, material_regions.value()};
         struct Stream {
             production::RenderMeshArtifact artifact;

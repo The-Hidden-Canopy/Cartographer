@@ -2,6 +2,7 @@
 #include "scene_import_test_support.hpp"
 #include <carto/io/generated_mesh.hpp>
 #include <carto/production/authoring_material.hpp>
+#include <carto/production/sculpt_stack.hpp>
 #include <carto/production/authoring_material_bake.hpp>
 #include <carto/io/gltf_material_import.hpp>
 #include <carto/io/gltf_scene_import.hpp>
@@ -337,6 +338,37 @@ int main(int argc, char **argv) {
             take(store.put(tga, "image/x-tga"));
             std::cout << "material fixture ready\n";
             return 0;
+        }
+        {
+            auto sculpt_doc = material_scene(c, root / "sculpt-material.carto");
+            auto stack = take(production::make_sculpt_stack(sculpt_doc, 1));
+            auto stack_digest = take(stack.digest());
+            journal::Journal sculpt_journal((root / "sculpt-material.carto").string() + ".journal");
+            auto sculpt_tx = take(project::ProjectTransaction::begin(sculpt_doc, sculpt_journal, "sculpt.material.test"));
+            okay(production::stage_sculpt_stack(sculpt_tx, stack));
+            static_cast<void>(take(sculpt_tx.commit()));
+            auto identity = sculpt_doc.serialize();
+            auto digest = assets::sha256({reinterpret_cast<const std::uint8_t*>(identity.data()), identity.size()});
+            const auto& source_mesh = sculpt_doc.meshes().at(1);
+            geometry::MeshPatch patch; patch.expected_revision = source_mesh.revision();
+            for (const auto& v : source_mesh.vertices_sorted()) {
+                auto translated = v.position; translated.z += .25;
+                patch.vertex_changes.push_back({v.id, v.position, translated});
+            }
+            auto sculpt_options = options;
+            sculpt_options.evaluated_sculpt.emplace(1, io::GltfEvaluatedSculpt{digest, stack_digest, patch});
+            for (const auto* suffix : {".gltf", ".glb"}) {
+                auto out = root / (std::string("sculpt-material") + suffix);
+                auto report = std::string_view(suffix) == ".gltf" ? take(io::export_gltf(sculpt_doc, out, sculpt_options)) : take(io::export_glb(sculpt_doc, out, sculpt_options));
+                check(report.materials == 2 && report.textures >= 4 && report.images >= 4, "sculpt preserves multi-material accounting");
+                auto raw = read(out);
+                auto imported = take(io::import_gltf_scene({reinterpret_cast<const std::uint8_t*>(raw.data()), raw.size()}));
+                check(imported.materials.catalog.materials().size() == 2, "sculpt preserves imported materials");
+                check(!imported.meshes.empty(), "sculpt imports geometry");
+                for (const auto& mesh : imported.meshes) for (const auto& v : mesh.vertices_sorted())
+                    near(v.position.z, .25, "sculpt material geometry");
+            }
+            check(sculpt_doc.serialize() == identity, "sculpt export leaves source document unchanged");
         }
         Payload gltf(root / "material.gltf"), glb(root / "material.glb");
         inspect(gltf, decoded.pixels);

@@ -8939,15 +8939,61 @@ struct DesktopState {
                         L"Cartographer export failed", MB_OK | MB_ICONERROR);
             return;
         }
-        // Scene export currently consumes source meshes, not evaluated sculpt.
-        if (!document.value().sculpt_stacks().empty()) {
-            MessageBoxW(window, L"glTF/GLB export cannot yet include authored sculpt. With a sculpt evaluator installed, export an evaluated OBJ, PLY, or STL mesh instead.",
+        carto::io::GltfExportOptions options{*snapshot.project_path, {},
+            export_bake_graphs ? export_bake_resolution : 0U, {}};
+        const auto source_bytes = document.value().serialize();
+        const auto source_digest = carto::assets::sha256({
+            reinterpret_cast<const std::uint8_t*>(source_bytes.data()), source_bytes.size()});
+        for (const auto& [mesh_id, stored] : document.value().sculpt_stacks()) {
+#ifdef CARTO_HAS_SCULPT_PREVIEW_PROVIDER
+            const auto source = document.value().meshes().find(mesh_id);
+            auto stack = carto::production::SculptStack::deserialize(stored.bytes);
+            auto provider = carto::sculpt_preview::make_provider();
+            if (source == document.value().meshes().end() || !stack || !provider) {
+                MessageBoxW(window, L"Could not load the sculpt source or evaluator; export was not written.",
+                            L"Cartographer sculpt export failed", MB_OK | MB_ICONERROR);
+                return;
+            }
+            auto evaluated = carto::application::materialize_sculpt_for_export(
+                source->second, stack.value(), *provider);
+            if (!evaluated) {
+                MessageBoxW(window, wide(evaluated.error().message).c_str(),
+                            L"Cartographer sculpt export failed", MB_OK | MB_ICONERROR);
+                return;
+            }
+            carto::geometry::MeshPatch patch;
+            patch.expected_revision = source->second.revision();
+            const auto before = source->second.vertices_sorted();
+            const auto after = evaluated.value().vertices_sorted();
+            if (before.size() != after.size()) {
+                MessageBoxW(window, L"Sculpt changed source topology; export was not written.",
+                            L"Cartographer sculpt export failed", MB_OK | MB_ICONERROR);
+                return;
+            }
+            for (std::size_t i = 0; i < before.size(); ++i) {
+                if (before[i].id != after[i].id) {
+                    MessageBoxW(window, L"Sculpt changed source vertex identities; export was not written.",
+                                L"Cartographer sculpt export failed", MB_OK | MB_ICONERROR);
+                    return;
+                }
+                const auto& a = before[i].position;
+                const auto& b = after[i].position;
+                if (a.x != b.x || a.y != b.y || a.z != b.z)
+                    patch.vertex_changes.push_back({before[i].id, a, b});
+            }
+            options.evaluated_sculpt.emplace(mesh_id, carto::io::GltfEvaluatedSculpt{
+                source_digest, stored.digest, std::move(patch)});
+#else
+            (void)mesh_id;
+            (void)stored;
+            MessageBoxW(window, L"This scene has authored sculpt, but this build has no sculpt evaluator. Export was not written.",
                         L"Cartographer export unavailable", MB_OK | MB_ICONWARNING);
             return;
+#endif
         }
         const auto report = binary_container
-            ? carto::io::export_glb(document.value(), *path, carto::io::GltfExportOptions{*snapshot.project_path,{},export_bake_graphs?export_bake_resolution:0U})
-            : carto::io::export_gltf(document.value(), *path, carto::io::GltfExportOptions{*snapshot.project_path,{},export_bake_graphs?export_bake_resolution:0U});
+            ? carto::io::export_glb(document.value(), *path, options)
+            : carto::io::export_gltf(document.value(), *path, options);
         if (!report) {
             MessageBoxW(window, wide(report.error().message).c_str(),
                         L"Cartographer export failed", MB_OK | MB_ICONERROR);
