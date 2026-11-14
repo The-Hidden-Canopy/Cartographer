@@ -1,4 +1,5 @@
 #include "application_access.hpp"
+#include "../apps/desktop/starter_material_library.hpp"
 #include <carto/io/gltf_material_import.hpp>
 #include <carto/project/project.hpp>
 #include <chrono>
@@ -13,6 +14,8 @@ int main(int argc, char** argv) {
     std::ifstream in(argv[1], std::ios::binary);
     if (!in) return 2;
     std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), {});
+    if (std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()) !=
+        studio::kStarterMaterialLibrary) return 13;
     auto result = carto::io::import_gltf_materials(bytes);
     if (!result) { std::cerr << result.error().message << '\n'; return 3; }
     const auto& catalog = result.value().catalog;

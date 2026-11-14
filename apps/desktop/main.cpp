@@ -48,6 +48,7 @@
 #include "studio_face_tools.hpp"
 #include "studio_vertex_tools.hpp"
 #include "studio_material_draft.hpp"
+#include "starter_material_library.hpp"
 #include "studio_material_graph_draft.hpp"
 #include "studio_sweep_source.hpp"
 #include "studio_viewshed.hpp"
@@ -18298,6 +18299,15 @@ struct DesktopState {
         ImGui::Separator();
 
         ImGui::TextDisabled("Texture source records");
+        ImGui::BeginDisabled(!snapshot.project_path);
+        if (ImGui::Button("Add 24 starter surface presets", ImVec2(-1, 28))) {
+            const auto library = studio::kStarterMaterialLibrary;
+            std::vector<std::uint8_t> bytes(library.begin(), library.end());
+            dispatch(carto::application::ImportGltfMaterialLibraryAction{
+                snapshot.project_generation, snapshot.project_revision, std::move(bytes), true});
+        }
+        ImGui::EndDisabled();
+        ImGui::TextWrapped("Starter presets are uniform colors and PBR factors, without textures or surface detail. Save the project before adding them.");
         ImGui::Checkbox("I own or may reuse the imported material library",&material_library_rights_confirmed);
         ImGui::BeginDisabled(!snapshot.project_path||!material_library_rights_confirmed);
         if(ImGui::Button("Import GLTF/GLB material library...",ImVec2(-1,28))) {

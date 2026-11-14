@@ -5,3 +5,6 @@ tests/fixtures/cartographer-destination-prepared-v1/** -text
 # Keep example manifest digests stable across platforms.
 examples/first-block/first-block.carto -text
 examples/first-block/first-block.obj -text
+
+# Embedded desktop starter asset must retain identical source bytes on every platform.
+/examples/material-libraries/starter-surfaces.gltf text eol=lf
