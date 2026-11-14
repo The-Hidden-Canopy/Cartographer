@@ -146,6 +146,9 @@ struct GltfMaterialWriter::Impl {
     Impl(const project::ProjectDocument &d, const GltfExportOptions &o, GltfExportReport &r)
         : catalog(d.material_catalog()), options(o), report(r) {}
     Result<void> load(const project::TextureSourceRecord &rec) {
+        if (rec.format == assets::TextureSourceFormat::pfm)
+            return Result<void>::failure(unsupported(
+                "scene-linear float PFM material texture cannot be exported to glTF without a lossy conversion"));
         if (options.textures || loaded_ids.contains(rec.id))
             return Result<void>::success();
         if (options.project_path.empty())

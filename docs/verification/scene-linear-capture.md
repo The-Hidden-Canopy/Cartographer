@@ -23,3 +23,8 @@ PFM has no embedded color profile, so the caller supplies values in that space.
 It generates float mips and uploads RGBA32F; the receipt binds source and mip
 digests. This is a per-capture override, not a saved project import or EXR
 decoder. Other material slots continue to use the legacy RGBA8 path.
+A strict `.pfm` can also be imported as a content-addressed project texture and
+bound to an emissive material slot. Its bytes remain in the project asset store;
+the renderer verifies the source hash and regenerates float mips after reload.
+No RGBA8 fallback is used. Other material slots reject PFM for now. Existing
+8-bit PNG/JPEG/TGA behavior is unchanged, and inspected EXR is still not decoded.

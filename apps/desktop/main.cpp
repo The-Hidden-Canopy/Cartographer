@@ -2933,8 +2933,8 @@ carto::studio::FilePickerTheme file_picker_theme = carto::studio::FilePickerThem
         break;
     case FileDialogKind::texture_source:
         dialog.lpstrFilter =
-            L"Supported Texture Sources (*.png;*.jpg;*.jpeg;*.tga;*.dds;*.exr)\0"
-            L"*.png;*.jpg;*.jpeg;*.tga;*.dds;*.exr\0"
+            L"Supported Texture Sources (*.png;*.jpg;*.jpeg;*.tga;*.dds;*.exr;*.pfm)\0"
+            L"*.png;*.jpg;*.jpeg;*.tga;*.dds;*.exr;*.pfm\0"
             L"All Files\0*.*\0";
         break;
     case FileDialogKind::environment_image:
@@ -18419,6 +18419,7 @@ struct DesktopState {
             }
         }
         ImGui::EndDisabled();
+        ImGui::TextDisabled("PFM: scene-linear Rec.709 RGB float, emissive slot only.");
         if (!snapshot.project_path.has_value()) {
             ImGui::TextDisabled("Save this project before importing texture sources.");
         }

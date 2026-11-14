@@ -1581,15 +1581,20 @@ Result<void> SceneRenderRequest::validate() const {
                 "scene PBR sampling does not execute comparison samplers"});
     }
     for (const auto& texture : textures) {
+        const bool float_only=texture.mips.levels.empty() && texture.linear_float_mips.has_value();
         if (texture.asset == 0U || !available.emplace(texture.asset, &texture).second ||
-            texture.current_source_digest.is_zero() || texture.mips.source.digest != texture.current_source_digest)
+            texture.current_source_digest.is_zero() ||
+            (float_only ? texture.linear_float_mips->source_digest != texture.current_source_digest
+                        : texture.mips.source.digest != texture.current_source_digest))
             return Result<void>::failure({core::ErrorCode::stale_data, "scene texture has duplicate/missing identity or stale source digest"});
-        if (texture.mips.resident_bytes() > kPayloadLimit - payload)
-            return Result<void>::failure(invalid("scene mip payload exceeds 512 MiB"));
-        payload += texture.mips.resident_bytes();
-        if (auto valid = texture.mips.validate(); !valid) return valid;
+        if (!float_only) {
+            if (texture.mips.resident_bytes() > kPayloadLimit - payload)
+                return Result<void>::failure(invalid("scene mip payload exceeds 512 MiB"));
+            payload += texture.mips.resident_bytes();
+            if (auto valid = texture.mips.validate(); !valid) return valid;
+        }
         if (texture.linear_float_mips) {
-            if (texture.mips.semantic != assets::TextureSemantic::emissive ||
+            if ((!float_only && texture.mips.semantic != assets::TextureSemantic::emissive) ||
                 !assets::validate_linear_float_mips(*texture.linear_float_mips))
                 return Result<void>::failure(invalid("invalid linear float emissive texture"));
             for (const auto& level : texture.linear_float_mips->levels) {
@@ -1781,7 +1786,9 @@ Result<void> SceneRenderRequest::validate() const {
                 const auto found = available.find(id);
                 if (found == available.end()) return Result<void>::failure({core::ErrorCode::not_found, "bound scene texture is unavailable; no fallback permitted"});
                 const auto& mip = found->second->mips;
-                if (mip.semantic != kSemantics[slot] || mip.color_space != assets::expected_color_space(kSemantics[slot]))
+                const bool float_only=mip.levels.empty() && found->second->linear_float_mips.has_value();
+                if (float_only ? kSemantics[slot] != assets::TextureSemantic::emissive :
+                    (mip.semantic != kSemantics[slot] || mip.color_space != assets::expected_color_space(kSemantics[slot])))
                     return Result<void>::failure(invalid("scene texture semantic/color space differs from material slot"));
                 used_textures.insert(id);
             }

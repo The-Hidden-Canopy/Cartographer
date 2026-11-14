@@ -5197,6 +5197,25 @@ void orthographic_viewport_zoom_changes_projection_height() {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 3 && std::string_view(argv[1]) == "--write-persisted-hdr-fixture") {
+            const std::filesystem::path project_path=argv[2];const auto root=project_path.parent_path();
+            std::vector<std::uint8_t> encoded{'P','F','\n','1',' ','1','\n','-','1','.','0','\n'};
+            for(float value:{4.0f,2.0f,0.5f}) { const auto bits=std::bit_cast<std::uint32_t>(value);
+                for(unsigned b=0;b<4;++b) encoded.push_back(static_cast<std::uint8_t>(bits>>(b*8))); }
+            const auto admission=take(assets::inspect_texture_source(encoded,"image/x-portable-floatmap"));
+            require(admission.format==assets::TextureSourceFormat::pfm && admission.high_dynamic_range && admission.bit_depth==32,
+                "PFM admission identifies real float data");
+            assets::BlobStore store(root/".carto-assets"/"source-blobs");const auto blob=take(store.put(encoded,"image/x-portable-floatmap"));
+            project::TextureSourceRecord source;source.id=502U;source.name="Persisted float emissive";
+            source.relative_locator=store.path_for(blob.digest).lexically_relative(root).generic_string();
+            source.content_digest=blob.digest;source.format=admission.format;source.width=1U;source.height=1U;
+            source.provenance="synthetic persisted float fixture";
+            auto document=room_project();auto catalog=document.material_catalog();take(catalog.insert_texture(source));
+            auto material=catalog.materials().at(1U);material.definition.emissive.asset=source.id;
+            material.definition.emissive_factor={1,1,1};material.definition.emissive_strength=1;
+            material.revision=core::Revision{2U};take(catalog.replace_material(material));
+            take(document.set_material_catalog(std::move(catalog)));take(document.save_atomic(project_path));return 0;
+        }
         if (argc == 3 && std::string_view(argv[1]) == "--write-hdr-emissive-fixture") {
             const std::filesystem::path project_path=argv[2]; const auto root=project_path.parent_path();
             const auto encoded=one_pixel_tga(); const auto admission=take(assets::inspect_texture_source(encoded,"image/x-tga"));

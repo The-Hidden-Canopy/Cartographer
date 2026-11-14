@@ -1179,6 +1179,7 @@ core::Result<DecodedRgba8Texture> decode_texture_image_rgba8(
             return decode_texture_image_wic(std::move(encoded_source), limits);
         case TextureSourceFormat::dds:
         case TextureSourceFormat::exr:
+        case TextureSourceFormat::pfm:
             return core::Result<DecodedRgba8Texture>::failure(decode_error(
                 "texture-image pixel decoding currently supports PNG, JPEG, and TGA"));
         }

@@ -61,6 +61,7 @@ bool valid_texture_format(assets::TextureSourceFormat format) {
     case assets::TextureSourceFormat::tga:
     case assets::TextureSourceFormat::dds:
     case assets::TextureSourceFormat::exr:
+    case assets::TextureSourceFormat::pfm:
         return true;
     }
     return false;
@@ -1014,7 +1015,7 @@ core::Result<MaterialCatalog> MaterialCatalog::deserialize(std::string_view text
         std::string digest;
         if (!require_token(input, "TEXTURE") || !read_unsigned(input, texture.id) ||
             !read_unsigned(input, revision) || !read_unsigned(input, format) ||
-            format > static_cast<unsigned>(assets::TextureSourceFormat::exr) ||
+            format > static_cast<unsigned>(assets::TextureSourceFormat::pfm) ||
             !read_unsigned(input, texture.width) || !read_unsigned(input, texture.height) ||
             !(input >> digest >> std::quoted(texture.name) >>
               std::quoted(texture.relative_locator) >> std::quoted(texture.provenance))) {

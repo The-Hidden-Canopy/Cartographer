@@ -446,7 +446,7 @@ int main(int argc, char** argv) {
         for (const auto& supplied : float_overrides) {
             const auto current=std::find_if(textures.begin(),textures.end(),[&](const auto& t){return t.asset==supplied.asset;});
             if(current==textures.end() || supplied.asset==0U || !float_ids.insert(supplied.asset).second ||
-                current->mips.semantic!=assets::TextureSemantic::emissive)
+                (!current->mips.levels.empty() && current->mips.semantic!=assets::TextureSemantic::emissive))
                 throw std::runtime_error("float override must name one bound emissive texture");
             std::ifstream file(supplied.path,std::ios::binary|std::ios::ate); const auto size=file.tellg();
             if(!file || size<=0 || size>static_cast<std::streamoff>(256ULL*1024*1024))
@@ -500,7 +500,7 @@ int main(int argc, char** argv) {
         else if (image.environment_color_space == assets::ColorSpace::srgb)
             receipt << json("srgb");
         else receipt << "null";
-        receipt << ",\n  \"float_emissive_overrides\": [";
+        receipt << ",\n  \"float_emissive_textures\": [";
         bool first_float = true;
         for (const auto& texture : request.textures) if (texture.linear_float_mips) {
             if (!first_float) receipt << ",";

@@ -436,8 +436,16 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
     std::set<std::string> used_graph_inputs;
     for (const auto& texture : request.textures) {
         const auto current = catalog.textures().find(texture.asset);
-        if (current == catalog.textures().end() || current->second.content_digest != texture.current_source_digest ||
-            texture.mips.source.digest != current->second.content_digest || texture.mips.levels.empty() ||
+        if (current == catalog.textures().end() || current->second.content_digest != texture.current_source_digest)
+            return Output::failure({core::ErrorCode::stale_data, "render texture differs from the current project source record"});
+        const bool float_only=texture.mips.levels.empty() && texture.linear_float_mips.has_value();
+        if (float_only) {
+            const auto& chain=*texture.linear_float_mips;
+            if (current->second.format != assets::TextureSourceFormat::pfm ||
+                chain.source_digest != current->second.content_digest || chain.levels.empty() ||
+                chain.levels.front().width != current->second.width || chain.levels.front().height != current->second.height)
+                return Output::failure({core::ErrorCode::stale_data, "float render texture differs from the current project source record"});
+        } else if (texture.mips.source.digest != current->second.content_digest || texture.mips.levels.empty() ||
             texture.mips.levels.front().width != current->second.width || texture.mips.levels.front().height != current->second.height)
             return Output::failure({core::ErrorCode::stale_data, "render texture differs from the current project source record"});
     }
