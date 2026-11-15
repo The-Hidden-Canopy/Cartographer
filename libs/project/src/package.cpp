@@ -28,7 +28,10 @@ namespace {
 constexpr std::size_t kMaxManifestBytes = 64U * 1024U;
 constexpr std::size_t kMaxProjectIdBytes = 128U;
 constexpr std::size_t kMaxNameBytes = 4096U;
-constexpr std::uint64_t kMaxFlatProjectBytes = 128ULL * 1024ULL * 1024ULL;
+#ifndef CARTOGRAPHER_PROJECT_TEXT_LIMIT_BYTES
+#define CARTOGRAPHER_PROJECT_TEXT_LIMIT_BYTES 134217728ULL
+#endif
+constexpr std::uint64_t kMaxFlatProjectBytes = CARTOGRAPHER_PROJECT_TEXT_LIMIT_BYTES;
 constexpr std::string_view kEvaluationGraphMediaType =
     "application/vnd.cartographer.evaluation-graph+text;v=1";
 std::atomic<std::uint64_t> g_package_temp_counter{0U};

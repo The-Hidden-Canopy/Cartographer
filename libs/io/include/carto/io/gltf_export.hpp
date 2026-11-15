@@ -58,6 +58,11 @@ struct GltfExportOptions {
     // Powers of two 4..1024, one [0,1] UV tile, <=1M total sampled texels
     // across unique material/variant bakes. One 1024 bake uses the allowance.
     std::uint32_t graph_bake_resolution = 0;
+    std::size_t embedded_image_limit = 64U;
+    std::uint64_t embedded_image_byte_limit = 64ULL * 1024ULL * 1024ULL;
+    // Adds one world-level conversion for legacy scenes authored with Z
+    // elevation, leaving all source node transforms untouched.
+    bool source_z_up = false;
     // Explicit, transient position-only products keyed by sculpted mesh asset.
     // Every stored sculpt stack must have one patch, even if it changes no
     // positions. Document and stack digests, source revision, and before values

@@ -646,10 +646,26 @@ PreparationOperationReport prepare_and_publish(
             "preparation.source-snapshot");
         return report;
     }
+    if (request.coordinate_override) {
+        if (auto result = request.coordinate_override->validate(); !result) {
+            record_failure(report, PreparationStage::resolve, result.error(),
+                source_namespace, std::nullopt, std::nullopt,
+                "preparation.coordinate-override");
+            return report;
+        }
+    }
     report.resolved_scope = scope.value();
-    report.operation_id = digest_text(operation_identity_text(
+    auto operation_identity = operation_identity_text(
         scope.value(), profile_digest.value(), source_namespace,
-        document.revision(), source_digest));
+        document.revision(), source_digest);
+    if (request.coordinate_override) {
+        const auto& frame = *request.coordinate_override;
+        operation_identity += "\nSOURCE_COORDINATE_OVERRIDE " + std::to_string(frame.meters_per_unit) +
+            " " + std::to_string(static_cast<unsigned>(frame.handedness)) +
+            " " + std::to_string(static_cast<unsigned>(frame.up)) +
+            " " + std::to_string(static_cast<unsigned>(frame.forward));
+    }
+    report.operation_id = digest_text(operation_identity);
     report.terminal_stage = PreparationStage::plan;
     if (record_cancellation_if_requested(report, PreparationStage::plan,
             source_namespace, request.stop_token)) {
@@ -772,8 +788,16 @@ PreparationOperationReport prepare_and_publish(
             "prepared-scene.envelope");
         return report;
     }
+    if (request.coordinate_override)
+        envelope.value().coordinates = *request.coordinate_override;
     std::optional<PreparedLinkedComposition> linked;
     if (request.linked != nullptr) {
+        if (request.coordinate_override) {
+            record_failure(report, PreparationStage::verify,
+                validation("a source-frame override cannot be inferred for independently authored linked parts"),
+                source_namespace, std::nullopt, std::nullopt, "scene.linked-source-frame");
+            return report;
+        }
         if (scope.value().kind != PreparationScopeKind::scene) {
             record_failure(report, PreparationStage::verify,
                 validation("linked parts are prepared only with the full scene scope"),

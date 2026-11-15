@@ -362,9 +362,12 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
             "glTF export cannot preserve the authored rig or deformation records"));
     }
     const auto canonical = document.serialize();
-    if (canonical.size() > 128U * 1024U * 1024U)
+#ifndef CARTOGRAPHER_PROJECT_TEXT_LIMIT_BYTES
+#define CARTOGRAPHER_PROJECT_TEXT_LIMIT_BYTES 134217728ULL
+#endif
+    if (canonical.size() > CARTOGRAPHER_PROJECT_TEXT_LIMIT_BYTES)
         return core::Result<GltfExportReport>::failure(
-            validation("glTF export source identity exceeds 128 MiB"));
+            validation("glTF export source identity exceeds the configured project size limit"));
     const auto document_digest = assets::sha256(
         {reinterpret_cast<const std::uint8_t *>(canonical.data()), canonical.size()});
     // A position patch is the only accepted override: topology, attributes,
@@ -523,6 +526,8 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
         auto slots=production::authoring_material_slot_layer(mesh);
         if(!slots)return core::Result<GltfExportReport>::failure(slots.error());
         base_options.material_slot_layer=slots.value();
+        if (mesh.attributes().find("cartographer.normal0") != nullptr)
+            base_options.normal_layer = "cartographer.normal0";
         auto base = production::compile_render_mesh_artifact(source_identity, mesh, base_options);
         if (!base)
             return core::Result<GltfExportReport>::failure(base.error());
@@ -944,14 +949,18 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
          << "\"},\n"
          << "  \"scene\":0,\n"
          << "  \"scenes\":[{\"nodes\":[";
-    bool first = true;
-    for (std::size_t index = 0U; index < nodes.size(); ++index) {
-        if (nodes[index].parent.has_value())
-            continue;
-        if (!first)
-            json << ',';
-        first = false;
-        json << index;
+    if (export_options.source_z_up) {
+        json << nodes.size();
+    } else {
+        bool first = true;
+        for (std::size_t index = 0U; index < nodes.size(); ++index) {
+            if (nodes[index].parent.has_value())
+                continue;
+            if (!first)
+                json << ',';
+            first = false;
+            json << index;
+        }
     }
     json << "]}],\n  \"nodes\":[\n";
     for (std::size_t index = 0U; index < nodes.size(); ++index) {
@@ -984,6 +993,19 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
             json << ']';
         }
         json << "}" << (index + 1U == nodes.size() ? "\n" : ",\n");
+    }
+    if (export_options.source_z_up) {
+        json << "    ,{\"name\":\"Source Z-up to glTF Y-up\","
+                "\"matrix\":[1,0,0,0,0,0,-1,0,0,1,0,0,0,0,0,1],\"children\":[";
+        bool first = true;
+        for (std::size_t index = 0U; index < nodes.size(); ++index) {
+            if (nodes[index].parent.has_value()) continue;
+            if (!first) json << ',';
+            first = false;
+            json << index;
+        }
+        json << "],\"extras\":{\"source_frame\":\"right_handed_z_up\","
+                "\"conversion\":\"x,z,-y\",\"source_transforms_preserved\":true}}\n";
     }
     json << "  ],\n  \"meshes\":[\n";
     for (std::size_t index = 0U; index < meshes.size(); ++index) {

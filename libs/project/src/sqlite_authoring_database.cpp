@@ -39,7 +39,10 @@ constexpr std::string_view kProjectDocumentSnapshotSql =
     "source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),"
     "document_bytes BLOB NOT NULL CHECK(length(document_bytes) > 0)"
     ");";
-constexpr int kMaxProjectSnapshotBytes = 128 * 1024 * 1024;
+#ifndef CARTOGRAPHER_PROJECT_TEXT_LIMIT_BYTES
+#define CARTOGRAPHER_PROJECT_TEXT_LIMIT_BYTES 134217728
+#endif
+constexpr int kMaxProjectSnapshotBytes = CARTOGRAPHER_PROJECT_TEXT_LIMIT_BYTES;
 #if defined(CARTO_SQLITE_TEST_FAULT_INJECTION)
 bool g_crash_before_project_snapshot_commit = false;
 #endif

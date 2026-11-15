@@ -125,6 +125,9 @@ struct PreparationOperationRequest {
     // Optional verified externally linked parts (scene scope only). Borrowed
     // for the duration of the call; each part keeps its own source authority.
     const PreparedLinkedSceneInput* linked = nullptr;
+    // Explicitly describes the source geometry when a legacy project label
+    // does not. It never changes the editable document or its local transforms.
+    std::optional<PreparedCoordinateConvention> coordinate_override;
 };
 
 struct PreparationOperationReport {

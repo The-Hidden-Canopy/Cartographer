@@ -173,7 +173,10 @@ constexpr std::uint64_t kMaxSerializedUvSets = 1'000'000U;
 constexpr std::uint64_t kMaxSerializedSculptStacks = 100'000U;
 constexpr std::uint64_t kMaxSerializedGarmentAssets = 100'000U;
 constexpr std::uint64_t kMaxSerializedClothRestPoseReceipts = 100'000U;
-constexpr std::uintmax_t kMaxSerializedProjectBytes = 128ULL * 1024ULL * 1024ULL;
+#ifndef CARTOGRAPHER_PROJECT_TEXT_LIMIT_BYTES
+#define CARTOGRAPHER_PROJECT_TEXT_LIMIT_BYTES 134217728ULL
+#endif
+constexpr std::uintmax_t kMaxSerializedProjectBytes = CARTOGRAPHER_PROJECT_TEXT_LIMIT_BYTES;
 // Mirrors carto::semantic::SemanticSidecar::kMaxSerializedBytes. The value is
 // duplicated here so libs/project keeps no dependency on carto_semantic.
 constexpr std::uint64_t kMaxSerializedSemanticSidecarBytes = 16ULL * 1024ULL * 1024ULL;
@@ -6437,7 +6440,7 @@ std::string ProjectDocument::serialize() const {
 core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text) {
     if (text.size() > kMaxSerializedProjectBytes) {
         return core::Result<ProjectDocument>::failure(parse_error(
-            "project text exceeds the Cartographer v1 size limit of 128 MiB"));
+            "project text exceeds the configured Cartographer project size limit"));
     }
     std::istringstream input{std::string(text)};
     input.imbue(std::locale::classic());
@@ -9100,7 +9103,7 @@ core::Result<ProjectDocument> ProjectDocument::load(const std::filesystem::path&
     }
     if (file_size > kMaxSerializedProjectBytes) {
         return core::Result<ProjectDocument>::failure(parse_error(
-            "project file exceeds the Cartographer size limit of 128 MiB"));
+            "project file exceeds the configured Cartographer project size limit"));
     }
     std::ostringstream contents;
     contents << input.rdbuf();
