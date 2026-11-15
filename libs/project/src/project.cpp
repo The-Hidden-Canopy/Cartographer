@@ -643,6 +643,37 @@ std::vector<std::size_t> serialized_attribute_value_order(
     return order;
 }
 
+// Writes floating-point values in the shortest form that reads back to the
+// identical double, instead of a fixed 17 significant digits. Loaded values
+// are unchanged; only the project text gets smaller. Explicit fixed,
+// scientific or padded formatting falls back to the standard facet. Digest
+// inputs such as canonical_mesh_state_bytes keep the classic locale.
+class ShortestRoundTripNumPut final : public std::num_put<char> {
+protected:
+    iter_type do_put(iter_type out, std::ios_base& stream, char_type fill, double value) const override {
+        if ((stream.flags() & std::ios_base::floatfield) != std::ios_base::fmtflags{} ||
+            stream.width() != 0 || !std::isfinite(value)) {
+            return std::num_put<char>::do_put(out, stream, fill, value);
+        }
+        std::array<char, 32> buffer{};
+        const auto written = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
+        if (written.ec != std::errc{}) return std::num_put<char>::do_put(out, stream, fill, value);
+        return std::copy(buffer.data(), written.ptr, out);
+    }
+    iter_type do_put(iter_type out, std::ios_base& stream, char_type fill, long double value) const override {
+        const double narrowed = static_cast<double>(value);
+        if (static_cast<long double>(narrowed) != value) {
+            return std::num_put<char>::do_put(out, stream, fill, value);
+        }
+        return do_put(out, stream, fill, narrowed);
+    }
+};
+
+const std::locale& shortest_round_trip_locale() {
+    static const std::locale locale(std::locale::classic(), new ShortestRoundTripNumPut);
+    return locale;
+}
+
 std::string canonical_mesh_state_bytes(const geometry::EditableMesh& mesh) {
     std::ostringstream output;
     output.imbue(std::locale::classic());
@@ -6074,7 +6105,7 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
 
 std::string ProjectDocument::serialize() const {
     std::ostringstream output;
-    output.imbue(std::locale::classic());
+    output.imbue(shortest_round_trip_locale());
     output << kMagic << ' ' << kSchemaVersion << '\n';
     output << "AUTHORING " << std::quoted(std::string(kAuthoringFormat)) << ' '
            << std::quoted(std::string(kAuthoringUnits)) << ' '

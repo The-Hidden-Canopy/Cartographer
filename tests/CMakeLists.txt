@@ -2463,3 +2463,9 @@ target_include_directories(cartographer_linear_pfm_tests PRIVATE "${PROJECT_SOUR
 target_link_libraries(cartographer_linear_pfm_tests PRIVATE carto_assets)
 carto_target(cartographer_linear_pfm_tests)
 add_test(NAME cartographer_linear_pfm_tests COMMAND cartographer_linear_pfm_tests)
+
+# Project text uses shortest exact doubles; reload is bit-identical.
+add_executable(cartographer_project_number_format_tests project_number_format_tests.cpp)
+target_link_libraries(cartographer_project_number_format_tests PRIVATE carto_application)
+carto_target(cartographer_project_number_format_tests)
+add_test(NAME cartographer_project_number_format_tests COMMAND cartographer_project_number_format_tests)
