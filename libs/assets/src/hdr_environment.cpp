@@ -127,7 +127,7 @@ core::Result<HdrEnvironmentImage> decode_hdr_environment(std::span<const std::ui
         }
         if(offset!=bytes.size())throw std::runtime_error("trailing data after HDR image");
         HdrEnvironmentImage result;result.source_digest=sha256(bytes);result.source_width=w;result.source_height=h;
-        result.height=std::min(h,64U);result.width=2*result.height;result.linear_radiance.resize(std::size_t(result.width)*result.height);
+        result.height=std::min(h,128U);result.width=2*result.height;result.linear_radiance.resize(std::size_t(result.width)*result.height);
         const double scale=double(h)/result.height;
         for(unsigned y=0;y<result.height;++y)for(unsigned x=0;x<result.width;++x) {
             core::Vec3d sum{};double weight=0;

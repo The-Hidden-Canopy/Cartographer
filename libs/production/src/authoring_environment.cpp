@@ -87,7 +87,7 @@ std::array<double, 4> atlas_sample(const EnvironmentLighting &p, unsigned row, u
                                    unsigned h, core::Vec2d coordinate, bool wrap = true,
                                    unsigned column = 0) {
     return bilinear(coordinate, w, h, wrap, [&](auto x, auto y) {
-        return p.atlas()[std::size_t(row + y) * p.width + column + x];
+        return p.atlas()[std::size_t(row + y) * p.atlas_width() + column + x];
     });
 }
 } // namespace
@@ -112,20 +112,31 @@ environment_content_digest(const project::AuthoredEnvironment &e) {
 }
 core::Result<std::shared_ptr<const EnvironmentLighting>>
 compile_environment_lighting(const project::AuthoredEnvironment &e) {
+    return compile_environment_lighting(e, e.width > EnvironmentLighting::width
+        ? EnvironmentLightingQuality::high : EnvironmentLightingQuality::standard);
+}
+core::Result<std::shared_ptr<const EnvironmentLighting>>
+compile_environment_lighting(const project::AuthoredEnvironment &e, EnvironmentLightingQuality quality) {
     using Result = core::Result<std::shared_ptr<const EnvironmentLighting>>;
+    if (quality != EnvironmentLightingQuality::standard && quality != EnvironmentLightingQuality::high)
+        return Result::failure(invalid("unknown environment lighting quality"));
     auto digest = environment_content_digest(e);
     if (!digest)
         return Result::failure(digest.error());
     auto product = std::shared_ptr<EnvironmentLighting>(new EnvironmentLighting);
     product->source_digest_ = digest.value();
-    product->atlas_.resize(std::size_t(product->width) * product->height);
+    product->atlas_width_ = quality == EnvironmentLightingQuality::high ? 256U : product->width;
+    const unsigned atlas_width = product->atlas_width();
+    product->atlas_.resize(std::size_t(atlas_width) * product->atlas_height());
     const auto store = [&](unsigned x, unsigned y, Vec3d c) {
-        product->atlas_[std::size_t(y) * product->width + x] = {float(c.x), float(c.y), float(c.z),
+        product->atlas_[std::size_t(y) * atlas_width + x] = {float(c.x), float(c.y), float(c.z),
                                                                 1};
     };
     for (unsigned level = 0; level < product->levels; ++level) {
-        const unsigned w = product->width >> std::min(level, 4U), h = w / 2;
-        const unsigned row = level < 5 ? 128 - w : 120, column = level < 5 ? 0 : (level - 4) * 8;
+        const unsigned w = atlas_width >> std::min(level, 4U), h = w / 2;
+        const unsigned floor_width = atlas_width / 16;
+        const unsigned row = level < 5 ? atlas_width - w : atlas_width - floor_width;
+        const unsigned column = level < 5 ? 0 : (level - 4) * floor_width;
         const double roughness = double(level) / (product->levels - 1);
         for (unsigned y = 0; y < h; ++y)
             for (unsigned x = 0; x < w; ++x) {
@@ -154,7 +165,7 @@ compile_environment_lighting(const project::AuthoredEnvironment &e) {
                                     e, to_world(n, {std::sqrt(v) * std::cos(p),
                                                     std::sqrt(v) * std::sin(p), std::sqrt(1 - v)}));
             }
-            store(x, product->diffuse_row + y, total * (1. / 128)); // cosine average = E/pi
+            store(x, atlas_width - 1 + y, total * (1. / 128)); // cosine average = E/pi
         }
     static const auto lut = [] {
         std::array<std::array<float, 4>, 64 * 64> values{};
@@ -165,7 +176,7 @@ compile_environment_lighting(const project::AuthoredEnvironment &e) {
     }();
     for (unsigned y = 0; y < 64; ++y)
         for (unsigned x = 0; x < 64; ++x)
-            product->atlas_[std::size_t(product->brdf_row + y) * product->width + x] =
+            product->atlas_[std::size_t(atlas_width + 15 + y) * atlas_width + x] =
                 lut[y * 64 + x];
     return Result::success(std::move(product));
 }
@@ -173,7 +184,7 @@ Vec3d EnvironmentLighting::diffuse(Vec3d n) const {
     n = n.normalized();
     if (!n.finite())
         return n;
-    const auto c = atlas_sample(*this, diffuse_row, 32, 16, uv(n));
+    const auto c = atlas_sample(*this, atlas_width_ - 1, 32, 16, uv(n));
     return {c[0], c[1], c[2]};
 }
 Vec3d EnvironmentLighting::specular(Vec3d r, double roughness) const {
@@ -187,9 +198,10 @@ Vec3d EnvironmentLighting::specular(Vec3d r, double roughness) const {
     const double level = std::clamp(roughness, 0., 1.) * (levels - 1);
     const unsigned a = unsigned(std::floor(level)), b = std::min(a + 1, levels - 1);
     const auto sample = [&](unsigned i) {
-        const unsigned w = width >> std::min(i, 4U);
-        return atlas_sample(*this, i < 5 ? 128 - w : 120, w, w / 2, uv(r), true,
-                            i < 5 ? 0 : (i - 4) * 8);
+        const unsigned w = atlas_width_ >> std::min(i, 4U);
+        const unsigned floor_width = atlas_width_ / 16;
+        return atlas_sample(*this, i < 5 ? atlas_width_ - w : atlas_width_ - floor_width,
+                            w, w / 2, uv(r), true, i < 5 ? 0 : (i - 4) * floor_width);
     };
     const auto x = sample(a), y = sample(b);
     const double t = level - a;
@@ -200,7 +212,7 @@ std::array<double, 2> EnvironmentLighting::brdf(double nv, double roughness) con
         const auto v = std::numeric_limits<double>::quiet_NaN();
         return {v, v};
     }
-    const auto c = atlas_sample(*this, brdf_row, 64, 64,
+    const auto c = atlas_sample(*this, atlas_width_ + 15, 64, 64,
                                 {std::clamp(nv, 0., 1.), std::clamp(roughness, 0., 1.)}, false);
     return {c[0], c[1]};
 }

@@ -624,18 +624,21 @@ struct AuthoringViewport::Impl {
             auto product = request.environment_lighting;
             if (product && product->source_digest() != digest)
                 throw std::runtime_error("GPU environment product is stale");
-            if (!product && environment_product && environment_product->source_digest() == digest)
+            const auto default_width = e->width > production::EnvironmentLighting::width ? 256U : 128U;
+            if (!product && environment_product && environment_product->source_digest() == digest &&
+                environment_product->atlas_width() == default_width)
                 product = environment_product;
             if (!product) {
                 const auto baking = Clock::now();
                 product = need(production::compile_environment_lighting(*e));
                 frame.environment_compile_milliseconds = elapsed(baking);
             }
-            if (uploaded_environment != digest.hex()) {
+            auto upload_key = digest.hex() + ":" + std::to_string(product->atlas_width());
+            if (uploaded_environment != upload_key) {
                 auto candidate = std::make_shared<Resources>(device);
                 const auto atlas = candidate->texture(
-                    {production::EnvironmentLighting::width,
-                     production::EnvironmentLighting::height, 1, 1, 1, gpu::Format::rgba32_float,
+                    {product->atlas_width(),
+                     product->atlas_height(), 1, 1, 1, gpu::Format::rgba32_float,
                      gpu::TextureDimension::texture_2d,
                      gpu::TextureUsage::sampled | gpu::TextureUsage::transfer_destination});
                 Resources staging(*device);
@@ -682,7 +685,7 @@ struct AuthoringViewport::Impl {
                 frame.allocation_milliseconds += candidate->allocation_ms + staging.allocation_ms;
                 environment_resources = std::move(candidate);
                 environment_atlas = atlas;
-                uploaded_environment = digest.hex();
+                uploaded_environment = std::move(upload_key);
                 frame.environment_upload_bytes = pixels.size();
             }
             environment_product = std::move(product);
@@ -691,8 +694,8 @@ struct AuthoringViewport::Impl {
         }
         if (environment_resources)
             frame.environment_resident_bytes =
-                std::uint64_t(production::EnvironmentLighting::width) *
-                production::EnvironmentLighting::height * 16;
+                std::uint64_t(environment_product->atlas_width()) *
+                environment_product->atlas_height() * 16;
         frame.logical_resident_bytes += frame.environment_resident_bytes;
         frame.environment_prepare_milliseconds = elapsed(started);
     }

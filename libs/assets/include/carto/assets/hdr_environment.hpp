@@ -14,7 +14,7 @@ struct HdrEnvironmentImage {
 };
 // Bounded Radiance RGBE lat-long import, including planar RLE and axis flips.
 // EXPOSURE/COLORCORR are removed, primaries adapted to linear Rec.709/D65.
-// The persisted lighting grid is explicitly solid-angle filtered to <=128x64.
+// The persisted lighting grid is explicitly solid-angle filtered to <=256x128.
 // Unsupported encodings, out-of-gamut radiance and malformed input fail atomically.
 [[nodiscard]] core::Result<HdrEnvironmentImage> decode_hdr_environment(
     std::span<const std::uint8_t> bytes);

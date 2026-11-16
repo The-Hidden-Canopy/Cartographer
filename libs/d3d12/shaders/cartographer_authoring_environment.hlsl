@@ -1,4 +1,4 @@
-// Fixed linear-HDR atlas. Rect-local filtering prevents mip/LUT row bleed;
+// Bounded linear-HDR atlas. Rect-local filtering prevents mip/LUT row bleed;
 // longitude wraps, latitude clamps. Native hardware mips are not substituted
 // for directional roughness convolution.
 Texture2D<float4> authoring_environment : register(t8);
@@ -19,9 +19,11 @@ float4 environment_rect(float2 uv,int row,int width,int height,bool wrap,int col
 }
 float3 environment_specular(float3 direction,float roughness) {
     float level=saturate(roughness)*6;int a=int(floor(level)),b=min(a+1,6);
-    int wa=128>>min(a,4),wb=128>>min(b,4);float2 uv=environment_uv(direction);
-    int ra=a<5?128-wa:120,rb=b<5?128-wb:120;
-    int ca=a<5?0:(a-4)*8,cb=b<5?0:(b-4)*8;
+    uint atlas_width,atlas_height;authoring_environment.GetDimensions(atlas_width,atlas_height);
+    int size=int(atlas_width),floor_width=size/16;
+    int wa=size>>min(a,4),wb=size>>min(b,4);float2 uv=environment_uv(direction);
+    int ra=a<5?size-wa:size-floor_width,rb=b<5?size-wb:size-floor_width;
+    int ca=a<5?0:(a-4)*floor_width,cb=b<5?0:(b-4)*floor_width;
     return lerp(environment_rect(uv,ra,wa,wa/2,true,ca).rgb,
                 environment_rect(uv,rb,wb,wb/2,true,cb).rgb,level-a);
 }
@@ -40,9 +42,10 @@ float3 environment_evaluate(float3 n,float3 v,float3 base,float3 f0,float roughn
     n=float3(settings.x*n.x-settings.y*n.z,n.y,settings.y*n.x+settings.x*n.z);
     reflected=float3(settings.x*reflected.x-settings.y*reflected.z,reflected.y,
         settings.y*reflected.x+settings.x*reflected.z);
-    float3 diffuse=environment_rect(environment_uv(n),127,32,16,true).rgb;
-    float2 brdf=environment_rect(float2(nv,roughness),143,64,64,false).rg;
-    float2 coat_brdf=environment_rect(float2(nv,coat_roughness),143,64,64,false).rg;
+    uint atlas_width,atlas_height;authoring_environment.GetDimensions(atlas_width,atlas_height);
+    float3 diffuse=environment_rect(environment_uv(n),int(atlas_width)-1,32,16,true).rgb;
+    float2 brdf=environment_rect(float2(nv,roughness),int(atlas_width)+15,64,64,false).rg;
+    float2 coat_brdf=environment_rect(float2(nv,coat_roughness),int(atlas_width)+15,64,64,false).rg;
     float3 specular=environment_specular(reflected,roughness)*(f0*brdf.x+brdf.y);
     diffuse*=base*(1-f0)*(1-metallic)*ao;
     float attenuation=1-coat*(.04+.96*pow(1-nv,5));

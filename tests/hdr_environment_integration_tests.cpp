@@ -95,11 +95,47 @@ int main(){try {
     check(!assets::decode_hdr_environment(image(4,2,false,primaries+"PIXASPECT=2\n")),"pixel aspect fails visibly");
     check(!assets::decode_hdr_environment(image(6,2)),"non lat-long extent rejected");
     const auto large=take(assets::decode_hdr_environment(image(512,256,true)));
-    check(large.width==128&&large.height==64&&large.source_width==512,"explicit bounded lighting grid");
+    check(large.width==256&&large.height==128&&large.source_width==512,"higher-detail bounded lighting grid");
     double input_energy=0,output_energy=0;
     for(unsigned y=0;y<256;++y)input_energy+=(1+double(y%128)/64)*(std::cos(y*std::numbers::pi/256)-std::cos((y+1)*std::numbers::pi/256));
-    for(unsigned y=0;y<64;++y)output_energy+=large.linear_radiance[y*128].x*(std::cos(y*std::numbers::pi/64)-std::cos((y+1)*std::numbers::pi/64));
+    for(unsigned y=0;y<128;++y)output_energy+=large.linear_radiance[y*256].x*(std::cos(y*std::numbers::pi/128)-std::cos((y+1)*std::numbers::pi/128));
     near(input_energy,output_energy,"solid-angle filtering conserves environment energy");
+    {
+        project::AuthoredEnvironment detailed;
+        detailed.identity="hdr.detail";
+        detailed.width=large.width; detailed.height=large.height;
+        detailed.linear_radiance=large.linear_radiance;
+        project::PresentationCatalog detailed_catalog;
+        okay(detailed_catalog.set_environment(detailed));
+        const auto serialized=detailed_catalog.serialize();
+        check(serialized.starts_with("CARTOGRAPHER_PRESENTATION_CATALOG 6\n"),
+              "higher-detail environment uses a new catalog version");
+        const auto reopened=take(project::PresentationCatalog::deserialize(serialized));
+        check(reopened.environment()->width==256 && reopened.serialize()==serialized,
+              "higher-detail environment survives exact catalog reload");
+        const auto high_product=take(production::compile_environment_lighting(detailed));
+        check(high_product->atlas_width()==256 && high_product->atlas_height()==335,
+              "higher-detail source selects the bounded higher-quality atlas");
+        const auto standard_product=take(production::compile_environment_lighting(
+            detailed,production::EnvironmentLightingQuality::standard));
+        check(standard_product->atlas_width()==128 &&
+              standard_product->source_digest()==high_product->source_digest(),
+              "standard tier remains available for the same source");
+        application::ApplicationSession high_session;
+        const auto high_snapshot=high_session.snapshot();
+        send(high_session,application::SetPresentationCatalogAction{
+            high_snapshot.project_generation,high_snapshot.project_revision,detailed_catalog});
+        const auto high_path=std::filesystem::temp_directory_path() /
+            ("cartographer-hdr-high-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".carto");
+        send(high_session,application::SaveProjectAction{high_path, std::nullopt, {}, {}, false});
+        const auto high_reopened=take(project::ProjectDocument::load(high_path));
+        check(high_reopened.presentation_catalog().serialize()==serialized,
+              "higher-detail source survives project save and reload");
+        auto forged=serialized;
+        forged.replace(forged.find("CATALOG 6"),9,"CATALOG 5");
+        check(!project::PresentationCatalog::deserialize(forged),
+              "old catalog versions cannot smuggle a newer oversized environment");
+    }
 
     // Exercise the same preparation used by the desktop import button.
     {
