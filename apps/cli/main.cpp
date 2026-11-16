@@ -2896,7 +2896,8 @@ int import_stl(const std::filesystem::path& stl_path, const std::filesystem::pat
 int export_interchange(
     const std::filesystem::path& project_path,
     const std::filesystem::path& output_path,
-    bool binary_container, std::uint32_t graph_bake_resolution = 0) {
+    bool binary_container, std::uint32_t graph_bake_resolution = 0,
+    bool whole_scene_materials = false, bool source_z_up = false) {
     const auto linked = carto::project::has_condition_link_companions(project_path);
     if (!linked) { print_error(linked.error()); return EXIT_FAILURE; }
     if (linked.value()) {
@@ -2924,9 +2925,11 @@ int export_interchange(
         std::cerr << "error: project has no mesh assets\n";
         return EXIT_FAILURE;
     }
+    const std::size_t image_limit = whole_scene_materials ? 256U : 64U;
+    const std::uint64_t image_bytes = whole_scene_materials ? 512ULL * 1024ULL * 1024ULL : 64ULL * 1024ULL * 1024ULL;
     auto report = binary_container
-        ? carto::io::export_glb(document.value(), output_path, carto::io::GltfExportOptions{project_path,{},graph_bake_resolution})
-        : carto::io::export_gltf(document.value(), output_path, carto::io::GltfExportOptions{project_path,{},graph_bake_resolution});
+        ? carto::io::export_glb(document.value(), output_path, carto::io::GltfExportOptions{project_path,{},graph_bake_resolution,image_limit,image_bytes,source_z_up})
+        : carto::io::export_gltf(document.value(), output_path, carto::io::GltfExportOptions{project_path,{},graph_bake_resolution,image_limit,image_bytes,source_z_up});
     if (!report) {
         print_error(report.error());
         return EXIT_FAILURE;
@@ -2942,6 +2945,8 @@ int export_interchange(
               << " materials=" << report.value().materials
               << " textures=" << report.value().textures
               << " images=" << report.value().images
+              << " embedded_image_bytes=" << report.value().embedded_image_bytes
+              << " embedded_image_limit=" << image_limit
               << '\n';
     for (const auto& warning : report.value().warnings) {
         std::cout << "warning: " << warning << '\n';
@@ -3075,6 +3080,11 @@ int prepare_project(int argc, char** argv) {
 #endif
     }
     int scope_index = 4;
+    bool source_z_up = false;
+    if (scope_index < argc && std::string_view(argv[scope_index]) == "--source-z-up") {
+        source_z_up = true;
+        ++scope_index;
+    }
     production::PreparationProfile profile =
         production::portable_preparation_profile();
     if (argc >= 7 && std::string_view(argv[scope_index]) == "--profile") {
@@ -3146,7 +3156,7 @@ int prepare_project(int argc, char** argv) {
     }
     auto source_root = project_path.parent_path();
     if (source_root.empty()) source_root = std::filesystem::current_path();
-    const production::PreparationOperationRequest request{
+    production::PreparationOperationRequest request{
         .scope = std::move(scope),
         .profile = std::move(profile),
         .source_root = std::move(source_root),
@@ -3154,6 +3164,14 @@ int prepare_project(int argc, char** argv) {
         .expected_selected_digest = expected,
         .stop_token = {},
     };
+    if (source_z_up) {
+        request.coordinate_override = production::PreparedCoordinateConvention{
+            .meters_per_unit = 1.0,
+            .handedness = production::PreparedHandedness::right_handed,
+            .up = production::PreparedAxis::positive_z,
+            .forward = production::PreparedAxis::positive_y,
+        };
+    }
     const auto report = production::prepare_and_publish(document.value(), request);
     return print_preparation_report(report, output_root);
 }
@@ -8981,11 +8999,11 @@ void usage(std::ostream& output) {
            << "  cartographer_cli export-obj <project.carto> [mesh-asset-id] <mesh.obj>\n"
            << "  cartographer_cli export-ply <project.carto> [mesh-asset-id] <mesh.ply>\n"
            << "  cartographer_cli export-stl <project.carto> [mesh-asset-id] <mesh.stl>\n"
-           << "  cartographer_cli export-gltf <project.carto> <scene.gltf> [explicit-graph-bake-resolution]\n"
-           << "  cartographer_cli export-glb <project.carto> <scene.glb> [explicit-graph-bake-resolution]\n"
+           << "  cartographer_cli export-gltf <project.carto> <scene.gltf> [explicit-graph-bake-resolution|whole-scene-materials] [--source-z-up]\n"
+           << "  cartographer_cli export-glb <project.carto> <scene.glb> [explicit-graph-bake-resolution|whole-scene-materials] [--source-z-up]\n"
            << "  cartographer_cli write-default-preparation-profile <profile.carto-prep>\n"
            << "  cartographer_cli inspect-preparation-profile <profile.carto-prep>\n"
-           << "  cartographer_cli prepare <project.carto> <output-directory> scene\n"
+           << "  cartographer_cli prepare <project.carto> <output-directory> [--source-z-up] scene\n"
            << "  cartographer_cli prepare <project.carto> <output-directory> --profile <profile.carto-prep> scene\n"
            << "  cartographer_cli prepare <project.carto> <output-directory> asset <mesh-asset-id>\n"
            << "  cartographer_cli prepare <project.carto> <output-directory> assembly <node-id>\n"
@@ -9154,9 +9172,13 @@ int main(int argc, char** argv) {
         }
         return export_stl(argv[2], argv[4], mesh_asset.value());
     }
-    if ((command == "export-gltf" || command == "export-glb") && (argc == 4 || argc == 5)) {
+    if ((command == "export-gltf" || command == "export-glb") && argc >= 4 && argc <= 6) {
         std::uint32_t bake=0;
-        if(argc==5) {
+        const bool whole_scene_materials = argc >= 5 && std::string_view(argv[4]) == "whole-scene-materials";
+        const bool source_z_up = (argc == 5 && std::string_view(argv[4]) == "--source-z-up") ||
+            (argc == 6 && std::string_view(argv[5]) == "--source-z-up");
+        if(argc == 6 && (!whole_scene_materials || !source_z_up))return EXIT_FAILURE;
+        if(argc==5 && !whole_scene_materials && !source_z_up) {
             auto parsed=parse_bake_u32_argument(argv[4],"explicit graph bake resolution");
             if(!parsed){print_error(parsed.error());return EXIT_FAILURE;}
             bake=parsed.value();
@@ -9167,7 +9189,7 @@ int main(int argc, char** argv) {
                 return EXIT_FAILURE;
             }
         }
-        return export_interchange(argv[2], argv[3], command=="export-glb",bake);
+        return export_interchange(argv[2], argv[3], command=="export-glb",bake,whole_scene_materials,source_z_up);
     }
     if (command == "write-default-preparation-profile" && argc == 3) {
         return write_default_preparation_profile(argv[2]);

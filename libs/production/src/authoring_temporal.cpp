@@ -80,7 +80,7 @@ core::Result<AuthoringTemporalFrame> AuthoringTemporalHistory::resolve(
         return Result::success({std::move(image), AuthoringHistoryReset::suspended, {}, {}});
     }
     const auto count = std::uint64_t(image.width) * image.height;
-    if (count > 1048576 || image.linear_hdr.size() != count || image.depth.size() != count ||
+    if (count > kAuthoringCpuMaxPixels || image.linear_hdr.size() != count || image.depth.size() != count ||
         image.objects.size() != count || image.faces.size() != count)
         return Result::failure(invalid("temporal authoring frame attachments mismatch extent"));
     if (auto check = image.view.validate(); !check)

@@ -2,6 +2,7 @@
 #include "gltf_test_payload.hpp"
 #include "scene_import_test_support.hpp"
 #include <carto/io/generated_mesh.hpp>
+#include <carto/core/json.hpp>
 #include <carto/io/gltf_scene_import.hpp>
 #include <carto/production/authoring_viewport.hpp>
 #include <sstream>
@@ -79,11 +80,86 @@ void reject(const std::vector<std::uint8_t> &bytes, const char *reason) {
 } // namespace
 int main(int argc, char **argv) {
     try {
+        // The large exception is bounded, numeric-only and opt-in. Ordinary
+        // arrays and all default parser users retain the original limit.
+        const auto make_array = [](std::size_t count) {
+            std::string a = "[";
+            for (std::size_t i = 0; i < count; ++i) { if (i) a += ','; a += '1'; }
+            return a + "]";
+        };
+        const auto large = make_array(107390);
+        const auto metadata = std::string("{\"cartographer_triangle_faces\":") + large + "}";
+        check(!core::json::parse_object(metadata), "default JSON limit remains intact");
+        check(bool(core::json::parse_object_with_numeric_array_limit(metadata, {"cartographer_triangle_faces"}, 200000)),
+              "large numeric provenance is accepted");
+        check(!core::json::parse_object_with_numeric_array_limit(
+                  std::string("{\"cartographer_triangle_faces\":") + make_array(200001) + "}",
+                  {"cartographer_triangle_faces"}, 200000), "provenance bound enforced");
+        check(!core::json::parse_object_with_numeric_array_limit(
+                  "{\"cartographer_triangle_faces\":[[1]]}", {"cartographer_triangle_faces"}, 200000),
+              "nested provenance entries rejected");
+        check(!core::json::parse_object_with_numeric_array_limit(
+                  std::string("{\"unrelated\":") + make_array(4097) + "}",
+                  {"cartographer_triangle_faces"}, 200000), "unrelated array bound preserved");
+        check(!core::json::parse_object_with_numeric_array_limit(
+                  "{\"cartographer_triangle_faces\":[1],\"cartographer_triangle_faces\":[2]}",
+                  {"cartographer_triangle_faces"}, 200000), "duplicate provenance keys rejected");
+        check(!core::json::parse_object_with_numeric_array_limit(
+                  std::string("{\"other\":{\"cartographer_triangle_faces\":") + make_array(4097) + "}}",
+                  {"meshes", "primitives", "extras", "cartographer_triangle_faces"}, 200000),
+              "same key outside the schema path remains bounded");
+        const auto with_metadata = replace(fixture(), "\"indices\":4,\"material\":0}",
+                  std::string("\"indices\":4,\"material\":0,\"extras\":") + metadata + "}");
+        check(bool(io::import_gltf_scene(with_metadata)), "large provenance scene imports");
         const auto root =
             std::filesystem::temp_directory_path() /
             ("static-gltf-import-" +
              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         std::filesystem::create_directories(root);
+        // A filesystem-dependent .gltf is snapshotted once; subsequent parsing
+        // must use the captured bytes even if the sibling changes or disappears.
+        {
+            const std::string json = R"({"asset":{"version":"2.0"},"images":[{"uri":"albedo.png"}]})";
+            const std::vector<std::uint8_t> source(json.begin(), json.end());
+            const std::vector<std::uint8_t> png = {137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,1,0,0,0,1,8,6,0,0,0,31,21,196,137,0,0,0,13,73,68,65,84,120,156,99,248,207,192,240,31,0,5,0,1,255,137,153,61,29,0,0,0,0,73,69,78,68,174,66,96,130};
+            const auto path = root / "external.gltf";
+            { std::ofstream out(root / "albedo.png", std::ios::binary); out.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size())); }
+            const auto captured = take(io::capture_gltf_scene_source(path, source));
+            std::filesystem::remove(root / "albedo.png");
+            const auto materials = take(io::import_gltf_materials(captured, false));
+            check(materials.encoded_images.size() == 1 && materials.encoded_images[0] == png,
+                  "external image is captured and imported without filesystem access");
+            // Exercise the same captured image through the scene material path.
+            { std::ofstream out(root / "albedo.png", std::ios::binary); out.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size())); }
+            auto scene_source = replace(fixture(), "\"materials\":[", "\"images\":[{\"uri\":\"albedo.png\"}],\"textures\":[{\"source\":0}],\"materials\":[");
+            scene_source = replace(scene_source, "\"pbrMetallicRoughness\":{", "\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0},");
+            const auto captured_scene = take(io::capture_gltf_scene_source(path, scene_source));
+            std::filesystem::remove(root / "albedo.png");
+            const auto scene = take(io::import_gltf_scene(captured_scene));
+            auto all_slots_source = replace(scene_source, "\"baseColorTexture\":{\"index\":0},", "\"baseColorTexture\":{\"index\":0},\"metallicRoughnessTexture\":{\"index\":0},");
+            all_slots_source = replace(all_slots_source, "\"pbrMetallicRoughness\":{", "\"normalTexture\":{\"index\":0},\"occlusionTexture\":{\"index\":0},\"emissiveTexture\":{\"index\":0},\"pbrMetallicRoughness\":{");
+            { std::ofstream out(root / "albedo.png", std::ios::binary); out.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size())); }
+            const auto all_slots = take(io::import_gltf_scene(take(io::capture_gltf_scene_source(path, all_slots_source))));
+            std::filesystem::remove(root / "albedo.png");
+            const auto& definition = all_slots.materials.catalog.materials().begin()->second.definition;
+            check(definition.normal.normal_convention == render::NormalConvention::opengl_y_plus &&
+                  definition.base_color.normal_convention == render::NormalConvention::directx_y_minus &&
+                  definition.metallic_roughness.normal_convention == render::NormalConvention::directx_y_minus &&
+                  definition.occlusion.normal_convention == render::NormalConvention::directx_y_minus &&
+                  definition.emissive.normal_convention == render::NormalConvention::directx_y_minus,
+                  "glTF +Y convention applies only to the normal texture slot");
+            check(scene.materials.encoded_images.size() == 1 && scene.meshes.size() == 1,
+                  "textured external-image scene imports after its sibling is removed");
+            check(!io::import_gltf_materials(source, false), "uncaptured external image is refused");
+            const auto mismatch = replace(source, "\"uri\":\"albedo.png\"", "\"uri\":\"albedo.png\",\"mimeType\":\"image/jpeg\"");
+            { std::ofstream out(root / "albedo.png", std::ios::binary); out.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size())); }
+            const auto mismatch_package = take(io::capture_gltf_scene_source(path, mismatch));
+            check(!io::import_gltf_materials(mismatch_package, false), "conflicting MIME is refused");
+            std::filesystem::remove(root / "albedo.png");
+            const std::string escape = R"({"asset":{"version":"2.0"},"images":[{"uri":"../albedo.png"}]})";
+            check(!io::capture_gltf_scene_source(path, {reinterpret_cast<const std::uint8_t*>(escape.data()), escape.size()}),
+                  "external image path traversal is refused");
+        }
         for (bool binary : {false, true}) {
             auto bytes = fixture(binary);
             auto parsed = take(io::import_gltf_scene(bytes));

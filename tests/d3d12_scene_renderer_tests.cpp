@@ -966,6 +966,29 @@ void project_scene_texture_loader_binds_verified_sources_and_fails_closed() {
         "fixture-room", document, {}, 64U, 64U, loaded));
     require(request.textures.size() == 1U,
         "verified project pixels reach the native render request");
+    // Historical glTF imports stamped +Y on every texture slot. Reopen an
+    // actual saved project with that legacy metadata and preserve its bytes.
+    auto legacy_document = document;
+    auto legacy_catalog = legacy_document.material_catalog();
+    auto legacy_material = legacy_catalog.materials().at(1U);
+    legacy_material.definition.base_color.normal_convention = render::NormalConvention::opengl_y_plus;
+    legacy_material.revision = core::Revision{3U};
+    take(legacy_catalog.replace_material(legacy_material));
+    take(legacy_document.set_material_catalog(std::move(legacy_catalog)));
+    const auto legacy_bytes = legacy_document.serialize();
+    const auto legacy_path = temporary.path() / "legacy-nonnormal.carto";
+    { std::ofstream out(legacy_path, std::ios::binary); out << legacy_bytes; require(bool(out), "legacy fixture saved"); }
+    const auto reopened_legacy = take(project::ProjectDocument::load(legacy_path));
+    const auto reopened_before = reopened_legacy.serialize();
+    const auto legacy_request = take(d3d12::prepare_project_scene_render(
+        "fixture-room", reopened_legacy, {}, 64U, 64U, loaded));
+    require(reopened_legacy.serialize() == reopened_before &&
+        std::any_of(legacy_request.objects.begin(), legacy_request.objects.end(), [](const auto& object) {
+            return std::any_of(object.materials.begin(), object.materials.end(), [](const auto& binding) {
+                return binding.current_material.definition.base_color.normal_convention ==
+                    render::NormalConvention::opengl_y_plus;
+            });
+        }), "legacy non-normal convention prepares without rewriting saved source");
     auto mapped_channel_document = document;
     auto mapped_channel_catalog = mapped_channel_document.material_catalog();
     auto mapped_channel_material = mapped_channel_catalog.materials().at(1U);
@@ -3127,6 +3150,16 @@ void scene_render_uses_independent_material_slot_samplers(
         "distinct current samplers admit on base-color and metallic/roughness slots");
 
     const auto direct = capture(device, input);
+    auto legacy = input;
+    legacy.objects[0U].materials[0U].current_material.definition.base_color.normal_convention =
+        render::NormalConvention::opengl_y_plus;
+    legacy.objects[0U].materials[0U].current_material.definition.metallic_roughness.normal_convention =
+        render::NormalConvention::opengl_y_plus;
+    rebind(legacy.objects[0U]);
+    const auto legacy_pixels = capture(device, legacy);
+    require(legacy_pixels.linear_hdr_rgba == direct.linear_hdr_rgba &&
+            legacy_pixels.pixel_digest == direct.pixel_digest,
+        "historical non-normal +Y metadata is inert and produces identical pixels");
     d3d12::SceneRenderCache cache;
     const auto cached = take(d3d12::render_scene_cached(
         device, cache, input, CARTO_D3D12_SHADER_DIR));
@@ -4632,9 +4665,90 @@ void explicit_temporal_resolve_uses_bound_history_and_resets_on_cut(
                 wrong_motion_format.temporal->motion_vectors)),
         "temporal test destroys only its caller-owned fixtures");
 }
+void float_emissive_reaches_native_pixels(d3d12::D3D12Device& device) {
+    auto bound=request(); bound.light.radiance={};
+    auto& material=bound.objects[0U].materials[0U].current_material.definition;
+    material.emissive.asset=77U; material.emissive_factor={1.0,1.0,1.0}; material.emissive_strength=1.0;
+    rebind(bound.objects[0U]);
+    bound.textures.push_back(texture(77U,{255U,255U,255U,255U},assets::TextureSemantic::emissive));
+    assets::LinearFloatImage input{1U,1U,{4.0f,2.0f,0.5f,1.0f}};
+    const std::vector<std::uint8_t> fixture{1U,2U,3U};
+    bound.textures.back().linear_float_mips=assets::generate_linear_float_mips(input,assets::sha256(fixture));
+    const auto image=capture(device,bound); const std::size_t center=(48U*96U+48U)*4U;
+    require(image.depth[center/4U]<1.0f && image.linear_hdr_rgba[center]>3.9f &&
+        image.linear_hdr_rgba[center+1U]>1.9f && image.linear_hdr_rgba[center+2U]>0.49f,
+        "float emissive texels above one reach scene-linear GPU output");
+    bound.textures.back().linear_float_mips.reset();
+    const auto legacy=capture(device,bound);
+    require(legacy.linear_hdr_rgba[center]<image.linear_hdr_rgba[center],
+        "legacy RGBA8 texture path remains distinct");
+}
+
+// Float base color keeps per-channel identity and linear scale, reaches the
+// GPU as RGBA32F instead of the RGBA8 texture, and must match its slot.
+void float_base_color_reaches_native_pixels(d3d12::D3D12Device& device) {
+    const std::size_t center=(48U*96U+48U)*4U;
+    std::uint8_t fixture_id=0U;
+    const auto render=[&](std::array<float,3U> color, bool keep_float) {
+        auto bound=request();
+        auto& material=bound.objects[0U].materials[0U].current_material.definition;
+        material.base_color.asset=78U; material.base_color_factor={1.0,1.0,1.0,1.0};
+        rebind(bound.objects[0U]);
+        bound.textures.push_back(texture(78U,{255U,255U,255U,255U},assets::TextureSemantic::base_color));
+        const std::vector<std::uint8_t> fixture{0xB0U,++fixture_id};
+        bound.textures.back().linear_float_mips=assets::generate_linear_float_mips(
+            assets::LinearFloatImage{1U,1U,{color[0U],color[1U],color[2U],1.0f}},assets::sha256(fixture));
+        bound.textures.back().linear_float_semantic=assets::TextureSemantic::base_color;
+        if(!keep_float) bound.textures.back().linear_float_mips.reset();
+        return capture(device,bound);
+    };
+    const auto red=render({0.8f,0.0f,0.0f},true);
+    const auto green=render({0.0f,0.8f,0.0f},true);
+    require(red.depth[center/4U]<1.0f &&
+        red.linear_hdr_rgba[center]>2.0f*red.linear_hdr_rgba[center+1U] &&
+        green.linear_hdr_rgba[center+1U]>2.0f*green.linear_hdr_rgba[center],
+        "float base color keeps per-channel identity in scene-linear output");
+    const auto dim=render({0.25f,0.25f,0.25f},true);
+    const auto bright=render({1.0f,1.0f,1.0f},true);
+    const auto over=render({2.0f,2.0f,2.0f},true);
+    require(dim.linear_hdr_rgba[center]<bright.linear_hdr_rgba[center] &&
+        bright.linear_hdr_rgba[center]<over.linear_hdr_rgba[center],
+        "float base color scales with authored linear values, including above one");
+    const auto legacy=render({0.25f,0.25f,0.25f},false);
+    require(legacy.linear_hdr_rgba[center]>dim.linear_hdr_rgba[center],
+        "float base color replaces the white RGBA8 texture rather than being ignored");
+
+    auto mismatched=request();
+    auto& material=mismatched.objects[0U].materials[0U].current_material.definition;
+    material.base_color.asset=79U; rebind(mismatched.objects[0U]);
+    mismatched.textures.push_back(texture(79U,{255U,255U,255U,255U},assets::TextureSemantic::base_color));
+    const std::vector<std::uint8_t> fixture{0xB1U};
+    mismatched.textures.back().linear_float_mips=assets::generate_linear_float_mips(
+        assets::LinearFloatImage{1U,1U,{0.5f,0.5f,0.5f,1.0f}},assets::sha256(fixture));
+    mismatched.textures.back().linear_float_semantic=assets::TextureSemantic::emissive;
+    require(!mismatched.validate(), "float texture semantic must match the RGBA8 slot it overrides");
+}
+
 void graph_occlusion_values_reach_native_pixels(d3d12::D3D12Device& device) {
     for (double occlusion : {0.0, 0.25, 1.0}) {
         auto document = room_project(); auto catalog = document.material_catalog();
+        std::vector<d3d12::SceneRenderTexture> source_textures;
+        if (occlusion == 0.25) {
+            auto map = texture(52U, {0U, 0U, 0U, 255U}, assets::TextureSemantic::occlusion);
+            project::TextureSourceRecord source;
+            source.id = map.asset; source.name = "Synthetic AO";
+            source.relative_locator = "fixtures/ao.tga";
+            source.content_digest = map.current_source_digest;
+            source.format = assets::TextureSourceFormat::tga;
+            source.width = source.height = 1U; source.provenance = "synthetic AO test";
+            take(catalog.insert_texture(source));
+            auto authored = catalog.materials().at(1U);
+            authored.definition.occlusion.asset = source.id;
+            authored.definition.occlusion_strength = 0.5;
+            authored.revision = authored.revision.next();
+            take(catalog.replace_material(authored));
+            source_textures.push_back(std::move(map));
+        }
         project::MaterialGraph graph; graph.identity = "fixture/occlusion"; graph.revision = core::Revision{1U};
         project::MaterialGraphNode color; color.id = 1U; color.kind = project::MaterialGraphNodeKind::constant_color;
         color.value_type = project::MaterialGraphValueType::color; color.constants = {1.0, 1.0, 1.0, 1.0};
@@ -4649,8 +4763,14 @@ void graph_occlusion_values_reach_native_pixels(d3d12::D3D12Device& device) {
             static_cast<bool>(document.set_material_catalog(std::move(catalog))), "source graph occlusion fixture admits");
         const auto before = document.serialize();
         d3d12::SceneRenderCamera camera; camera.position = {0.0, 5.0, 3.0}; camera.target = {0.0, -0.1, 0.0};
-        auto prepared = take(d3d12::prepare_project_scene_render("graph-occlusion", document, camera, 96U, 96U, {},
+        auto prepared = take(d3d12::prepare_project_scene_render("graph-occlusion", document, camera, 96U, 96U, source_textures,
             {{0.0, 1.0, 0.0}, {0.0, 0.0, 0.0}}));
+        if (occlusion == 0.25) {
+            const auto& binding = prepared.objects.front().materials.front();
+            require(binding.graph_occlusion == 0.25 &&
+                binding.current_material.definition.occlusion_strength == 0.5,
+                "graph AO preparation retains independent authored map strength");
+        }
         std::erase_if(prepared.objects, [&](const auto& rendered) {
             return document.scene().find(rendered.object)->name != "Floor";
         });
@@ -4658,7 +4778,7 @@ void graph_occlusion_values_reach_native_pixels(d3d12::D3D12Device& device) {
         const std::size_t center = (48U * 96U + 48U) * 4U;
         require(image.depth[center / 4U] < 1.0F, "occlusion test covers actual floor geometry");
         for (std::size_t channel = 0U; channel < 3U; ++channel)
-            require(std::abs(image.linear_hdr_rgba[center + channel] - 0.03 * occlusion) < 0.000001,
+            require(std::abs(image.linear_hdr_rgba[center + channel] - 0.03 * occlusion * (occlusion == 0.25 ? 0.5 : 1.0)) < 0.000001,
                 "graph occlusion must affect native ambient pixels, not only prepared metadata");
         require(document.serialize() == before, "native graph rendering never edits the source project");
     }
@@ -4676,6 +4796,35 @@ void graph_occlusion_values_reach_native_pixels(d3d12::D3D12Device& device) {
     const auto image = capture(device, bound);
     require(std::abs(image.linear_hdr_rgba[center] - 0.03) < 0.000001,
         "zero authored texture strength still disables the bound occlusion map");
+    material.occlusion = {}; material.occlusion_strength = 0.0;
+    bound.textures.clear();
+    rebind(bound.objects[0U]);
+    const auto no_map = capture(device, bound);
+    require(std::abs(no_map.linear_hdr_rgba[center] - 0.03) < 0.000001,
+        "unbound map strength must not darken ambient light");
+    material.occlusion.asset = 52U; material.occlusion_strength = 0.5;
+    bound.textures.push_back(texture(52U, {0U, 0U, 0U, 255U}, assets::TextureSemantic::occlusion));
+    bound.objects[0U].materials[0U].graph_occlusion = 0.25;
+    rebind(bound.objects[0U]);
+    const auto composed = capture(device, bound);
+    require(std::abs(composed.linear_hdr_rgba[center] - 0.00375) < 0.000001,
+        "graph AO multiplies the independently strength-weighted texture AO");
+    const auto composed_digest = take(bound.digest());
+    d3d12::SceneRenderCache cache;
+    const auto cached_before = take(d3d12::render_scene_cached(device, cache, bound, CARTO_D3D12_SHADER_DIR));
+    bound.objects[0U].materials[0U].graph_occlusion = 0.5;
+    require(take(bound.digest()) != composed_digest,
+        "graph AO changes request identity");
+    const auto cached_after = take(d3d12::render_scene_cached(device, cache, bound, CARTO_D3D12_SHADER_DIR));
+    const auto fresh_after = capture(device, bound);
+    require(cached_after.linear_hdr_rgba == fresh_after.linear_hdr_rgba &&
+            cached_after.pixel_digest == fresh_after.pixel_digest &&
+            cached_after.linear_hdr_rgba != cached_before.linear_hdr_rgba,
+        "AO-only change invalidates cached mesh payload and matches fresh render");
+    for (double invalid : {-0.01, 1.01, std::numeric_limits<double>::quiet_NaN()}) {
+        bound.objects[0U].materials[0U].graph_occlusion = invalid;
+        require(!bound.validate(), "invalid graph AO refuses before rendering");
+    }
 }
 
 void graph_opacity_reaches_native_coverage(d3d12::D3D12Device& device) {
@@ -5126,6 +5275,53 @@ void orthographic_viewport_zoom_changes_projection_height() {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 3 && std::string_view(argv[1]) == "--write-persisted-hdr-fixture") {
+            const std::filesystem::path project_path=argv[2];const auto root=project_path.parent_path();
+            std::vector<std::uint8_t> encoded{'P','F','\n','1',' ','1','\n','-','1','.','0','\n'};
+            for(float value:{4.0f,2.0f,0.5f}) { const auto bits=std::bit_cast<std::uint32_t>(value);
+                for(unsigned b=0;b<4;++b) encoded.push_back(static_cast<std::uint8_t>(bits>>(b*8))); }
+            const auto admission=take(assets::inspect_texture_source(encoded,"image/x-portable-floatmap"));
+            require(admission.format==assets::TextureSourceFormat::pfm && admission.high_dynamic_range && admission.bit_depth==32,
+                "PFM admission identifies real float data");
+            assets::BlobStore store(root/".carto-assets"/"source-blobs");const auto blob=take(store.put(encoded,"image/x-portable-floatmap"));
+            project::TextureSourceRecord source;source.id=502U;source.name="Persisted float emissive";
+            source.relative_locator=store.path_for(blob.digest).lexically_relative(root).generic_string();
+            source.content_digest=blob.digest;source.format=admission.format;source.width=1U;source.height=1U;
+            source.provenance="synthetic persisted float fixture";
+            auto document=room_project();auto catalog=document.material_catalog();take(catalog.insert_texture(source));
+            auto material=catalog.materials().at(1U);material.definition.emissive.asset=source.id;
+            material.definition.emissive_factor={1,1,1};material.definition.emissive_strength=1;
+            material.revision=core::Revision{2U};take(catalog.replace_material(material));
+            take(document.set_material_catalog(std::move(catalog)));take(document.save_atomic(project_path));return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--write-hdr-emissive-fixture") {
+            const std::filesystem::path project_path=argv[2]; const auto root=project_path.parent_path();
+            const auto encoded=one_pixel_tga(); const auto admission=take(assets::inspect_texture_source(encoded,"image/x-tga"));
+            assets::BlobStore store(root / ".carto-assets" / "source-blobs");
+            const auto blob=take(store.put(encoded,"image/x-tga"));
+            project::TextureSourceRecord source; source.id=501U; source.name="HDR override fixture";
+            source.relative_locator=store.path_for(blob.digest).lexically_relative(root).generic_string();
+            source.content_digest=admission.source.digest;source.format=admission.format;
+            source.width=admission.width;source.height=admission.height;source.provenance="synthetic HDR override fixture";
+            auto document=room_project();auto catalog=document.material_catalog();take(catalog.insert_texture(source));
+            auto material=catalog.materials().at(1U);material.definition.emissive.asset=source.id;
+            material.definition.emissive_factor={1.0,1.0,1.0};material.definition.emissive_strength=1.0;
+            material.revision=core::Revision{2U};take(catalog.replace_material(material));
+            take(document.set_material_catalog(std::move(catalog)));take(document.save_atomic(project_path));
+            std::ofstream out(root / "fixture-float.pfm",std::ios::binary);out << "PF\n1 1\n-1.0\n";
+            for(float value:{4.0f,2.0f,0.5f}) { const auto bits=std::bit_cast<std::uint32_t>(value);
+                for(unsigned b=0;b<4;++b) out.put(static_cast<char>(bits>>(b*8))); }
+            out.close();require(static_cast<bool>(out),"write HDR fixture");return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--verify-hdr-pfm") {
+            std::ifstream in(argv[2],std::ios::binary|std::ios::ate);const auto size=in.tellg();
+            require(static_cast<bool>(in) && size>0,"read float capture");
+            std::vector<std::uint8_t> data(static_cast<std::size_t>(size));in.seekg(0);
+            in.read(reinterpret_cast<char*>(data.data()),static_cast<std::streamsize>(data.size()));
+            const auto decoded=assets::decode_linear_pfm(data);
+            require(*std::max_element(decoded.rgba.begin(),decoded.rgba.end())>3.5f,
+                "saved-project CLI override must produce HDR values above one");return 0;
+        }
         if (argc == 3 && std::string_view(argv[1]) == "--write-fixture") {
             take(room_project().save_atomic(argv[2])); return 0;
         }
@@ -5284,8 +5480,20 @@ int main(int argc, char** argv) {
             std::cout << "PASS LDR/HDR environment source admission and prefiltering\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--legacy-nonnormal-only") {
+            project_scene_texture_loader_binds_verified_sources_and_fails_closed();
+            auto device = take(d3d12::D3D12Device::create({{}, false, true}));
+            scene_render_uses_independent_material_slot_samplers(*device);
+            require(device->debug_receipts().empty() && !device->device_lost(),
+                "legacy texture compatibility preserves a clean native device");
+            std::cout << "PASS legacy saved texture metadata and native pixel parity\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--material-gpu-only") {
             auto device = take(d3d12::D3D12Device::create({{}, false, true}));
+            float_emissive_reaches_native_pixels(*device);
+            float_base_color_reaches_native_pixels(*device);
+            std::cout << "PASS focused float emissive and base-color pixels\n";
             graph_occlusion_values_reach_native_pixels(*device);
             std::cout << "PASS focused graph occlusion pixels\n";
             graph_opacity_reaches_native_coverage(*device);
@@ -5374,6 +5582,9 @@ int main(int argc, char** argv) {
         std::cout << "PASS explicit D3D12 temporal history, reset, provenance and state wiring\n";
         direct_target_matches_capture_and_preserves_caller_ownership(*device);
         std::cout << "PASS direct GPU target pixel parity, stale-state refusal and caller ownership\n";
+        float_emissive_reaches_native_pixels(*device);
+        float_base_color_reaches_native_pixels(*device);
+        std::cout << "PASS scene-linear float emissive and base-color textures reach native pixels\n";
         graph_occlusion_values_reach_native_pixels(*device);
         std::cout << "PASS material graph occlusion reaches native pixels without source mutation\n";
         graph_opacity_reaches_native_coverage(*device);

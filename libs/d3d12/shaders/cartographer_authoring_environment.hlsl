@@ -25,6 +25,13 @@ float3 environment_specular(float3 direction,float roughness) {
     return lerp(environment_rect(uv,ra,wa,wa/2,true,ca).rgb,
                 environment_rect(uv,rb,wb,wb/2,true,cb).rgb,level-a);
 }
+// Radiance arriving along a world direction (refraction preview).
+float3 environment_direction(float3 direction,float roughness,float4 settings) {
+    if(settings.w==0 || settings.z==0) return 0;
+    direction=float3(settings.x*direction.x-settings.y*direction.z,direction.y,
+        settings.y*direction.x+settings.x*direction.z);
+    return environment_specular(direction,roughness)*settings.z;
+}
 float3 environment_evaluate(float3 n,float3 v,float3 base,float3 f0,float roughness,
     float metallic,float coat,float coat_roughness,float ao,float4 settings) {
     float nv=saturate(dot(n,v));

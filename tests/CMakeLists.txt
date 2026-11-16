@@ -2439,6 +2439,48 @@ if(CARTO_ENABLE_D3D12)
     carto_target(cartographer_authoring_gpu_viewport_benchmark)
 endif()
 
+# Ensure the shipped starter library stays within the actual material-import profile.
+add_executable(cartographer_starter_material_library_tests starter_material_library_smoke.cpp)
+target_link_libraries(cartographer_starter_material_library_tests PRIVATE carto_io carto_application)
+carto_target(cartographer_starter_material_library_tests)
+add_test(NAME cartographer_starter_material_library_tests
+    COMMAND cartographer_starter_material_library_tests
+            "${CMAKE_SOURCE_DIR}/examples/material-libraries/starter-surfaces.gltf")
+
+add_executable(cartographer_sculpt_export_tests sculpt_export_tests.cpp)
+target_link_libraries(cartographer_sculpt_export_tests PRIVATE carto_application)
+carto_target(cartographer_sculpt_export_tests)
+add_test(NAME cartographer_sculpt_export_tests COMMAND cartographer_sculpt_export_tests)
+
+add_executable(cartographer_sculpt_gltf_export_tests sculpt_gltf_export_tests.cpp)
+target_link_libraries(cartographer_sculpt_gltf_export_tests PRIVATE carto_application carto_ui)
+carto_target(cartographer_sculpt_gltf_export_tests)
+add_test(NAME cartographer_sculpt_gltf_export_tests COMMAND cartographer_sculpt_gltf_export_tests)
+
+# Strict float PFM round trip: values above one and malformed payloads.
+add_executable(cartographer_linear_pfm_tests linear_pfm_tests.cpp)
+target_include_directories(cartographer_linear_pfm_tests PRIVATE "${PROJECT_SOURCE_DIR}")
+target_link_libraries(cartographer_linear_pfm_tests PRIVATE carto_assets)
+carto_target(cartographer_linear_pfm_tests)
+add_test(NAME cartographer_linear_pfm_tests COMMAND cartographer_linear_pfm_tests)
+
+# Project text uses shortest exact doubles; reload is bit-identical.
+add_executable(cartographer_project_number_format_tests project_number_format_tests.cpp)
+target_link_libraries(cartographer_project_number_format_tests PRIVATE carto_application)
+carto_target(cartographer_project_number_format_tests)
+add_test(NAME cartographer_project_number_format_tests COMMAND cartographer_project_number_format_tests)
+
+# Extended-sequential (SOF1) 8/12-bit JPEG entropy admission.
+add_executable(cartographer_jpeg_entropy_coverage_tests jpeg_entropy_coverage_tests.cpp)
+target_link_libraries(cartographer_jpeg_entropy_coverage_tests PRIVATE carto_assets)
+carto_target(cartographer_jpeg_entropy_coverage_tests)
+add_test(NAME cartographer_jpeg_entropy_coverage_tests COMMAND cartographer_jpeg_entropy_coverage_tests)
+
+# Source registry reimport planning budgets.
+add_executable(cartographer_source_registry_budget_tests source_registry_budget_tests.cpp)
+target_link_libraries(cartographer_source_registry_budget_tests PRIVATE carto_assets)
+carto_target(cartographer_source_registry_budget_tests)
+add_test(NAME cartographer_source_registry_budget_tests COMMAND cartographer_source_registry_budget_tests)
 add_executable(carto_sprint3_texture_coverage texture_coverage_sprint3_tests.cpp)
 target_link_libraries(carto_sprint3_texture_coverage PRIVATE carto_assets)
 carto_target(carto_sprint3_texture_coverage)
@@ -2449,3 +2491,16 @@ add_executable(carto_sprint3_registry_budget source_registry_budget_sprint3_test
 target_link_libraries(carto_sprint3_registry_budget PRIVATE carto_assets)
 carto_target(carto_sprint3_registry_budget)
 add_test(NAME carto_sprint3_registry_budget COMMAND carto_sprint3_registry_budget)
+
+add_executable(cartographer_authoring_viewport_budget_tests authoring_viewport_budget_tests.cpp)
+target_link_libraries(cartographer_authoring_viewport_budget_tests PRIVATE carto_production)
+carto_target(cartographer_authoring_viewport_budget_tests)
+add_test(NAME cartographer_authoring_viewport_budget_tests COMMAND cartographer_authoring_viewport_budget_tests)
+
+if(CARTO_ENABLE_D3D12)
+    add_executable(cartographer_authoring_native_4k_tests authoring_native_4k_tests.cpp)
+    target_link_libraries(cartographer_authoring_native_4k_tests PRIVATE carto_d3d12_viewport)
+    carto_target(cartographer_authoring_native_4k_tests)
+    add_test(NAME cartographer_authoring_native_4k_tests COMMAND cartographer_authoring_native_4k_tests)
+    set_tests_properties(cartographer_authoring_native_4k_tests PROPERTIES TIMEOUT 120 LABELS "GPU")
+endif()

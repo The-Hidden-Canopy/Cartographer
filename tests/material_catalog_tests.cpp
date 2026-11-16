@@ -702,8 +702,94 @@ void failed_catalog_admission_has_no_mutation_or_event() {
 
 } // namespace
 
+void material_v5_transmission_volume_survives_the_catalog() {
+    using namespace carto;
+    auto catalog = catalog_fixture(1U);
+    const std::string plain = catalog.serialize();
+    require(plain.find("MATERIAL_EXTENSIONS 0\n") != std::string::npos &&
+                plain.find("VARIANT_EXTENSIONS 0\n") != std::string::npos,
+        "a catalog without transmission writes empty V5 sections");
+
+    render::MaterialAsset glass = material_fixture(73U, "Amber bottle glass", false);
+    glass.definition.metallic = 0.0;
+    glass.definition.roughness = 0.04;
+    glass.definition.ior = 1.52;
+    glass.definition.transmission = 1.0;
+    glass.definition.thickness = 0.003;
+    glass.definition.attenuation_color = {0.55, 0.25, 0.05};
+    glass.definition.attenuation_distance = 0.004;
+    require(static_cast<bool>(catalog.insert_material(glass)), "amber glass material enters the catalog");
+
+    project::MaterialVariant frosted;
+    frosted.id = 902U;
+    frosted.name = "Frosted amber";
+    frosted.base_material = 73U;
+    frosted.overrides.roughness = 0.35;
+    frosted.overrides.transmission = 0.8;
+    frosted.overrides.attenuation_color = core::Vec3d{0.6, 0.3, 0.08};
+    frosted.revision = core::Revision{1U};
+    require(static_cast<bool>(catalog.insert_variant(std::move(frosted))), "frosted glass variant enters the catalog");
+
+    const std::string encoded = catalog.serialize();
+    const auto reopened = project::MaterialCatalog::deserialize(encoded);
+    require(reopened && reopened.value().serialize() == encoded,
+        "V5 transmission and volume survive deterministic save and reopen");
+    const auto& definition = reopened.value().materials().at(73U).definition;
+    require(definition.ior == 1.52 && definition.transmission == 1.0 && definition.thickness == 0.003 &&
+                definition.attenuation_color.x == 0.55 && definition.attenuation_color.z == 0.05 &&
+                definition.attenuation_distance == 0.004,
+        "reopened glass keeps IOR, transmission, thickness and attenuation exactly");
+    const auto resolved = reopened.value().resolve_material(73U, 902U);
+    require(resolved && resolved.value().transmission == 0.8 && resolved.value().roughness == 0.35 &&
+                resolved.value().ior == 1.52 && resolved.value().attenuation_color.x == 0.6,
+        "a variant overrides transmission and attenuation and inherits IOR");
+    require(reopened.value().materials().at(71U).definition.transmission == 0.0 &&
+                reopened.value().materials().at(71U).definition.ior == 1.5,
+        "materials without V5 data keep the defaults");
+
+    // A V4 reader's view: same records, no V5 sections.
+    auto v4 = encoded;
+    v4.replace(0U, std::string("CARTOGRAPHER_MATERIAL_CATALOG 5").size(), "CARTOGRAPHER_MATERIAL_CATALOG 4");
+    const auto volumes = v4.find("MATERIAL_EXTENSIONS ");
+    v4.erase(volumes, v4.find("END\n", volumes) - volumes);
+    const auto reopened_v4 = project::MaterialCatalog::deserialize(v4);
+    require(reopened_v4 && reopened_v4.value().materials().at(73U).definition.transmission == 0.0,
+        "a V4 catalog reads with transmission defaults");
+
+    render::MaterialAsset steel = material_fixture(75U, "Brushed fork steel", false);
+    steel.definition.metallic = 1.0;
+    steel.definition.roughness = 0.3;
+    steel.definition.anisotropy = 0.7;
+    steel.definition.anisotropy_rotation = 1.5707963267948966;
+    auto with_steel = catalog;
+    require(static_cast<bool>(with_steel.insert_material(steel)), "brushed steel material enters the catalog");
+    const auto steel_reopened = project::MaterialCatalog::deserialize(with_steel.serialize());
+    require(steel_reopened && steel_reopened.value().materials().at(75U).definition.anisotropy == 0.7 &&
+                steel_reopened.value().materials().at(75U).definition.anisotropy_rotation == 1.5707963267948966,
+        "anisotropy strength and rotation survive save and reopen");
+    auto bad_steel = steel;
+    bad_steel.id = 76U;
+    bad_steel.definition.anisotropy = 1.5;
+    require(!with_steel.insert_material(bad_steel), "anisotropy above one is refused");
+
+    auto unknown = encoded;
+    const auto record = unknown.find("MATERIAL_EXTENSION 73 ");
+    require(record != std::string::npos, "the glass volume record is written");
+    unknown.replace(record, std::string("MATERIAL_EXTENSION 73 ").size(), "MATERIAL_EXTENSION 99 ");
+    require(!project::MaterialCatalog::deserialize(unknown), "a volume record for an unknown material is refused");
+
+    auto invalid = glass;
+    invalid.id = 74U;
+    invalid.definition.ior = 0.5;
+    require(!catalog.insert_material(invalid), "IOR below one is refused");
+    invalid.definition.ior = 1.5;
+    invalid.definition.attenuation_color = {1.5, 0.2, 0.2};
+    require(!catalog.insert_material(invalid), "attenuation colour above one is refused");
+}
+
 int main() {
     catalog_round_trips_and_resolves_variants_deterministically();
+    material_v5_transmission_volume_survives_the_catalog();
     texture_source_replacement_advances_revision_and_rejects_stale_edits();
     hostile_catalog_inputs_fail_closed();
     project_save_reopen_and_journal_preserve_authoring_truth();

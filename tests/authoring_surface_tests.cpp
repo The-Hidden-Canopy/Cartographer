@@ -358,7 +358,7 @@ void gpu_packet_contract() {
     okay(c.bind_material_graph(1, g.identity));
     const auto program = take(production::compile_authoring_material(c, 1));
     const auto packet = take(program.gpu_packet());
-    check(packet.words.size() % 32 == 0 && packet.words[0][0] == 1 && packet.words[0][3] <= 32,
+    check(packet.words.size() % 32 == 0 && packet.words[0][0] == 2 && packet.words[0][3] <= 32,
           "native packet version, row alignment and register bound");
     check(packet.words.size() * 16 <= 6656, "bounded native packet payload");
     // Decode the packed register machine independently of the CPU graph's
@@ -366,11 +366,11 @@ void gpu_packet_contract() {
     for (float u : {.1F, .3F, .7F, .9F}) {
         std::array<std::array<float, 4>, 32> regs{};
         for (unsigned i = 0; i < unsigned(packet.words[0][1]); ++i) {
-            const auto code = packet.words[24 + i * 3], slots = packet.words[25 + i * 3];
+            const auto code = packet.words[28 + i * 3], slots = packet.words[29 + i * 3];
             std::array<float, 4> value{};
             const unsigned op = unsigned(code[0]), dest = unsigned(slots[0]);
             if (op < 2)
-                value = packet.words[26 + i * 3];
+                value = packet.words[30 + i * 3];
             else if (op == 2 || op == 3) {
                 const auto &m = packet.material;
                 switch (unsigned(code[2])) {

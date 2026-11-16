@@ -109,6 +109,20 @@ void factors_parameters_and_variants() {
     near(partial.emissive_factor.x, 2);
     near(partial.clearcoat, .4);
     near(partial.roughness, .06);
+
+    // Material V5: transmission and anisotropy outputs lower onto factors,
+    // and V5 parameters are readable by graphs.
+    auto v5 = authoring_graph_fixture();
+    const auto routed = take(production::resolve_authoring_material(bound_catalog(f, v5), 1));
+    v5.outputs.transmission = v5.outputs.roughness;
+    v5.outputs.anisotropy = v5.outputs.metallic;
+    const auto lowered = take(production::resolve_authoring_material(bound_catalog(f, v5), 1));
+    near(lowered.transmission, routed.roughness);
+    near(lowered.anisotropy, routed.metallic);
+    auto ior_graph = authoring_graph_fixture();
+    node(ior_graph, 6).parameter_name = "ior";
+    check(static_cast<bool>(production::resolve_authoring_material(bound_catalog(f, ior_graph), 1)),
+          "graphs may read the IOR parameter");
 }
 void stale_source_order_and_ranges() {
     auto f = fixture();

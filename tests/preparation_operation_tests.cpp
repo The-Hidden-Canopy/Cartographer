@@ -480,6 +480,37 @@ void invalid_or_stale_requests_fail_before_mutation() {
         "stale captured scope fails before creating publication state");
 }
 
+void explicit_source_coordinates_publish_without_mutating_source() {
+    using namespace carto;
+    TempDirectory temp;
+    const auto texture = one_pixel_tga(255U);
+    const auto source_root = temp.path() / "source";
+    write_bytes(source_root / "textures" / "albedo.tga", texture);
+    const auto document = make_document(temp.path() / "journal.log", texture);
+    const auto source_bytes = document.serialize();
+    auto request = request_for(document, source_root, temp.path() / "prepared", std::nullopt);
+    request.coordinate_override = production::PreparedCoordinateConvention{
+        .meters_per_unit = 1.0,
+        .handedness = production::PreparedHandedness::right_handed,
+        .up = production::PreparedAxis::positive_z,
+        .forward = production::PreparedAxis::positive_y,
+    };
+    const auto prepared = production::prepare_and_publish(document, request);
+    require(prepared.succeeded() && prepared.envelope->coordinates.up == production::PreparedAxis::positive_z &&
+            prepared.envelope->coordinates.forward == production::PreparedAxis::positive_y &&
+            document.serialize() == source_bytes,
+        "the explicit source frame is exported without changing editable source bytes");
+    require(prepared.operation_id != production::prepare_and_publish(document,
+        request_for(document, source_root, temp.path() / "default-frame", std::nullopt)).operation_id,
+        "coordinate interpretation is bound into the operation identity");
+    request.output_root = temp.path() / "invalid-frame";
+    request.coordinate_override->meters_per_unit = 0.0;
+    const auto refused = production::prepare_and_publish(document, request);
+    require(!refused.succeeded() && refused.terminal_stage == production::PreparationStage::resolve &&
+            !std::filesystem::exists(request.output_root),
+        "an invalid coordinate override fails before publication");
+}
+
 void portable_source_meaning_survives_narrower_optional_lookdev() {
     using namespace carto;
     TempDirectory temp;
@@ -896,6 +927,7 @@ int main() {
     one_operation_is_shared_complete_and_last_valid();
     authoring_region_aliases_prepare_and_missing_regions_refuse();
     invalid_or_stale_requests_fail_before_mutation();
+    explicit_source_coordinates_publish_without_mutating_source();
     portable_source_meaning_survives_narrower_optional_lookdev();
     profiles_round_trip_and_hostile_inputs_fail_closed();
     profile_v2_policies_and_v1_compatibility();

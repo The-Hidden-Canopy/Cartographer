@@ -130,7 +130,8 @@ struct GltfMaterialWriter::Impl {
     const project::MaterialCatalog &catalog;
     GltfExportOptions options;
     GltfExportReport &report;
-    production::AuthoringTextureLibrary loaded;
+    std::unique_ptr<production::AuthoringTextureLibrary> loaded =
+        std::make_unique<production::AuthoringTextureLibrary>();
     std::vector<std::string> materials, images, textures, samplers;
     std::map<std::pair<render::MaterialId, std::optional<project::MaterialVariantId>>,
              GltfMaterialProjection>
@@ -146,6 +147,11 @@ struct GltfMaterialWriter::Impl {
     Impl(const project::ProjectDocument &d, const GltfExportOptions &o, GltfExportReport &r)
         : catalog(d.material_catalog()), options(o), report(r) {}
     Result<void> load(const project::TextureSourceRecord &rec) {
+        if (!options.embedded_image_limit || !options.embedded_image_byte_limit)
+            return Result<void>::failure(unsupported("embedded image limits must be nonzero"));
+        if (rec.format == assets::TextureSourceFormat::pfm)
+            return Result<void>::failure(unsupported(
+                "scene-linear float PFM material texture cannot be exported to glTF without a lossy conversion"));
         if (options.textures || loaded_ids.contains(rec.id))
             return Result<void>::success();
         if (options.project_path.empty())
@@ -181,7 +187,7 @@ struct GltfMaterialWriter::Impl {
         auto bytes = store.read(rec.content_digest);
         if (!bytes)
             return Result<void>::failure(bytes.error());
-        auto admitted = loaded.admit(rec, bytes.value());
+        auto admitted = loaded->admit(rec, bytes.value());
         if (!admitted)
             return admitted;
         loaded_ids.insert(rec.id);
@@ -230,7 +236,7 @@ struct GltfMaterialWriter::Impl {
         auto admission = load(record->second);
         if (!admission)
             return Result<std::string>::failure(admission.error());
-        const auto *library = options.textures ? options.textures.get() : &loaded;
+        const auto *library = options.textures ? options.textures.get() : loaded.get();
         auto mip =
             library->prepare(record->second, semantic, assets::expected_color_space(semantic));
         if (!mip)
@@ -250,10 +256,11 @@ struct GltfMaterialWriter::Impl {
         if (auto i = image_ids.find(digest); i != image_ids.end())
             image = i->second;
         else {
-            if (images.size() >= 64 ||
-                report.embedded_image_bytes + encoded.size() > 64ULL * 1024 * 1024)
+            if (images.size() >= options.embedded_image_limit ||
+                report.embedded_image_bytes + encoded.size() > options.embedded_image_byte_limit)
                 return Result<std::string>::failure(
-                    unsupported("embedded images exceed 64-image/64-MiB bound"));
+                    unsupported("embedded images exceed " + std::to_string(options.embedded_image_limit) +
+                        "-image/" + std::to_string(options.embedded_image_byte_limit / 1024 / 1024) + "-MiB bound"));
             image = images.size();
             image_ids.emplace(digest, image);
             report.embedded_image_bytes += encoded.size();
@@ -344,7 +351,7 @@ struct GltfMaterialWriter::Impl {
             if(entry==catalog.textures().end())return R::failure(unsupported("graph bake texture source missing"));
             const auto admitted=load(entry->second);if(!admitted)return R::failure(admitted.error());
         }
-        auto program=production::compile_authoring_material(catalog,id,variant,options.textures?options.textures.get():&loaded);
+        auto program=production::compile_authoring_material(catalog,id,variant,options.textures?options.textures.get():loaded.get());
         if(!program)return R::failure(program.error());
         auto output=production::bake_authoring_material(program.value(),n);
         if(output)baked_texels+=std::uint64_t(n)*n;
@@ -366,6 +373,10 @@ struct GltfMaterialWriter::Impl {
         auto key = std::pair(id, variant);
         if (auto it = projected.find(key); it != projected.end())
             return Result<GltfMaterialProjection>::success(it->second);
+        if (!options.textures) {
+            loaded = std::make_unique<production::AuthoringTextureLibrary>();
+            loaded_ids.clear();
+        }
         if (materials.size() >= 32)
             return Result<GltfMaterialProjection>::failure(
                 unsupported("resolved materials exceed 32-material export bound"));
@@ -415,6 +426,16 @@ struct GltfMaterialWriter::Impl {
                     return Result<GltfMaterialProjection>::failure(t.error());
                 info[i] = std::move(t.value());
             }
+        // Material V5 maps travel as linear data textures.
+        std::string transmission_info, thickness_info, anisotropy_info;
+        for (auto [ref, out] : {std::pair{&m.transmission_map, &transmission_info},
+                                std::pair{&m.thickness_map, &thickness_info},
+                                std::pair{&m.anisotropy_map, &anisotropy_info}}) {
+            if (!*ref) continue;
+            auto t = texture(*ref, assets::TextureSemantic::data, p);
+            if (!t) return Result<GltfMaterialProjection>::failure(t.error());
+            *out = std::move(t.value());
+        }
         std::ostringstream o;
         o.imbue(std::locale::classic());
         o << std::setprecision(17) << '{';
@@ -460,8 +481,28 @@ struct GltfMaterialWriter::Impl {
             report.warnings.push_back(
                 "BLEND alpha is exported as authored; the native authoring renderer "
                 "does not yet validate blended appearance");
-        const double root = std::sqrt(m.dielectric_f0), ior = (1 + root) / (1 - root);
-        const bool use_ior = m.dielectric_f0 != 0.04;
+        // Pre-V5 materials (IOR left at 1.5) keep the reflectance-derived IOR,
+        // so their export is unchanged. An authored IOR is exported as is, and
+        // KHR_materials_specular carries any reflectance that IOR does not imply.
+        const bool authored_ior = m.ior != 1.5;
+        const double root = std::sqrt(m.dielectric_f0);
+        const double ior = authored_ior ? m.ior : (1 + root) / (1 - root);
+        const bool use_ior = authored_ior || m.dielectric_f0 != 0.04;
+        double specular_factor = 1.0;
+        if (authored_ior) {
+            const double ior_f0 = std::pow((m.ior - 1.0) / (m.ior + 1.0), 2.0);
+            specular_factor = ior_f0 > 0.0 ? m.dielectric_f0 / ior_f0 : 1.0;
+            if (specular_factor > 1.0) {
+                report.warnings.push_back("Loss: dielectric reflectance exceeds what IOR " + std::to_string(m.ior) +
+                    " implies and KHR_materials_specular cannot raise it; exported reflectance is clamped.");
+                specular_factor = 1.0;
+            }
+        }
+        const bool use_specular = authored_ior && std::abs(specular_factor - 1.0) > 1e-9;
+        const bool use_transmission = m.transmission != 0.0 || !transmission_info.empty();
+        const bool use_volume = m.thickness != 0.0 || !thickness_info.empty() || m.attenuation_distance != 0.0 ||
+            m.attenuation_color.x != 1.0 || m.attenuation_color.y != 1.0 || m.attenuation_color.z != 1.0;
+        const bool use_anisotropy = m.anisotropy != 0.0 || !anisotropy_info.empty();
         const bool use_clearcoat = m.clearcoat != 0.0 || !clearcoat_info.empty();
         const bool zero_emission = m.emissive_factor.x == 0.0 && m.emissive_factor.y == 0.0 &&
                                    m.emissive_factor.z == 0.0;
@@ -469,7 +510,8 @@ struct GltfMaterialWriter::Impl {
         if ((!use_clearcoat && m.clearcoat_roughness != 0.0) ||
             (zero_emission && strength != 1.0))
             report.warnings.push_back("Inactive clearcoat roughness or zero-emission strength remains in the source material; the exported appearance is unchanged.");
-        if (use_ior || use_clearcoat || use_emission_strength) {
+        if (use_ior || use_clearcoat || use_emission_strength || use_specular || use_transmission ||
+            use_volume || use_anisotropy) {
             o << ",\"extensions\":{";
             bool first = true;
             const auto separator = [&] { if (!first) o << ','; first = false; };
@@ -491,9 +533,41 @@ struct GltfMaterialWriter::Impl {
                 extensions.insert("KHR_materials_emissive_strength");
                 o << "\"KHR_materials_emissive_strength\":{\"emissiveStrength\":" << strength << '}';
             }
+            if (use_specular) {
+                separator();
+                extensions.insert("KHR_materials_specular");
+                o << "\"KHR_materials_specular\":{\"specularFactor\":" << specular_factor << '}';
+            }
+            if (use_transmission) {
+                separator();
+                extensions.insert("KHR_materials_transmission");
+                o << "\"KHR_materials_transmission\":{\"transmissionFactor\":" << m.transmission;
+                if (!transmission_info.empty()) o << ",\"transmissionTexture\":{" << transmission_info << '}';
+                o << '}';
+            }
+            if (use_volume) {
+                separator();
+                extensions.insert("KHR_materials_volume");
+                o << "\"KHR_materials_volume\":{\"thicknessFactor\":" << m.thickness
+                  << ",\"attenuationColor\":[" << m.attenuation_color.x << ',' << m.attenuation_color.y << ','
+                  << m.attenuation_color.z << ']';
+                // glTF's default attenuation distance is infinity; Cartographer's 0 means none.
+                if (m.attenuation_distance > 0.0) o << ",\"attenuationDistance\":" << m.attenuation_distance;
+                if (!thickness_info.empty()) o << ",\"thicknessTexture\":{" << thickness_info << '}';
+                o << '}';
+            }
+            if (use_anisotropy) {
+                separator();
+                extensions.insert("KHR_materials_anisotropy");
+                o << "\"KHR_materials_anisotropy\":{\"anisotropyStrength\":" << m.anisotropy
+                  << ",\"anisotropyRotation\":" << m.anisotropy_rotation;
+                if (!anisotropy_info.empty()) o << ",\"anisotropyTexture\":{" << anisotropy_info << '}';
+                o << '}';
+            }
             o << '}';
         }
         o << ",\"extras\":{\"cartographer_material_id\":" << id;
+        if (authored_ior) o << ",\"cartographer_ior\":" << m.ior;
         if (p.uv)
             o << ",\"cartographer_uv_set\":" << quote(std::to_string(*p.uv));
         if (variant)
@@ -530,7 +604,9 @@ Result<void> GltfMaterialWriter::prepare_catalog() {
             m.base_color || m.metallic_roughness || m.normal || m.occlusion || m.emissive ||
             m.normal_scale != 1.0 || m.occlusion_strength != 1.0 || m.dielectric_f0 != 0.04 ||
             m.clearcoat != 0.0 || m.clearcoat_roughness != 0.1 ||
-            m.emissive_factor.x != 0.0 || m.emissive_factor.y != 0.0 || m.emissive_factor.z != 0.0)
+            m.emissive_factor.x != 0.0 || m.emissive_factor.y != 0.0 || m.emissive_factor.z != 0.0 ||
+            m.ior != 1.5 || m.transmission != 0.0 || m.thickness != 0.0 || m.attenuation_distance != 0.0 ||
+            m.anisotropy != 0.0 || m.transmission_map || m.thickness_map || m.anisotropy_map)
             return Result<void>::success();
     }
     for (const auto& [id, material] : catalog.materials()) {

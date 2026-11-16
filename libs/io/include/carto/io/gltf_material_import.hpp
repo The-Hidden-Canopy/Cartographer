@@ -9,11 +9,15 @@ struct ImportedGltfMaterials {
     // and admits these verified PNG/JPEGs to its own content-addressed source store.
     std::vector<std::vector<std::uint8_t>> encoded_images;
     assets::Sha256Digest artifact_digest;
+    // Appearance the source carried that Cartographer could not represent
+    // and therefore did not import. Empty means a faithful import.
+    std::vector<std::string> losses;
 };
 // Materials-only reimport of Cartographer's bounded embedded GLTF/GLB profile.
 // The scene adapter can disable the profile requirement for the same strictly
 // supported glTF 2.0 material subset; this never relaxes appearance validation.
-// Geometry/hierarchy are not imported. No external URI is read. Unknown visual
+// Geometry/hierarchy are not imported. No external URI is read during parsing;
+// external images must have been captured in an owned source package. Unknown visual
 // extensions, texture-coordinate sets and unrepresentable samplers fail closed.
 [[nodiscard]] core::Result<ImportedGltfMaterials>
 import_gltf_materials(std::span<const std::uint8_t> bytes,

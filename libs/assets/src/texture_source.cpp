@@ -1,3 +1,4 @@
+#include <carto/assets/linear_float_image.hpp>
 #include <carto/assets/texture_source.hpp>
 
 #include <algorithm>
@@ -70,7 +71,8 @@ bool media_type_matches(TextureSourceFormat format, std::string_view declared) {
     case TextureSourceFormat::tga: return declared == "image/tga";
     case TextureSourceFormat::dds: return declared == "image/dds";
     case TextureSourceFormat::exr: return declared == "image/exr";
-    case TextureSourceFormat::png: return false;
+    case TextureSourceFormat::png:
+    case TextureSourceFormat::pfm: return false;
     }
     return false;
 }
@@ -783,6 +785,7 @@ const char* texture_source_format_name(TextureSourceFormat format) noexcept {
     case TextureSourceFormat::tga: return "tga";
     case TextureSourceFormat::dds: return "dds";
     case TextureSourceFormat::exr: return "exr";
+    case TextureSourceFormat::pfm: return "pfm";
     }
     return "unknown";
 }
@@ -794,6 +797,7 @@ const char* texture_source_media_type(TextureSourceFormat format) noexcept {
     case TextureSourceFormat::tga: return "image/x-tga";
     case TextureSourceFormat::dds: return "image/vnd-ms.dds";
     case TextureSourceFormat::exr: return "image/x-exr";
+    case TextureSourceFormat::pfm: return "image/x-portable-floatmap";
     }
     return "application/octet-stream";
 }
@@ -862,6 +866,16 @@ core::Result<TextureSourceAdmission> inspect_texture_source(
         }
         if (bytes.size() >= 4U && read_le32(bytes, 0U) == 0x01312f76U) {
             return inspect_exr(bytes);
+        }
+        if (bytes.size() >= 3U && bytes[0]=='P' && bytes[1]=='F' && bytes[2]=='\n') {
+            try {
+                const auto image=decode_linear_pfm(bytes);
+                HeaderInfo info; info.format=TextureSourceFormat::pfm; info.width=image.width; info.height=image.height;
+                info.channels=3U; info.bit_depth=32U; info.high_dynamic_range=true;
+                return core::Result<HeaderInfo>::success(info);
+            } catch(const std::exception& e) {
+                return core::Result<HeaderInfo>::failure(invalid(e.what()));
+            }
         }
         return inspect_tga(bytes);
     }();

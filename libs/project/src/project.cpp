@@ -173,7 +173,10 @@ constexpr std::uint64_t kMaxSerializedUvSets = 1'000'000U;
 constexpr std::uint64_t kMaxSerializedSculptStacks = 100'000U;
 constexpr std::uint64_t kMaxSerializedGarmentAssets = 100'000U;
 constexpr std::uint64_t kMaxSerializedClothRestPoseReceipts = 100'000U;
-constexpr std::uintmax_t kMaxSerializedProjectBytes = 128ULL * 1024ULL * 1024ULL;
+#ifndef CARTOGRAPHER_PROJECT_TEXT_LIMIT_BYTES
+#define CARTOGRAPHER_PROJECT_TEXT_LIMIT_BYTES 134217728ULL
+#endif
+constexpr std::uintmax_t kMaxSerializedProjectBytes = CARTOGRAPHER_PROJECT_TEXT_LIMIT_BYTES;
 // Mirrors carto::semantic::SemanticSidecar::kMaxSerializedBytes. The value is
 // duplicated here so libs/project keeps no dependency on carto_semantic.
 constexpr std::uint64_t kMaxSerializedSemanticSidecarBytes = 16ULL * 1024ULL * 1024ULL;
@@ -641,6 +644,37 @@ std::vector<std::size_t> serialized_attribute_value_order(
     order.reserve(*count);
     for (std::size_t index = 0U; index < *count; ++index) order.push_back(index);
     return order;
+}
+
+// Writes floating-point values in the shortest form that reads back to the
+// identical double, instead of a fixed 17 significant digits. Loaded values
+// are unchanged; only the project text gets smaller. Explicit fixed,
+// scientific or padded formatting falls back to the standard facet. Digest
+// inputs such as canonical_mesh_state_bytes keep the classic locale.
+class ShortestRoundTripNumPut final : public std::num_put<char> {
+protected:
+    iter_type do_put(iter_type out, std::ios_base& stream, char_type fill, double value) const override {
+        if ((stream.flags() & std::ios_base::floatfield) != std::ios_base::fmtflags{} ||
+            stream.width() != 0 || !std::isfinite(value)) {
+            return std::num_put<char>::do_put(out, stream, fill, value);
+        }
+        std::array<char, 32> buffer{};
+        const auto written = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
+        if (written.ec != std::errc{}) return std::num_put<char>::do_put(out, stream, fill, value);
+        return std::copy(buffer.data(), written.ptr, out);
+    }
+    iter_type do_put(iter_type out, std::ios_base& stream, char_type fill, long double value) const override {
+        const double narrowed = static_cast<double>(value);
+        if (static_cast<long double>(narrowed) != value) {
+            return std::num_put<char>::do_put(out, stream, fill, value);
+        }
+        return do_put(out, stream, fill, narrowed);
+    }
+};
+
+const std::locale& shortest_round_trip_locale() {
+    static const std::locale locale(std::locale::classic(), new ShortestRoundTripNumPut);
+    return locale;
 }
 
 std::string canonical_mesh_state_bytes(const geometry::EditableMesh& mesh) {
@@ -6074,7 +6108,7 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
 
 std::string ProjectDocument::serialize() const {
     std::ostringstream output;
-    output.imbue(std::locale::classic());
+    output.imbue(shortest_round_trip_locale());
     output << kMagic << ' ' << kSchemaVersion << '\n';
     output << "AUTHORING " << std::quoted(std::string(kAuthoringFormat)) << ' '
            << std::quoted(std::string(kAuthoringUnits)) << ' '
@@ -6406,7 +6440,7 @@ std::string ProjectDocument::serialize() const {
 core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text) {
     if (text.size() > kMaxSerializedProjectBytes) {
         return core::Result<ProjectDocument>::failure(parse_error(
-            "project text exceeds the Cartographer v1 size limit of 128 MiB"));
+            "project text exceeds the configured Cartographer project size limit"));
     }
     std::istringstream input{std::string(text)};
     input.imbue(std::locale::classic());
@@ -9069,7 +9103,7 @@ core::Result<ProjectDocument> ProjectDocument::load(const std::filesystem::path&
     }
     if (file_size > kMaxSerializedProjectBytes) {
         return core::Result<ProjectDocument>::failure(parse_error(
-            "project file exceeds the Cartographer size limit of 128 MiB"));
+            "project file exceeds the configured Cartographer project size limit"));
     }
     std::ostringstream contents;
     contents << input.rdbuf();

@@ -2,6 +2,7 @@
 #include <carto/project/project.hpp>
 
 #include <algorithm>
+#include "linear_pfm.hpp"
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -122,13 +123,13 @@ void publish_capture(const std::filesystem::path& output_path,
 
     std::filesystem::rename(cleanup.receipt_path, receipt_path);
     try {
-        // Publish the BMP last so its presence means the complete receipt was written.
+        // Publish the image last so its presence means the complete receipt was written.
         std::filesystem::rename(cleanup.image_path, output_path);
     } catch (const std::exception& publish_error) {
         std::error_code rollback_error;
         static_cast<void>(std::filesystem::remove(receipt_path, rollback_error));
         if (rollback_error)
-            throw std::runtime_error("BMP publication failed and the receipt could not be rolled back: " +
+            throw std::runtime_error("Image publication failed and the receipt could not be rolled back: " +
                 std::string(publish_error.what()));
         throw;
     }
@@ -155,7 +156,7 @@ int main(int argc, char** argv) {
     using namespace carto;
     try {
         if (argc < 3) throw std::runtime_error(
-            "usage: cartographer_scene_render input.carto output.bmp --identity stable-id --shaders directory "
+            "usage: cartographer_scene_render input.carto output.bmp|output.pfm --identity stable-id --shaders directory "
             "(--camera px py pz tx ty tz [--projection perspective|orthographic] "
             "[--orthographic-height world-units] | --authored-camera object-id) "
             "--size width height "
@@ -165,13 +166,13 @@ int main(int argc, char** argv) {
             "[--antialias fxaa|none] "
             "[--graph-parameter graph-id name scalar|color|normal values...] "
             "[--graph-surface-input graph-id input-name scalar|color|normal values...] "
-            "[--texture id exact-current-source-mip-artifact] [--diffuse-irradiance-sh file] "
+            "[--texture id exact-current-source-mip-artifact] [--hdr-emissive id linear-float.pfm] [--hdr-base-color id linear-float.pfm] [--diffuse-irradiance-sh file] "
             "[--environment-equirectangular png|jpg|tga|Radiance-HDR --environment-color-space linear|srgb (HDR requires linear)]");
         const std::filesystem::path input_path = argv[1], output_path = argv[2];
         const std::filesystem::path receipt_path = output_path.string() + ".receipt.json";
-        if (output_path.extension() != ".bmp" || path_entry_exists(output_path) ||
+        if ((output_path.extension() != ".bmp" && output_path.extension() != ".pfm") || path_entry_exists(output_path) ||
             path_entry_exists(receipt_path))
-            throw std::runtime_error("output must be a new .bmp path with no existing receipt");
+            throw std::runtime_error("output must be a new .bmp or .pfm path with no existing receipt");
         std::filesystem::path shader_directory;
         std::optional<std::filesystem::path> environment_sh_path;
         std::optional<std::filesystem::path> environment_image_path;
@@ -195,6 +196,12 @@ int main(int argc, char** argv) {
             std::filesystem::path path;
         };
         std::vector<SuppliedMipArtifact> supplied_mip_artifacts;
+        struct FloatOverride {
+            assets::TextureAssetId asset = 0U;
+            std::filesystem::path path;
+            assets::TextureSemantic semantic = assets::TextureSemantic::emissive;
+        };
+        std::vector<FloatOverride> float_overrides;
         std::map<std::string, project::MaterialGraphEvaluationInputs> pending_graph_inputs;
         const auto read_graph_value = [&](std::string_view type,
                                           const auto& next) {
@@ -324,6 +331,11 @@ int main(int argc, char** argv) {
                 if (supplied_mip_artifacts.size() >= 1024U)
                     throw std::runtime_error("more than 1024 mip artifacts were supplied");
                 supplied_mip_artifacts.push_back({id, path});
+            } else if (option == "--hdr-emissive" || option == "--hdr-base-color") {
+                const auto id=number<std::uint64_t>(next()); const std::filesystem::path path=next();
+                if(float_overrides.size()>=1024U) throw std::runtime_error("too many float overrides");
+                const auto semantic=option == "--hdr-base-color" ? assets::TextureSemantic::base_color : assets::TextureSemantic::emissive;
+                float_overrides.push_back({id,path,semantic});
             } else if (option == "--graph-parameter" ||
                        option == "--graph-surface-input") {
                 const std::string graph_identity(next());
@@ -435,6 +447,34 @@ int main(int argc, char** argv) {
                     "supplied mip artifact does not exactly match the current project texture source");
             }
         }
+        std::set<assets::TextureAssetId> float_ids;
+        std::uint64_t float_payload_bytes = 0U;
+        for (const auto& supplied : float_overrides) {
+            const auto current=std::find_if(textures.begin(),textures.end(),[&](const auto& t){return t.asset==supplied.asset;});
+            if(current==textures.end() || supplied.asset==0U || !float_ids.insert(supplied.asset).second ||
+                current->mips.levels.empty() || current->mips.semantic!=supplied.semantic)
+                throw std::runtime_error("float override must name one bound RGBA8 texture of the requested color semantic; reimport saved PFM sources instead");
+            std::ifstream file(supplied.path,std::ios::binary|std::ios::ate); const auto size=file.tellg();
+            if(!file || size<=0 || size>static_cast<std::streamoff>(256ULL*1024*1024))
+                throw std::runtime_error("float texture missing or exceeds 256 MiB");
+            std::vector<std::uint8_t> data(static_cast<std::size_t>(size)); file.seekg(0);
+            file.read(reinterpret_cast<char*>(data.data()),static_cast<std::streamsize>(data.size()));
+            if(!file) throw std::runtime_error("float texture read failed");
+            const auto digest=assets::sha256(data);
+            auto decoded=assets::decode_linear_pfm(data);
+            // Bound the full derived chain before allocating it.
+            std::uint64_t mip_bytes=0U; auto w=decoded.width,h=decoded.height;
+            while (true) {
+                mip_bytes += static_cast<std::uint64_t>(w)*h*16U;
+                if(w==1U && h==1U) break;
+                w=std::max(1U,w/2U);h=std::max(1U,h/2U);
+            }
+            if(mip_bytes>kMaxSuppliedMipArtifactBytes-float_payload_bytes)
+                throw std::runtime_error("aggregate float texture mips exceed 512 MiB");
+            float_payload_bytes+=mip_bytes;
+            current->linear_float_mips=assets::generate_linear_float_mips(std::move(decoded),digest);
+            current->linear_float_semantic=supplied.semantic;
+        }
         auto request = take(d3d12::prepare_project_scene_render(
             identity, document, camera, width, height, std::move(textures), light,
             std::move(graph_inputs)));
@@ -451,7 +491,8 @@ int main(int argc, char** argv) {
         const auto render_wall_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - render_started).count();
         if (!device->debug_receipts().empty()) throw std::runtime_error("native device reported debug errors; capture refused");
-        const auto encoded = bmp(image);
+        const bool is_hdr = output_path.extension() == ".pfm";
+        const auto encoded = is_hdr ? encode_linear_pfm(image) : bmp(image);
         const std::size_t host_output_payload_bytes =
             image.linear_hdr_rgba.size() * sizeof(float) +
             image.depth.size() * sizeof(float) + image.srgb_rgba.size() + encoded.size();
@@ -466,7 +507,31 @@ int main(int argc, char** argv) {
         else if (image.environment_color_space == assets::ColorSpace::srgb)
             receipt << json("srgb");
         else receipt << "null";
-        receipt << ",\n  \"bmp_digest\": " << json(assets::sha256(encoded).hex())
+        receipt << ",\n  \"float_emissive_textures\": [";
+        bool first_float = true;
+        for (const auto& texture : request.textures) if (texture.linear_float_mips &&
+                texture.linear_float_semantic == assets::TextureSemantic::emissive) {
+            if (!first_float) receipt << ",";
+            first_float = false;
+            receipt << "{\"asset\":" << texture.asset << ",\"source_digest\":"
+                << json(texture.linear_float_mips->source_digest.hex())
+                << ",\"mip_digest\":" << json(texture.linear_float_mips->artifact_digest.hex()) << "}";
+        }
+        receipt << "]";
+        receipt << ",\n  \"float_base_color_textures\": [";
+        bool first_float_base = true;
+        for (const auto& texture : request.textures) if (texture.linear_float_mips &&
+                texture.linear_float_semantic == assets::TextureSemantic::base_color) {
+            if (!first_float_base) receipt << ",";
+            first_float_base = false;
+            receipt << "{\"asset\":" << texture.asset << ",\"source_digest\":"
+                << json(texture.linear_float_mips->source_digest.hex())
+                << ",\"mip_digest\":" << json(texture.linear_float_mips->artifact_digest.hex()) << "}";
+        }
+        receipt << "]";
+        receipt << ",\n  \"output_format\": " << json(is_hdr ? "pfm-linear-rgb-f32" : "bmp-srgb-rgba8")
+            << ",\n  \"output_digest\": " << json(assets::sha256(encoded).hex())
+            << (is_hdr ? "" : ",\n  \"bmp_digest\": " + json(assets::sha256(encoded).hex()))
             << ",\n  \"extent\": [" << width << ", " << height
             << "],\n  \"antialiasing\": " << json(image.antialiasing == d3d12::SceneRenderAntialiasing::fxaa ? "fxaa" : "none")
             << ",\n  \"draw_count\": " << image.draw_count

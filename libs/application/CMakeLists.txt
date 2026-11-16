@@ -1,5 +1,6 @@
 add_library(carto_application STATIC
     src/application.cpp
+    src/sculpt_export.cpp
     src/ik_fk_key_admission.cpp
     src/gltf_scene_import.cpp
     src/shared_rig.cpp

@@ -171,7 +171,8 @@ int main(int argc, char** argv) {
               !d3d12::detail::valid_readback_rgba(0, 1, 0) &&
               !d3d12::detail::valid_readback_rgba(1, 1, 3) &&
               !d3d12::detail::valid_readback_rgba(1, 1, 5) &&
-              !d3d12::detail::valid_readback_rgba(1025, 1024, 1025U * 1024U * 4U),
+              d3d12::detail::valid_readback_rgba(3840, 2160, 3840U * 2160U * 4U) &&
+              !d3d12::detail::valid_readback_rgba(3840, 2161, 3840U * 2161U * 4U),
               "readback identity requires bounded nonempty exact RGBA8 data");
         using Gate = d3d12::detail::ReadbackViewportGate;
         Gate gate;

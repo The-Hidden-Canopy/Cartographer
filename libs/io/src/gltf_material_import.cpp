@@ -31,6 +31,11 @@ template <class T> T need(core::Result<T> r) {
 }
 using Object = std::vector<core::json::Member>;
 Object object(std::string_view s) { return need(core::json::parse_object(s)); }
+// Allow only the exporter provenance path, capped at the face admission limit.
+// Each caller supplies the remaining path when reparsing a nested object.
+Object provenance_object(std::string_view s, std::vector<std::string_view> path) {
+    return need(core::json::parse_object_with_numeric_array_limit(s, std::move(path), 200000U));
+}
 std::string_view get(const Object &o, std::string_view key, std::string_view fallback = "") {
     const auto *p = core::json::find_member(o, key);
     return p ? p->raw_value : fallback;
@@ -172,7 +177,7 @@ GltfContainer container(std::span<const std::uint8_t> bytes) {
         };
         const auto document_size = take_u32();
         const auto count = take_u32();
-        if (!document_size || count == 0U || count > 16U || document_size > bytes.size() - cursor)
+        if (!document_size || count == 0U || count > 80U || document_size > bytes.size() - cursor)
             throw std::runtime_error("invalid glTF source package header");
         const auto document = bytes.subspan(cursor, document_size);
         cursor += document_size;
@@ -269,23 +274,25 @@ core::Result<std::vector<std::uint8_t>> capture_gltf_scene_source(
     try {
         const auto contents = container(bytes);
         if (!contents.external.empty()) throw std::runtime_error("source packages cannot be recaptured as files");
-        const auto root = object(contents.json);
+        const auto root = provenance_object(contents.json, {"meshes", "primitives", "extras", "cartographer_triangle_faces"});
         std::vector<std::pair<std::string, std::vector<std::uint8_t>>> captured;
         std::uint64_t total = bytes.size();
-        for (auto raw : array(get(root, "buffers", "[]"), 16)) {
-            const auto entry = object(raw);
-            const auto uri = get(entry, "uri");
-            if (uri.empty()) continue;
+        const auto capture_uri = [&](std::string_view uri, std::size_t limit) {
+            if (uri.empty()) return;
             const auto name = text(uri);
-            if (name.starts_with("data:")) continue;
+            if (name.starts_with("data:")) return;
             if (std::any_of(captured.begin(), captured.end(), [&](const auto& item) { return item.first == name; }))
-                continue;
-            auto data = detail::read_gltf_sibling(path, name, 64U * 1024U * 1024U);
-            if (!data) return Result::failure(data.error());
+                return;
+            auto data = detail::read_gltf_sibling(path, name, limit);
+            if (!data) throw std::runtime_error(data.error().message);
             if (data.value().empty() || (total += data.value().size() + name.size() + 8U) > 128U * 1024U * 1024U - 20U)
                 throw std::runtime_error("glTF source package exceeds its size limit");
             captured.emplace_back(name, std::move(data.value()));
-        }
+        };
+        for (auto raw : array(get(root, "buffers", "[]"), 16))
+            capture_uri(get(object(raw), "uri"), 64U * 1024U * 1024U);
+        for (auto raw : array(get(root, "images", "[]"), 64))
+            capture_uri(get(object(raw), "uri"), 18U * 1024U * 1024U);
         if (captured.empty()) return Result::success({bytes.begin(), bytes.end()});
         std::vector<std::uint8_t> result(kSourcePackageMagic.begin(), kSourcePackageMagic.end());
         const auto append_u32 = [&](std::uint32_t value) {
@@ -314,7 +321,7 @@ core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::u
         if (bytes.empty() || bytes.size() > 128U * 1024U * 1024U)
             throw std::runtime_error("material library source must be within 128 MiB");
         const auto contents = container(bytes);
-        const auto root = object(contents.json);
+        const auto root = provenance_object(contents.json, {"meshes", "primitives", "extras", "cartographer_triangle_faces"});
         const auto asset = object(get(root, "asset"));
         const auto profile = object(get(object(get(root, "extras", "{}")), "cartographer", "{}"));
         if (text(get(asset, "version")) != "2.0" ||
@@ -326,7 +333,9 @@ core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::u
         for (auto e : array(get(root, "extensionsRequired", "[]"), 16)) {
             const auto name = text(e);
             if (name != "KHR_texture_transform" && name != "KHR_materials_ior" &&
-                name != "KHR_materials_clearcoat" && name != "KHR_materials_emissive_strength")
+                name != "KHR_materials_clearcoat" && name != "KHR_materials_emissive_strength" &&
+                name != "KHR_materials_transmission" && name != "KHR_materials_volume" &&
+                name != "KHR_materials_anisotropy" && name != "KHR_materials_specular")
                 throw std::runtime_error("unsupported required material extension: " + name);
         }
         ImportedGltfMaterials result;
@@ -348,13 +357,26 @@ core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::u
                 const auto skip = uri.starts_with(png)    ? png.size()
                                   : uri.starts_with(jpeg) ? jpeg.size()
                                                           : 0;
-                if (!skip)
-                    throw std::runtime_error("material import accepts embedded PNG/JPEG "
-                                             "only; external images are not read");
-                declared = uri.starts_with(png) ? "image/png" : "image/jpeg";
+                if (skip) {
+                    declared = uri.starts_with(png) ? "image/png" : "image/jpeg";
+                    encoded = base64(std::string_view(uri).substr(skip));
+                } else {
+                    const auto found = std::find_if(contents.external.begin(), contents.external.end(),
+                        [&](const auto& entry) { return entry.uri == uri; });
+                    if (found == contents.external.end())
+                        throw std::runtime_error("external glTF image was not captured in the source package");
+                    if (found->bytes.size() > 18U * 1024U * 1024U)
+                        throw std::runtime_error("external image exceeds source limit");
+                    encoded.assign(found->bytes.begin(), found->bytes.end());
+                    constexpr std::array<std::uint8_t, 8> png_signature{137,80,78,71,13,10,26,10};
+                    if (encoded.size() >= png_signature.size() && std::equal(png_signature.begin(), png_signature.end(), encoded.begin()))
+                        declared = "image/png";
+                    else if (encoded.size() >= 3 && encoded[0] == 0xff && encoded[1] == 0xd8 && encoded[2] == 0xff)
+                        declared = "image/jpeg";
+                    else throw std::runtime_error("external image is not PNG/JPEG");
+                }
                 if (auto mime = get(image, "mimeType"); !mime.empty() && text(mime) != declared)
-                    throw std::runtime_error("image MIME type conflicts with embedded URI");
-                encoded = base64(std::string_view(uri).substr(skip));
+                    throw std::runtime_error("image MIME type conflicts with image bytes");
             } else {
                 const auto mime = text(get(image, "mimeType"));
                 if (mime != "image/png" && mime != "image/jpeg")
@@ -458,7 +480,6 @@ core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::u
                 ref.sampler = default_sampler;
             }
             ref.uv_set = uv;
-            ref.normal_convention = render::NormalConvention::opengl_y_plus;
             if (!result.catalog.textures().contains(ref.asset) ||
                 !result.catalog.samplers().contains(ref.sampler))
                 throw std::runtime_error("material texture refers to a missing image or sampler");
@@ -513,6 +534,9 @@ core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::u
             put(pbr, "baseColorTexture", v.base_color);
             put(pbr, "metallicRoughnessTexture", v.metallic_roughness);
             put(material, "normalTexture", v.normal);
+            // glTF's +Y normal convention applies only to normal maps. Other
+            // slots retain their neutral non-normal binding metadata.
+            if (v.normal) v.normal.normal_convention = render::NormalConvention::opengl_y_plus;
             put(material, "occlusionTexture", v.occlusion);
             put(material, "emissiveTexture", v.emissive);
             if (v.normal)
@@ -536,20 +560,75 @@ core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::u
             v.alpha_cutoff = number(get(material, "alphaCutoff", "0.5"));
             const auto ext = object(get(material, "extensions", "{}"));
             fields(ext, {"KHR_materials_ior", "KHR_materials_clearcoat",
-                         "KHR_materials_emissive_strength"});
+                         "KHR_materials_emissive_strength", "KHR_materials_specular",
+                         "KHR_materials_transmission", "KHR_materials_volume",
+                         "KHR_materials_anisotropy"});
+            const auto loss = [&](std::string what) {
+                result.losses.push_back(m.name + ": " + std::move(what));
+            };
+            double ior = 1.5;
             if (auto value = get(ext, "KHR_materials_ior"); !value.empty()) {
                 const auto e = object(value);
                 fields(e, {"ior"});
-                const auto ior = number(get(e, "ior", "1.5"));
+                ior = number(get(e, "ior", "1.5"));
                 if (ior < 1)
                     throw std::runtime_error("IOR below one is unsupported");
-                v.dielectric_f0 = std::pow((ior - 1) / (ior + 1), 2);
             }
+            double specular = 1.0;
+            if (auto value = get(ext, "KHR_materials_specular"); !value.empty()) {
+                const auto e = object(value);
+                fields(e, {"specularFactor", "specularColorFactor", "specularTexture",
+                           "specularColorTexture"});
+                specular = number(get(e, "specularFactor", "1"));
+                const auto tint = vector(get(e, "specularColorFactor", "[1,1,1]"), 3);
+                if (tint[0] != 1 || tint[1] != 1 || tint[2] != 1)
+                    loss("specular colour tint has no Cartographer field (scalar reflectance kept)");
+                if (!get(e, "specularTexture").empty() || !get(e, "specularColorTexture").empty())
+                    loss("specular textures have no Cartographer slot (factor kept)");
+            }
+            v.dielectric_f0 = std::pow((ior - 1) / (ior + 1), 2) * specular;
+            // A Cartographer export records whether IOR was authored; any other
+            // source's KHR_materials_ior is a real refractive index.
+            if (auto authored = get(extras, "cartographer_ior"); !authored.empty())
+                v.ior = number(authored);
+            else if (!get(extras, "cartographer_material_id").empty())
+                v.ior = 1.5;
+            else
+                v.ior = ior;
             if (auto value = get(ext, "KHR_materials_clearcoat"); !value.empty()) {
                 const auto e = object(value);
-                fields(e, {"clearcoatFactor", "clearcoatRoughnessFactor"});
+                fields(e, {"clearcoatFactor", "clearcoatRoughnessFactor", "clearcoatTexture",
+                           "clearcoatRoughnessTexture", "clearcoatNormalTexture"});
                 v.clearcoat = number(get(e, "clearcoatFactor", "0"));
                 v.clearcoat_roughness = number(get(e, "clearcoatRoughnessFactor", "0"));
+                if (!get(e, "clearcoatTexture").empty() || !get(e, "clearcoatRoughnessTexture").empty() ||
+                    !get(e, "clearcoatNormalTexture").empty())
+                    loss("clearcoat textures have no Cartographer slot (clearcoat factors kept, "
+                         "textures dropped; a baked clearcoat varies only by its factor after reimport)");
+            }
+            if (auto value = get(ext, "KHR_materials_transmission"); !value.empty()) {
+                const auto e = object(value);
+                fields(e, {"transmissionFactor", "transmissionTexture"});
+                v.transmission = number(get(e, "transmissionFactor", "0"));
+                put(e, "transmissionTexture", v.transmission_map);
+            }
+            if (auto value = get(ext, "KHR_materials_volume"); !value.empty()) {
+                const auto e = object(value);
+                fields(e, {"thicknessFactor", "thicknessTexture", "attenuationDistance",
+                           "attenuationColor"});
+                v.thickness = number(get(e, "thicknessFactor", "0"));
+                const auto color = vector(get(e, "attenuationColor", "[1,1,1]"), 3);
+                v.attenuation_color = {color[0], color[1], color[2]};
+                // glTF's default (absent) distance is infinity: no absorption.
+                v.attenuation_distance = number(get(e, "attenuationDistance", "0"));
+                put(e, "thicknessTexture", v.thickness_map);
+            }
+            if (auto value = get(ext, "KHR_materials_anisotropy"); !value.empty()) {
+                const auto e = object(value);
+                fields(e, {"anisotropyStrength", "anisotropyRotation", "anisotropyTexture"});
+                v.anisotropy = number(get(e, "anisotropyStrength", "0"));
+                v.anisotropy_rotation = number(get(e, "anisotropyRotation", "0"));
+                put(e, "anisotropyTexture", v.anisotropy_map);
             }
             if (auto value = get(ext, "KHR_materials_emissive_strength"); !value.empty()) {
                 const auto e = object(value);
@@ -630,7 +709,7 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
                                                   GltfSceneImportOptions options) {
     try {
         const auto contents = container(bytes);
-        const auto root = object(contents.json);
+        const auto root = provenance_object(contents.json, {"meshes", "primitives", "extras", "cartographer_triangle_faces"});
         fields(root,
                {"asset", "scene", "scenes", "nodes", "meshes", "buffers", "bufferViews",
                 "accessors", "materials", "textures", "images", "samplers", "extensionsUsed",
@@ -722,7 +801,7 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
         const auto source_material_count = result.materials.catalog.materials().size();
         std::optional<std::uint64_t> default_material;
         for (auto raw_mesh : mesh_sources) {
-            const auto source = object(raw_mesh);
+            const auto source = provenance_object(raw_mesh, {"primitives", "extras", "cartographer_triangle_faces"});
             fields(source, {"name", "primitives", "extras"});
             if (const auto extra = get(source, "extras"); !extra.empty() && extra.front() == '{')
                 omitted_source_regions = omitted_source_regions ||
@@ -734,10 +813,10 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
             std::set<attributes::UvSetId> uv_ids;
             bool any_uv = false, any_tangent = false, missing_tangent = false;
             for (auto raw : array(get(source, "primitives"), 128)) {
-                const auto primitive = object(raw);
+                const auto primitive = provenance_object(raw, {"extras", "cartographer_triangle_faces"});
                 fields(primitive, {"attributes", "indices", "material", "mode", "extras"});
                 if (const auto extra = get(primitive, "extras"); !extra.empty() && extra.front() == '{') {
-                    const auto metadata = object(extra);
+                    const auto metadata = provenance_object(extra, {"cartographer_triangle_faces"});
                     omitted_source_regions = omitted_source_regions ||
                         !get(metadata, "cartographer_material_region").empty() ||
                         !get(metadata, "condition_material_region").empty() ||

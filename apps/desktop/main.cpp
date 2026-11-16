@@ -1,6 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #define VK_USE_PLATFORM_WIN32_KHR
+
+#include <carto/application/sculpt_export.hpp>
 #define IMGUI_DEFINE_MATH_OPERATORS
 
 #if defined(CARTO_DESKTOP_D3D12_UI) && !defined(CARTO_DESKTOP_D3D12_COMPILE_CHECK)
@@ -48,6 +50,7 @@
 #include "studio_face_tools.hpp"
 #include "studio_vertex_tools.hpp"
 #include "studio_material_draft.hpp"
+#include "starter_material_library.hpp"
 #include "studio_material_graph_draft.hpp"
 #include "studio_sweep_source.hpp"
 #include "studio_viewshed.hpp"
@@ -2674,7 +2677,38 @@ find_d3d12_scene_shader_directory() {
 }
 #endif
 
+// Axis and origin are in source-mesh local coordinates. The evaluator owns
+// the actual symmetry realization; these are authored settings only.
+struct NativeSculptSymmetrySettings {
+    carto::production::SculptSymmetryMode mode = carto::production::SculptSymmetryMode::none;
+    carto::core::Vec3d axis{1.0, 0.0, 0.0};
+    std::uint32_t copies = 4U;
+};
+
+[[nodiscard]] NativeSculptSymmetrySettings native_sculpt_symmetry_settings(
+    int index, int radial_copies) {
+    using carto::production::SculptSymmetryMode;
+    NativeSculptSymmetrySettings result;
+    switch (index) {
+    case 1: result.mode = SculptSymmetryMode::mirror_x; break;
+    case 2: result.mode = SculptSymmetryMode::mirror_plane; result.axis = {0.0, 1.0, 0.0}; break;
+    case 3: result.mode = SculptSymmetryMode::mirror_plane; result.axis = {0.0, 0.0, 1.0}; break;
+    case 4: result.mode = SculptSymmetryMode::radial; break;
+    case 5: result.mode = SculptSymmetryMode::radial; result.axis = {0.0, 1.0, 0.0}; break;
+    case 6: result.mode = SculptSymmetryMode::radial; result.axis = {0.0, 0.0, 1.0}; break;
+    default: break;
+    }
+    if (result.mode == SculptSymmetryMode::radial) {
+        result.copies = static_cast<std::uint32_t>(std::clamp(radial_copies, 2,
+            static_cast<int>(carto::production::kMaxSculptRadialSymmetryCopies)));
+    }
+    return result;
+}
+
 struct NativeSculptStrokeCapture {
+    carto::production::SculptSymmetryMode symmetry = carto::production::SculptSymmetryMode::none;
+    std::uint32_t radial_symmetry_count = 4U;
+    carto::core::Vec3d symmetry_axis_local{1.0, 0.0, 0.0};
     carto::core::Revision project_revision;
     std::uint64_t project_generation = 0U;
     bool perspective_camera = false;
@@ -2930,8 +2964,8 @@ carto::studio::FilePickerTheme file_picker_theme = carto::studio::FilePickerThem
         break;
     case FileDialogKind::texture_source:
         dialog.lpstrFilter =
-            L"Supported Texture Sources (*.png;*.jpg;*.jpeg;*.tga;*.dds;*.exr)\0"
-            L"*.png;*.jpg;*.jpeg;*.tga;*.dds;*.exr\0"
+            L"Supported Texture Sources (*.png;*.jpg;*.jpeg;*.tga;*.dds;*.exr;*.pfm)\0"
+            L"*.png;*.jpg;*.jpeg;*.tga;*.dds;*.exr;*.pfm\0"
             L"All Files\0*.*\0";
         break;
     case FileDialogKind::environment_image:
@@ -3482,6 +3516,8 @@ struct DesktopState {
     double extrude_distance = 0.25;
     double inset_distance = 0.15;
     double custom_face_normal[3]{0.0, 0.0, 1.0};
+    int sculpt_symmetry_index = 0;
+    int sculpt_radial_symmetry_count = 4;
     int sculpt_mode_index = 0;
     double sculpt_radius = 0.25;
     double sculpt_strength = 0.05;
@@ -7623,6 +7659,11 @@ struct DesktopState {
         capture.mesh_asset = *object->object.mesh_asset;
         capture.mode = static_cast<carto::production::SculptStrokeMode>(
             std::clamp(sculpt_mode_index, 0, 11));
+        const auto symmetry = native_sculpt_symmetry_settings(
+            sculpt_symmetry_index, sculpt_radial_symmetry_count);
+        capture.symmetry = symmetry.mode;
+        capture.radial_symmetry_count = symmetry.copies;
+        capture.symmetry_axis_local = symmetry.axis;
         capture.radius = sculpt_radius;
         capture.strength = sculpt_strength;
         capture.viewport = viewport;
@@ -7783,7 +7824,10 @@ struct DesktopState {
             capture.radius,
             capture.strength,
             std::move(samples.value()),
-            capture.project_generation}));
+            capture.project_generation,
+            capture.symmetry,
+            capture.radial_symmetry_count,
+            capture.symmetry_axis_local}));
         return true;
     }
 
@@ -8936,9 +8980,61 @@ struct DesktopState {
                         L"Cartographer export failed", MB_OK | MB_ICONERROR);
             return;
         }
+        carto::io::GltfExportOptions options{*snapshot.project_path, {},
+            export_bake_graphs ? export_bake_resolution : 0U, {}};
+        const auto source_bytes = document.value().serialize();
+        const auto source_digest = carto::assets::sha256({
+            reinterpret_cast<const std::uint8_t*>(source_bytes.data()), source_bytes.size()});
+        for (const auto& [mesh_id, stored] : document.value().sculpt_stacks()) {
+#ifdef CARTO_HAS_SCULPT_PREVIEW_PROVIDER
+            const auto source = document.value().meshes().find(mesh_id);
+            auto stack = carto::production::SculptStack::deserialize(stored.bytes);
+            auto provider = carto::sculpt_preview::make_provider();
+            if (source == document.value().meshes().end() || !stack || !provider) {
+                MessageBoxW(window, L"Could not load the sculpt source or evaluator; export was not written.",
+                            L"Cartographer sculpt export failed", MB_OK | MB_ICONERROR);
+                return;
+            }
+            auto evaluated = carto::application::materialize_sculpt_for_export(
+                source->second, stack.value(), *provider);
+            if (!evaluated) {
+                MessageBoxW(window, wide(evaluated.error().message).c_str(),
+                            L"Cartographer sculpt export failed", MB_OK | MB_ICONERROR);
+                return;
+            }
+            carto::geometry::MeshPatch patch;
+            patch.expected_revision = source->second.revision();
+            const auto before = source->second.vertices_sorted();
+            const auto after = evaluated.value().vertices_sorted();
+            if (before.size() != after.size()) {
+                MessageBoxW(window, L"Sculpt changed source topology; export was not written.",
+                            L"Cartographer sculpt export failed", MB_OK | MB_ICONERROR);
+                return;
+            }
+            for (std::size_t i = 0; i < before.size(); ++i) {
+                if (before[i].id != after[i].id) {
+                    MessageBoxW(window, L"Sculpt changed source vertex identities; export was not written.",
+                                L"Cartographer sculpt export failed", MB_OK | MB_ICONERROR);
+                    return;
+                }
+                const auto& a = before[i].position;
+                const auto& b = after[i].position;
+                if (a.x != b.x || a.y != b.y || a.z != b.z)
+                    patch.vertex_changes.push_back({before[i].id, a, b});
+            }
+            options.evaluated_sculpt.emplace(mesh_id, carto::io::GltfEvaluatedSculpt{
+                source_digest, stored.digest, std::move(patch)});
+#else
+            (void)mesh_id;
+            (void)stored;
+            MessageBoxW(window, L"This scene has authored sculpt, but this build has no sculpt evaluator. Export was not written.",
+                        L"Cartographer export unavailable", MB_OK | MB_ICONWARNING);
+            return;
+#endif
+        }
         const auto report = binary_container
-            ? carto::io::export_glb(document.value(), *path, carto::io::GltfExportOptions{*snapshot.project_path,{},export_bake_graphs?export_bake_resolution:0U})
-            : carto::io::export_gltf(document.value(), *path, carto::io::GltfExportOptions{*snapshot.project_path,{},export_bake_graphs?export_bake_resolution:0U});
+            ? carto::io::export_glb(document.value(), *path, options)
+            : carto::io::export_gltf(document.value(), *path, options);
         if (!report) {
             MessageBoxW(window, wide(report.error().message).c_str(),
                         L"Cartographer export failed", MB_OK | MB_ICONERROR);
@@ -9236,8 +9332,42 @@ struct DesktopState {
                         L"Cartographer export scope required", MB_OK | MB_ICONWARNING);
             return;
         }
+        const auto& source_mesh = document.value().meshes().at(resolved_mesh.value());
+        std::optional<carto::geometry::EditableMesh> evaluated_mesh;
+        const auto stored_sculpt = document.value().sculpt_stacks().find(resolved_mesh.value());
+        if (stored_sculpt != document.value().sculpt_stacks().end()) {
+#ifdef CARTO_HAS_SCULPT_PREVIEW_PROVIDER
+            auto stack = carto::production::SculptStack::deserialize(stored_sculpt->second.bytes);
+            if (!stack) {
+                MessageBoxW(window, wide(stack.error().message).c_str(),
+                            L"Cartographer sculpt export failed", MB_OK | MB_ICONERROR);
+                return;
+            }
+            auto provider = carto::sculpt_preview::make_provider();
+            if (!provider) {
+                MessageBoxW(window, L"The sculpt evaluator is unavailable; export was not written.",
+                            L"Cartographer sculpt export failed", MB_OK | MB_ICONERROR);
+                return;
+            }
+            auto result = carto::application::materialize_sculpt_for_export(
+                source_mesh, stack.value(), *provider,
+                format == StandardMeshExport::obj
+                    ? carto::application::SculptExportFramePolicy::require_current
+                    : carto::application::SculptExportFramePolicy::geometry_only);
+            if (!result) {
+                MessageBoxW(window, wide(result.error().message).c_str(),
+                            L"Cartographer sculpt export failed", MB_OK | MB_ICONERROR);
+                return;
+            }
+            evaluated_mesh = std::move(result.value());
+#else
+            MessageBoxW(window, L"This mesh has authored sculpt, but this build has no sculpt evaluator. Export was not written.",
+                        L"Cartographer export unavailable", MB_OK | MB_ICONWARNING);
+            return;
+#endif
+        }
         const auto export_mesh = [&]() -> carto::core::Result<carto::io::IoReport> {
-            const auto& mesh = document.value().meshes().at(resolved_mesh.value());
+            const auto& mesh = evaluated_mesh.has_value() ? *evaluated_mesh : source_mesh;
             if (format == StandardMeshExport::obj) return carto::io::export_obj(mesh, *path);
             if (format == StandardMeshExport::ply) return carto::io::export_ply(mesh, *path);
             return carto::io::export_stl(mesh, *path);
@@ -12261,7 +12391,15 @@ struct DesktopState {
             request.temporal.session = snapshot.project_generation;
 #endif
             const double scale = std::array{1.0, 0.5, 0.25}[static_cast<std::size_t>(material_viewport_scale)];
-            constexpr double max_readback_pixels = 1'048'576.0;
+            std::uint64_t max_pixels = carto::production::kAuthoringCpuMaxPixels;
+#if defined(CARTO_DESKTOP_ASYNC_READBACK) || defined(CARTO_DESKTOP_RESIDENT_WORKER)
+            max_pixels = carto::production::kAuthoringNativeMaxPixels;
+#endif
+#ifdef CARTO_DESKTOP_D3D12_VIEWPORT
+            max_pixels = material_viewport_cpu_reference ? carto::production::kAuthoringCpuMaxPixels
+                : carto::production::kAuthoringNativeMaxPixels;
+#endif
+            const double max_readback_pixels = static_cast<double>(max_pixels);
             // Clamp both dimensions before multiplication/conversion, then
             // scale proportionally and retain the canvas aspect in the view.
             const double requested_width = std::clamp(static_cast<double>(extent.x) * scale,
@@ -12269,11 +12407,12 @@ struct DesktopState {
             const double requested_height = std::clamp(static_cast<double>(extent.y) * scale,
                 1.0, max_readback_pixels);
             const double limit_scale = std::min(1.0,
-                std::sqrt(max_readback_pixels / (requested_width * requested_height)));
+                std::min(std::sqrt(max_readback_pixels / (requested_width * requested_height)),
+                    double(carto::production::kAuthoringNativeMaxDimension) / std::max(requested_width, requested_height)));
             request.width = static_cast<std::uint32_t>(std::max(1.0, std::floor(requested_width * limit_scale)));
             request.height = static_cast<std::uint32_t>(std::max(1.0, std::floor(requested_height * limit_scale)));
-            if (std::uint64_t(request.width) * request.height > 1'048'576ULL)
-                request.width = static_cast<std::uint32_t>(1'048'576ULL / request.height);
+            if (std::uint64_t(request.width) * request.height > max_pixels)
+                request.width = static_cast<std::uint32_t>(max_pixels / request.height);
             const bool render_extent_capped = limit_scale < 1.0 ||
                 static_cast<double>(extent.x) * scale > max_readback_pixels ||
                 static_cast<double>(extent.y) * scale > max_readback_pixels;
@@ -18298,6 +18437,15 @@ struct DesktopState {
         ImGui::Separator();
 
         ImGui::TextDisabled("Texture source records");
+        ImGui::BeginDisabled(!snapshot.project_path);
+        if (ImGui::Button("Add 24 starter surface presets", ImVec2(-1, 28))) {
+            const auto library = studio::kStarterMaterialLibrary;
+            std::vector<std::uint8_t> bytes(library.begin(), library.end());
+            dispatch(carto::application::ImportGltfMaterialLibraryAction{
+                snapshot.project_generation, snapshot.project_revision, std::move(bytes), true});
+        }
+        ImGui::EndDisabled();
+        ImGui::TextWrapped("Starter presets are uniform colors and PBR factors, without textures or surface detail. Save the project before adding them.");
         ImGui::Checkbox("I own or may reuse the imported material library",&material_library_rights_confirmed);
         ImGui::BeginDisabled(!snapshot.project_path||!material_library_rights_confirmed);
         if(ImGui::Button("Import GLTF/GLB material library...",ImVec2(-1,28))) {
@@ -18325,6 +18473,7 @@ struct DesktopState {
             }
         }
         ImGui::EndDisabled();
+        ImGui::TextDisabled("PFM: scene-linear Rec.709 RGB float, base-color or emissive slot.");
         if (!snapshot.project_path.has_value()) {
             ImGui::TextDisabled("Save this project before importing texture sources.");
         }
@@ -18575,6 +18724,67 @@ struct DesktopState {
                         material_draft_dirty = true;
                     }
                 }
+                // Standard PBR slots share source selection while preserving mapping.
+                const auto draw_texture_slot = [&](const char* label, carto::render::TextureRef& binding) {
+                    std::string preview = "None";
+                    if (binding.asset != 0U) {
+                        const auto found = std::find_if(snapshot.texture_sources.begin(), snapshot.texture_sources.end(),
+                            [&](const auto& source) { return source.id == binding.asset; });
+                        preview = found == snapshot.texture_sources.end() ? "Missing texture source"
+                            : found->name + " - " + found->content_digest.hex().substr(0U, 12U);
+                    }
+                    ImGui::PushID(label);
+                    ImGui::BeginDisabled(material_draft_stale);
+                    if (ImGui::BeginCombo("Texture", preview.c_str())) {
+                        if (ImGui::Selectable("None", binding.asset == 0U) && binding.asset != 0U) {
+                            carto::studio::set_material_texture_source(binding, 0U);
+                            material_draft_dirty = true;
+                        }
+                        for (const auto& texture : snapshot.texture_sources) {
+                            const auto id = carto::studio::material_source_widget_id(snapshot.project_generation, texture.id);
+                            ImGui::PushID(id.c_str());
+                            const std::string item = texture.name + " - " + texture.content_digest.hex().substr(0U, 12U);
+                            if (ImGui::Selectable(item.c_str(), binding.asset == texture.id) && binding.asset != texture.id) {
+                                carto::studio::set_material_texture_source(binding, texture.id);
+                                material_draft_dirty = true;
+                            }
+                            ImGui::PopID();
+                        }
+                        ImGui::EndCombo();
+                    }
+                    ImGui::EndDisabled();
+                    ImGui::PopID();
+                };
+                ImGui::TextDisabled("Metallic-roughness (default: G roughness, B metallic)");
+                draw_texture_slot("Metallic-roughness", material_draft.metallic_roughness);
+                ImGui::TextDisabled("Normal map");
+                draw_texture_slot("Normal", material_draft.normal);
+                if (material_draft.normal.asset != 0U) {
+                    ImGui::BeginDisabled(material_draft_stale);
+                    int convention = material_draft.normal.normal_convention == carto::render::NormalConvention::opengl_y_plus ? 1 : 0;
+                    if (ImGui::Combo("Normal map convention", &convention, "DirectX (Y-)\0OpenGL (Y+)\0")) {
+                        material_draft.normal.normal_convention = convention == 1 ? carto::render::NormalConvention::opengl_y_plus : carto::render::NormalConvention::directx_y_minus;
+                        material_draft_dirty = true;
+                    }
+                    float scale = static_cast<float>(material_draft.normal_scale);
+                    if (ImGui::SliderFloat("Normal strength", &scale, 0.0F, 2.0F, "%.3f")) {
+                        material_draft.normal_scale = scale; material_draft_dirty = true;
+                    }
+                    ImGui::EndDisabled();
+                }
+                ImGui::TextDisabled("Occlusion (default: red channel)");
+                draw_texture_slot("Occlusion", material_draft.occlusion);
+                if (material_draft.occlusion.asset != 0U) {
+                    ImGui::BeginDisabled(material_draft_stale);
+                    float strength = static_cast<float>(material_draft.occlusion_strength);
+                    if (ImGui::SliderFloat("Occlusion strength", &strength, 0.0F, 1.0F, "%.3f")) {
+                        material_draft.occlusion_strength = strength; material_draft_dirty = true;
+                    }
+                    ImGui::EndDisabled();
+                }
+                ImGui::TextDisabled("Emissive texture (default: sRGB)");
+                draw_texture_slot("Emissive", material_draft.emissive);
+                ImGui::TextWrapped("New slots use default UV0 and sampling. Replacing a source retains its mapping. Maps multiply material factors; metallic and emissive factors must be above zero to see those maps. The ordinary workspace does not preview texture shading.");
                 ImGui::ColorButton("Current source color", ImVec4(
                     swatch[0], swatch[1], swatch[2], swatch[3]),
                     ImGuiColorEditFlags_NoTooltip, ImVec2(-1, 28));
@@ -18600,6 +18810,53 @@ struct DesktopState {
                 if (ImGui::SliderFloat("Clearcoat", &clearcoat, 0.0F, 1.0F, "%.3f")) {
                     material_draft.clearcoat = clearcoat;
                     material_draft_dirty = true;
+                }
+                float clearcoat_roughness = static_cast<float>(material_draft.clearcoat_roughness);
+                if (ImGui::SliderFloat("Clearcoat roughness", &clearcoat_roughness, 0.0F, 1.0F, "%.3f")) {
+                    material_draft.clearcoat_roughness = clearcoat_roughness;
+                    material_draft_dirty = true;
+                }
+                if (ImGui::CollapsingHeader("Transmission and volume", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    float ior = static_cast<float>(material_draft.ior);
+                    if (ImGui::SliderFloat("IOR", &ior, 1.0F, 2.5F, "%.3f")) {
+                        material_draft.ior = ior;
+                        material_draft_dirty = true;
+                    }
+                    float transmission = static_cast<float>(material_draft.transmission);
+                    if (ImGui::SliderFloat("Transmission", &transmission, 0.0F, 1.0F, "%.3f")) {
+                        material_draft.transmission = transmission;
+                        material_draft_dirty = true;
+                    }
+                    float thickness_mm = static_cast<float>(material_draft.thickness * 1000.0);
+                    if (ImGui::DragFloat("Thickness · mm", &thickness_mm, 0.05F, 0.0F, 200.0F, "%.2f")) {
+                        material_draft.thickness = std::max(0.0F, thickness_mm) / 1000.0;
+                        material_draft_dirty = true;
+                    }
+                    float attenuation[3]{static_cast<float>(material_draft.attenuation_color.x),
+                        static_cast<float>(material_draft.attenuation_color.y),
+                        static_cast<float>(material_draft.attenuation_color.z)};
+                    if (ImGui::ColorEdit3("Absorption colour · linear", attenuation, ImGuiColorEditFlags_Float)) {
+                        material_draft.attenuation_color = {attenuation[0], attenuation[1], attenuation[2]};
+                        material_draft_dirty = true;
+                    }
+                    float attenuation_mm = static_cast<float>(material_draft.attenuation_distance * 1000.0);
+                    if (ImGui::DragFloat("Absorption distance · mm", &attenuation_mm, 0.1F, 0.0F, 1000.0F, "%.1f")) {
+                        material_draft.attenuation_distance = std::max(0.0F, attenuation_mm) / 1000.0;
+                        material_draft_dirty = true;
+                    }
+                    ImGui::TextDisabled("Absorption: the colour light reaches after that distance inside the material; 0 = clear.");
+                }
+                if (ImGui::CollapsingHeader("Anisotropy", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    float anisotropy = static_cast<float>(material_draft.anisotropy);
+                    if (ImGui::SliderFloat("Anisotropy", &anisotropy, 0.0F, 1.0F, "%.3f")) {
+                        material_draft.anisotropy = anisotropy;
+                        material_draft_dirty = true;
+                    }
+                    float rotation_degrees = static_cast<float>(material_draft.anisotropy_rotation * 57.29577951308232);
+                    if (ImGui::SliderFloat("Anisotropy rotation · °", &rotation_degrees, -180.0F, 180.0F, "%.1f")) {
+                        material_draft.anisotropy_rotation = rotation_degrees / 57.29577951308232;
+                        material_draft_dirty = true;
+                    }
                 }
                 float emissive_factor[3]{
                     static_cast<float>(material_draft.emissive_factor.x),
@@ -19562,6 +19819,15 @@ struct DesktopState {
                 static_cast<int>(sizeof(sculpt_modes) / sizeof(sculpt_modes[0]));
             sculpt_mode_index = std::clamp(sculpt_mode_index, 0, sculpt_mode_count - 1);
             ImGui::Combo("Brush mode", &sculpt_mode_index, sculpt_modes, sculpt_mode_count);
+            static constexpr const char* sculpt_symmetries[]{
+                "None", "Mirror local X = 0", "Mirror local Y = 0", "Mirror local Z = 0",
+                "Radial around local X", "Radial around local Y", "Radial around local Z"};
+            sculpt_symmetry_index = std::clamp(sculpt_symmetry_index, 0, 6);
+            ImGui::Combo("Symmetry", &sculpt_symmetry_index, sculpt_symmetries, 7);
+            if (sculpt_symmetry_index >= 4) {
+                ImGui::SliderInt("Radial copies", &sculpt_radial_symmetry_count, 2,
+                    static_cast<int>(carto::production::kMaxSculptRadialSymmetryCopies));
+            }
             ImGui::InputDouble("Radius", &sculpt_radius, 0.01, 0.1, "%.4f");
             ImGui::InputDouble("Strength", &sculpt_strength, 0.01, 0.1, "%.4f");
             const bool one_vertex =
@@ -19570,12 +19836,17 @@ struct DesktopState {
                 snapshot.selection.component_object.has_value();
             ImGui::BeginDisabled(!one_vertex);
             if (ImGui::Button("Add stroke at selected vertex", ImVec2(-1, 34))) {
+                const auto symmetry = native_sculpt_symmetry_settings(
+                    sculpt_symmetry_index, sculpt_radial_symmetry_count);
                 const bool accepted = dispatch(carto::application::AppendSculptStrokeAction{
                     snapshot.project_revision,
                     static_cast<carto::production::SculptStrokeMode>(sculpt_mode_index),
                     sculpt_radius,
                     sculpt_strength,
-                    snapshot.project_generation});
+                    snapshot.project_generation,
+                    symmetry.mode,
+                    symmetry.copies,
+                    symmetry.axis});
                 if (accepted) {
                     action_feedback = "Sculpt stroke recorded in the project-bound stack.";
                     action_feedback_error = false;
@@ -19959,6 +20230,17 @@ struct DesktopState {
         if (ImGui::Button("Edge loop")) run_selection(carto::ui::selection_commands::loop);
         ImGui::SameLine();
         if (ImGui::Button("Edge ring")) run_selection(carto::ui::selection_commands::ring);
+        if (ImGui::Button("Select all open boundary edges", ImVec2(-1, 28)))
+            run_selection(carto::ui::selection_commands::all_boundary_edges);
+        ImGui::TextDisabled("Replaces the edge selection on each selected mesh.");
+        ImGui::EndDisabled();
+        ImGui::BeginDisabled(snapshot.selection.mode != carto::editor::SelectionMode::face);
+        if (ImGui::Button("Triangles")) run_selection(carto::ui::selection_commands::triangle_faces);
+        ImGui::SameLine();
+        if (ImGui::Button("Quads")) run_selection(carto::ui::selection_commands::quad_faces);
+        ImGui::SameLine();
+        if (ImGui::Button("N-gons")) run_selection(carto::ui::selection_commands::ngon_faces);
+        ImGui::TextDisabled("Replace selection with faces of that size on each selected mesh.");
         ImGui::EndDisabled();
         ImGui::EndDisabled();
         if (!has_components) ImGui::TextDisabled("Select mesh components to convert or expand them.");
@@ -19990,8 +20272,12 @@ struct DesktopState {
             }
         }
         ImGui::BeginDisabled(selection_path_goal == 0U);
-        if (ImGui::Button("Select shortest path", ImVec2(-1, 28)) && path_available) {
+        if (ImGui::Button("Select shortest path (edges)", ImVec2(-1, 28)) && path_available) {
             run_selection(carto::ui::selection_commands::shortest_path,
+                carto::geometry::VertexId{selection_path_goal}, path_groups.front().object);
+        }
+        if (ImGui::Button("Select shortest path (local length)", ImVec2(-1, 28)) && path_available) {
+            run_selection(carto::ui::selection_commands::shortest_path_length,
                 carto::geometry::VertexId{selection_path_goal}, path_groups.front().object);
         }
         ImGui::EndDisabled();
@@ -20605,6 +20891,12 @@ struct DesktopState {
                     "mesh.merge-vertices", arguments}));
             }
             ImGui::EndDisabled();
+            ImGui::BeginDisabled(!vertex_tools.merge_last_selected);
+            if (ImGui::Button("Merge at last selected", ImVec2(-1, 30))) {
+                static_cast<void>(dispatch(carto::studio::merge_at_last_selected_action()));
+            }
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("Select two vertices per object; the last selected stays in place.");
             ImGui::BeginDisabled(!vertex_tools.merge_by_distance);
             ImGui::InputDouble("Merge distance", &merge_distance, 0.0001, 0.001, "%.5f");
             merge_distance = std::max(merge_distance, 1e-9);

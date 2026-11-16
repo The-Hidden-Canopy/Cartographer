@@ -421,7 +421,12 @@ inline constexpr std::string_view invert = "selection.invert";
 inline constexpr std::string_view loop = "selection.loop";
 inline constexpr std::string_view ring = "selection.ring";
 inline constexpr std::string_view boundary = "selection.boundary";
+inline constexpr std::string_view all_boundary_edges = "selection.all-boundary-edges";
+inline constexpr std::string_view triangle_faces = "selection.triangle-faces";
+inline constexpr std::string_view quad_faces = "selection.quad-faces";
+inline constexpr std::string_view ngon_faces = "selection.ngon-faces";
 inline constexpr std::string_view shortest_path = "selection.shortest-path";
+inline constexpr std::string_view shortest_path_length = "selection.shortest-path-length";
 } // namespace selection_commands
 
 enum class MeshImportFormat {

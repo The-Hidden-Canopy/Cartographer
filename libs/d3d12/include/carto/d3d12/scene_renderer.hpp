@@ -1,5 +1,6 @@
 #pragma once
 
+#include <carto/assets/linear_float_image.hpp>
 #include <carto/assets/texture_mip.hpp>
 #include <carto/device_ir/command.hpp>
 #include <carto/d3d12/device.hpp>
@@ -19,6 +20,7 @@
 
 namespace carto::d3d12 {
 
+// V36 separates graph occlusion from source texture strength.
 // V35 compares PCF taps on the receiver plane and decodes LDR environment blue.
 // V34 transports direct anisotropy axes to bounded UV0 normal-map normals.
 // V33 adds UV0-tangent-bound direct anisotropy with explicit unsupported inputs.
@@ -35,7 +37,7 @@ namespace carto::d3d12 {
 // environment integration, per-texture affine transforms, bounded UV streams,
 // primary-stream normal-map tangents, both conventions, and material samplers.
 inline constexpr std::string_view kSceneRenderAlgorithm =
-    "carto.d3d12.scene-direct-capture.v35";
+    "carto.d3d12.scene-direct-capture.v36";
 inline constexpr std::uint32_t kSceneRenderEnvironmentPrefilterSampleCount = 32U;
 inline constexpr double kSceneRenderLocalLightDistanceFloorMeters = 0.01;
 inline constexpr double kSceneRenderMaximumLocalLightIntensity = 1.0e20;
@@ -106,6 +108,9 @@ struct SceneRenderMaterialBinding {
     // positive axis scales carry those axes to the mapped shading normal by
     // shortest rotation; rotated/reflected maps remain unsupported.
     double anisotropy = 0.0;
+    // Scene-only graph ambient-occlusion multiplier, independent of the
+    // source material's occlusion texture strength. Neutral when absent.
+    double graph_occlusion = 1.0;
 };
 
 // D3D12 scene-only material compilation keeps the exact authored source digest
@@ -149,6 +154,10 @@ struct SceneRenderTexture {
     // from a previous source cannot silently satisfy the current source.
     assets::Sha256Digest current_source_digest;
     assets::Rgba8MipChain mips;
+    // Scene-linear float PFM, interpreted as base color or emissive radiance.
+    // The slot is explicit so a float source cannot silently change meaning.
+    std::optional<assets::LinearFloatMipChain> linear_float_mips;
+    assets::TextureSemantic linear_float_semantic = assets::TextureSemantic::emissive;
 };
 
 struct SceneRenderEnvironmentMipLevel {

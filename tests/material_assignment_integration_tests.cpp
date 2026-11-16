@@ -76,6 +76,17 @@ int main(){try {
               studio::material_source_widget_id(12U,3U) !=
                   studio::material_source_widget_id(1U,23U),
               "material widget scopes retain full source identity and project generation");
+        // All standard slots use the same non-destructive source selector.
+        render::StandardMaterial maps;
+        for (auto* slot : {&maps.metallic_roughness, &maps.normal, &maps.occlusion, &maps.emissive}) {
+            slot->asset = 4; slot->uv_set = 7; slot->sampler = 3;
+            slot->transform.offset = {.2, .3};
+            auto preserved = *slot; preserved.asset = 5;
+            studio::set_material_texture_source(*slot, 5);
+            check(*slot == preserved, "slot replacement retains UV, sampler and mapping");
+            studio::set_material_texture_source(*slot, 0);
+            check(*slot == render::TextureRef{}, "slot clear resets its complete binding");
+        }
         render::TextureRef binding;
         binding.asset=10;binding.uv_set=7;binding.sampler=3;
         binding.transform.offset={.2,.3};binding.transform.scale={2,3};
@@ -91,6 +102,69 @@ int main(){try {
         studio::set_base_color_texture_source(binding,12);
         render::TextureRef rebound;rebound.asset=12;
         check(binding==rebound,"binding from None uses default sampling metadata");
+    }
+    // The same edit path used by the desktop persists all five slots through
+    // revisioned update, undo/redo, and a saved project reopen.
+    {
+        application::ApplicationSession maps_session;
+        const auto maps_path = root / "maps.carto";
+        send(maps_session, application::SaveProjectAction{maps_path});
+        const std::vector<std::uint8_t> png = {137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,1,0,0,0,1,8,6,0,0,0,31,21,196,137,0,0,0,13,73,68,65,84,120,156,99,248,207,192,240,31,0,5,0,1,255,137,153,61,29,0,0,0,0,73,69,78,68,174,66,96,130};
+        assets::BlobStore blobs(root / ".carto-assets" / "source-blobs");
+        const auto stored = take(blobs.put(png, "image/png"));
+        auto state = maps_session.snapshot();
+        send(maps_session, application::ImportMaterialTextureSourceAction{
+            state.project_revision, stored.digest, assets::TextureSourceFormat::png, 1U, 1U});
+        state = maps_session.snapshot();
+        send(maps_session, application::CreateMaterialAction{state.project_revision, "Maps", {}});
+        state = maps_session.snapshot();
+        auto edited = state.materials.front().definition;
+        const auto texture = state.texture_sources.front().id;
+        for (auto* slot : {&edited.base_color, &edited.metallic_roughness, &edited.normal,
+                           &edited.occlusion, &edited.emissive})
+            studio::set_material_texture_source(*slot, texture);
+        edited.normal.normal_convention = render::NormalConvention::opengl_y_plus;
+        edited.normal_scale = .7; edited.occlusion_strength = .6;
+        send(maps_session, application::UpdateMaterialAction{state.project_revision,
+            state.materials.front().id, state.materials.front().revision, edited});
+        send(maps_session, application::UndoAction{});
+        check(!maps_session.snapshot().materials.front().definition.normal,
+              "undo removes new map bindings");
+        send(maps_session, application::RedoAction{});
+        send(maps_session, application::SaveProjectAction{std::nullopt});
+        const auto reopened_maps = take(project::ProjectDocument::load(maps_path));
+        const auto& saved = reopened_maps.material_catalog().materials().begin()->second.definition;
+        check(saved.base_color.asset == texture && saved.metallic_roughness.asset == texture &&
+              saved.normal.asset == texture && saved.occlusion.asset == texture &&
+              saved.emissive.asset == texture && saved.normal.normal_convention ==
+                  render::NormalConvention::opengl_y_plus && saved.normal_scale == .7 &&
+              saved.occlusion_strength == .6, "all map bindings survive undo/redo and reopen");
+        // Put the bindings on a UV-mapped mesh and exercise the real glTF
+        // handoff from the saved project-owned source blobs.
+        auto mapped_mesh = quad();
+        attributes::AttributeSet mapped_attributes({{attributes::AttributeDomain::corner, 6U}});
+        okay(mapped_attributes.add_layer({{"uv0.corners", attributes::AttributeDomain::corner,
+            attributes::AttributeType::vec2}, {core::Vec2d{0,0}, core::Vec2d{1,0}, core::Vec2d{1,1},
+            core::Vec2d{0,0}, core::Vec2d{1,1}, core::Vec2d{0,1}}}));
+        attributes::UvSetTable mapped_uvs;
+        okay(mapped_uvs.add({render::kUv0, "UV0", "uv0.corners", true, true, false, 1U}));
+        okay(mapped_mesh.set_attribute_payload(std::move(mapped_attributes), std::move(mapped_uvs)));
+        state = maps_session.snapshot();
+        send(maps_session, application::CreateMeshObjectAction{"Mapped quad", std::move(mapped_mesh)});
+        state = maps_session.snapshot();
+        const auto mapped_object = state.objects.front().object.id;
+        send(maps_session, application::AssignMaterialToMeshAction{state.project_generation,
+            state.project_revision, mapped_object, state.materials.front().id,
+            state.materials.front().revision, {}, {}});
+        send(maps_session, application::SaveProjectAction{std::nullopt});
+        const auto export_source = take(project::ProjectDocument::load(maps_path));
+        take(io::export_glb(export_source, root / "maps.glb", io::GltfExportOptions{maps_path}));
+        Payload maps_payload(root / "maps.glb");
+        const auto material = array(member(maps_payload.json, "materials"))[0];
+        const auto pbr = member(material, "pbrMetallicRoughness");
+        check(!member(pbr, "baseColorTexture").empty() && !member(pbr, "metallicRoughnessTexture").empty() &&
+              !member(material, "normalTexture").empty() && !member(material, "occlusionTexture").empty() &&
+              !member(material, "emissiveTexture").empty(), "all five map slots reach exported GLB");
     }
     send(s,application::AssignMaterialToMeshAction{snap.project_generation,snap.project_revision,object,redid,core::Revision{redrev},{},{}});colors(image(s),false);
     snap=s.snapshot();auto whole=take(s.authoring_viewport_source(snap.project_revision));check(whole.material_catalog().assignments().size()==1,"new primitive gains one authored slot/binding");
