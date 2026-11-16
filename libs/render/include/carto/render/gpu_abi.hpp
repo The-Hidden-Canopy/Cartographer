@@ -65,6 +65,9 @@ static_assert(sizeof(GpuTemporalConstants) % 16U == 0U);
 [[nodiscard]] core::Result<void> validate(const GpuLightConstants& constants);
 [[nodiscard]] core::Result<void> validate(const GpuTemporalConstants& constants);
 
+// The legacy native material ABI cannot carry Material V5 optical fields.
+[[nodiscard]] core::Result<void> validate_native_material_optics(
+    const StandardMaterial& material);
 [[nodiscard]] core::Result<GpuMaterialConstants> pack_material_for_gpu(
     const StandardMaterial& material);
 [[nodiscard]] core::Result<GpuLightConstants> pack_light_for_gpu(

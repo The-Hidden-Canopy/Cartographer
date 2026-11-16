@@ -1,5 +1,6 @@
 #include "authoring_environment_fixture.hpp"
 #include <carto/ui/ui.hpp>
+#include <chrono>
 #include <fstream>
 #include <iostream>
 
@@ -34,23 +35,63 @@ void lighting_contract() {
     auto uniform = take(production::compile_environment_lighting(constant));
     check(uniform->atlas().size_bytes() == 128 * 207 * 16,
           "environment product has a bounded explicit atlas budget");
+    const auto high = take(production::compile_environment_lighting(
+        constant, production::EnvironmentLightingQuality::high));
+    check(high->atlas_width() == 256 && high->atlas_height() == 335 &&
+              high->atlas().size_bytes() == 256U * 335U * 16U,
+          "high quality has a bounded, explicitly sized atlas");
+    check(!production::compile_environment_lighting(
+              constant, static_cast<production::EnvironmentLightingQuality>(99)),
+          "unknown quality tiers fail closed");
     for (const auto n : {core::Vec3d{1, 0, 0}, core::Vec3d{0, 1, 0}, core::Vec3d{0, 0, -1}}) {
         check((uniform->diffuse(n) - core::Vec3d{4, 2, .5}).length() < 1e-5,
               "constant environment conserves diffuse radiance E/pi in every direction");
         for (double roughness : {0., .1, .4, .8, 1.}) {
             check((uniform->specular(n, roughness) - core::Vec3d{4, 2, .5}).length() < 1e-5,
                   "normalized GGX prefilter conserves constant HDR radiance");
+            check((high->specular(n, roughness) - core::Vec3d{4, 2, .5}).length() < 1e-5 &&
+                      (high->diffuse(n) - core::Vec3d{4, 2, .5}).length() < 1e-5,
+                  "high-quality atlas conserves constant radiance");
             for (double nv : {.01, .2, .7, 1.}) {
                 const auto lut = uniform->brdf(nv, roughness);
+                const auto high_lut = high->brdf(nv, roughness);
                 check(std::isfinite(lut[0]) && std::isfinite(lut[1]) && lut[0] >= 0 &&
                           lut[1] >= 0 && lut[0] + lut[1] < 1.05,
                       "BRDF integral remains finite and energy-bounded over roughness/view-angle "
                       "sweep");
+                check(std::abs(lut[0]-high_lut[0]) < 1e-7 &&
+                          std::abs(lut[1]-high_lut[1]) < 1e-7,
+                      "quality tiers preserve the same BRDF lookup");
             }
         }
     }
     auto e = asymmetric_environment();
     auto product = take(production::compile_environment_lighting(e));
+    auto detail = e;
+    detail.width = 256; detail.height = 128;
+    detail.linear_radiance.assign(std::size_t(detail.width)*detail.height, core::Vec3d{.01,.01,.01});
+    constexpr unsigned bright_x=128, bright_y=64;
+    detail.linear_radiance[std::size_t(bright_y)*detail.width+bright_x] = {1000,1000,1000};
+    const auto began = std::chrono::steady_clock::now();
+    const auto detail_standard = take(production::compile_environment_lighting(
+        detail, production::EnvironmentLightingQuality::standard));
+    const auto standard_ms = std::chrono::duration<double,std::milli>(
+        std::chrono::steady_clock::now()-began).count();
+    const auto high_start = std::chrono::steady_clock::now();
+    const auto detail_high = take(production::compile_environment_lighting(
+        detail, production::EnvironmentLightingQuality::high));
+    const auto high_ms = std::chrono::duration<double,std::milli>(
+        std::chrono::steady_clock::now()-high_start).count();
+    const double theta=std::numbers::pi*(bright_y+.5)/detail.height;
+    const double phi=2*std::numbers::pi*((bright_x+.5)/detail.width-.5);
+    const core::Vec3d direction{std::sin(theta)*std::cos(phi),std::cos(theta),
+                                std::sin(theta)*std::sin(phi)};
+    const auto standard_peak=detail_standard->specular(direction,0).x;
+    const auto high_peak=detail_high->specular(direction,0).x;
+    std::cout << "detail fixture: standard=" << standard_peak << " high=" << high_peak
+              << "; standard_compile_ms=" << standard_ms << "; high_compile_ms=" << high_ms << '\n';
+    check(high_peak > standard_peak * 1.05,
+          "higher-quality atlas retains a narrow bright reflection better");
     check(product->diffuse({1, 0, 0}).x > product->diffuse({-1, 0, 0}).x * 2,
           "diffuse environment is spatially directional, not one+Z irradiance sample");
     check(product->specular({1, 0, 0}, .1).x > product->specular({1, 0, 0}, 1).x * 2,

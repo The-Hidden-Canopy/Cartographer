@@ -330,6 +330,18 @@ struct DxcModuleGuard {
     DxcModuleGuard& operator=(const DxcModuleGuard&) = delete;
 };
 
+HMODULE load_paired_dxc_validator(HMODULE compiler) {
+    if (!compiler) return nullptr;
+    std::array<wchar_t, 32768> module_name{};
+    const auto length = GetModuleFileNameW(compiler, module_name.data(),
+                                           static_cast<DWORD>(module_name.size()));
+    if (!length || length >= module_name.size()) return nullptr;
+    const auto path = std::filesystem::path(std::wstring(module_name.data(), length))
+                          .parent_path() / L"dxil.dll";
+    return LoadLibraryExW(path.c_str(), nullptr,
+                          LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+}
+
 std::string dxc_error_text(IDxcResult* result) {
     if (result == nullptr) return {};
     Microsoft::WRL::ComPtr<IDxcBlobEncoding> errors;
@@ -370,6 +382,11 @@ core::Result<device::ShaderBinary> compile_hlsl(const ShaderSource& source) {
         return core::Result<device::ShaderBinary>::failure(Diagnostic(
             ErrorCode::not_found,
             "dxcompiler.dll was not found; set CARTO_DXCOMPILER_PATH to an approved DXC runtime"));
+    }
+    DxcModuleGuard validator_guard{load_paired_dxc_validator(module)};
+    if (!validator_guard.module) {
+        return core::Result<device::ShaderBinary>::failure(Diagnostic(
+            ErrorCode::not_found, "DXC validator dxil.dll is unavailable beside the selected compiler"));
     }
     const auto create = reinterpret_cast<DxcCreateInstanceProc>(
         GetProcAddress(module, "DxcCreateInstance"));
@@ -445,8 +462,31 @@ core::Result<device::ShaderBinary> compile_hlsl(const ShaderSource& source) {
             native_failure("IDxcOperationResult::GetResult",
                            FAILED(status) ? status : E_FAIL));
     }
-    const auto* bytes = static_cast<const std::uint8_t*>(object->GetBufferPointer());
-    std::vector<std::uint8_t> bytecode(bytes, bytes + object->GetBufferSize());
+    const auto validator_create = reinterpret_cast<DxcCreateInstanceProc>(
+        GetProcAddress(validator_guard.module, "DxcCreateInstance"));
+    constexpr GUID validator_id = {
+        0xa6e82bd2, 0x1fd7, 0x4826, {0x98, 0x11, 0x28, 0x57, 0xe7, 0x97, 0xf4, 0x9a}};
+    Microsoft::WRL::ComPtr<IDxcValidator> validator;
+    if (!validator_create || FAILED(validator_create(CLSID_DxcValidator, validator_id,
+                                                       reinterpret_cast<void**>(validator.GetAddressOf())))) {
+        return core::Result<device::ShaderBinary>::failure(
+            unsupported("DXC validator creation failed"));
+    }
+    Microsoft::WRL::ComPtr<IDxcOperationResult> validated;
+    HRESULT validation_status = E_FAIL;
+    if (FAILED(validator->Validate(object.Get(), DxcValidatorFlags_Default, &validated)) ||
+        !validated || FAILED(validated->GetStatus(&validation_status)) || FAILED(validation_status)) {
+        return core::Result<device::ShaderBinary>::failure(
+            validation("DXC validator rejected compiled shader"));
+    }
+    Microsoft::WRL::ComPtr<IDxcBlob> signed_object;
+    if (FAILED(validated->GetResult(&signed_object)) || !signed_object || !signed_object->GetBufferPointer() ||
+        signed_object->GetBufferSize() == 0U) {
+        return core::Result<device::ShaderBinary>::failure(
+            validation("DXC validator produced no signed shader"));
+    }
+    const auto* bytes = static_cast<const std::uint8_t*>(signed_object->GetBufferPointer());
+    std::vector<std::uint8_t> bytecode(bytes, bytes + signed_object->GetBufferSize());
     const auto* source_bytes = reinterpret_cast<const std::uint8_t*>(source.source.data());
     const std::string source_digest = assets::sha256(
         std::span<const std::uint8_t>{source_bytes, source.source.size()}).hex();
@@ -538,16 +578,7 @@ core::Result<void> validate_dxil(std::span<const std::uint8_t> bytes) {
                                      : nullptr;
     if (!create)
         return core::Result<void>::failure(unsupported("DXC validation runtime unavailable"));
-    std::array<wchar_t, 32768> module_name{};
-    const auto length = GetModuleFileNameW(guard.module, module_name.data(),
-                                           static_cast<DWORD>(module_name.size()));
-    const auto validator_path =
-        std::filesystem::path(std::wstring(module_name.data(), length)).parent_path() / L"dxil.dll";
-    DxcModuleGuard validator_guard{
-        length && length < module_name.size()
-            ? LoadLibraryExW(validator_path.c_str(), nullptr,
-                             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)
-            : nullptr};
+    DxcModuleGuard validator_guard{load_paired_dxc_validator(guard.module)};
     const auto validator_create =
         validator_guard.module ? reinterpret_cast<DxcCreateInstanceProc>(
                                      GetProcAddress(validator_guard.module, "DxcCreateInstance"))
@@ -570,6 +601,12 @@ core::Result<void> validate_dxil(std::span<const std::uint8_t> bytes) {
     if (FAILED(validator->Validate(blob.Get(), 0, &result)) || !result ||
         FAILED(result->GetStatus(&status)) || FAILED(status))
         return core::Result<void>::failure(validation("DXIL cache validator rejected binary"));
+    ComPtr<IDxcBlob> signed_blob;
+    if (FAILED(result->GetResult(&signed_blob)) || !signed_blob || !signed_blob->GetBufferPointer() ||
+        signed_blob->GetBufferSize() != bytes.size() ||
+        !std::equal(bytes.begin(), bytes.end(),
+                    static_cast<const std::uint8_t*>(signed_blob->GetBufferPointer())))
+        return core::Result<void>::failure(validation("DXIL cache binary is unsigned or altered"));
     return core::Result<void>::success();
 #endif
 }

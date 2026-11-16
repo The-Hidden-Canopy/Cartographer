@@ -529,7 +529,7 @@ core::Result<void> PresentationCatalog::insert_light(AuthoredLight light) {
 
 core::Result<void> AuthoredEnvironment::validate() const {
     if (!safe_identifier(identity, 128) || revision == core::Revision{} || height < 2 ||
-        height > 64 || width != height * 2 ||
+        height > 128 || width != height * 2 ||
         linear_radiance.size() != std::size_t(width) * height || !std::isfinite(rotation_radians) ||
         std::abs(rotation_radians) > 1e6 || !std::isfinite(intensity) || intensity < 0 ||
         intensity > 1e4)
@@ -624,7 +624,10 @@ std::string PresentationCatalog::serialize() const {
     std::ostringstream out;
     out.imbue(std::locale::classic());
     out << std::setprecision(std::numeric_limits<double>::max_digits10);
-    out << kMagic << ' ' << kSchemaVersion << '\n';
+    // Keep the existing byte identity for catalogs that old readers support.
+    // Larger environment grids require v6 so older readers reject explicitly.
+    const auto version = environment_ && environment_->height > 64 ? kSchemaVersion : 5U;
+    out << kMagic << ' ' << version << '\n';
     out << "CAMERAS " << cameras_.size() << '\n';
     for (const auto& [identity, camera] : cameras_) {
         static_cast<void>(identity);
@@ -874,7 +877,8 @@ core::Result<PresentationCatalog> PresentationCatalog::deserialize(std::string_v
             if (!expect(input, "ENVIRONMENT_SOURCE") || !(input >> std::quoted(e.identity)) ||
                 !read_unsigned(input, revision) || !read_unsigned(input, e.width) ||
                 !read_unsigned(input, e.height) || !(input >> e.rotation_radians >> e.intensity) ||
-                !read_bool(input, e.enabled) || e.height < 2 || e.height > 64 ||
+                !read_bool(input, e.enabled) || e.height < 2 ||
+                e.height > (version >= 6 ? 128U : 64U) ||
                 e.width != 2 * e.height)
                 return core::Result<PresentationCatalog>::failure(
                     validation("environment source record is invalid"));

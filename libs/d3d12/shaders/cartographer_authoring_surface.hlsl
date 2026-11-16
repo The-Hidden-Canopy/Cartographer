@@ -49,17 +49,22 @@ float4 sample_map(uint slot, float2 uv, float2 dx, float2 dy, inout bool valid) 
     const float2 ax=dx*metadata.xy, ay=dy*metadata.xy;
     const float lx=length(ax), ly=length(ay);
     float rho=max(lx,ly);
-    const float minor=max(min(lx,ly),1e-6);
-    const uint taps=uint(clamp(ceil(rho/minor),1.0,8.0));
-    const float2 major_uv=(lx>=ly ? dx : dy);
-    bool finite=all(isfinite(uv)) && all(isfinite(dx)) && all(isfinite(dy)) && isfinite(rho) && all(abs(uv)<=1e6);
+    // Reserve signed-32-bit headroom for texel conversion and neighbours.
+    const float coordinate_limit=min(1e6,1e9/max(metadata.x,metadata.y));
+    bool finite=all(isfinite(uv)) && all(isfinite(dx)) && all(isfinite(dy)) && isfinite(rho) && all(abs(uv)<=coordinate_limit);
     valid=valid && finite;
     if(!finite) return 0;
+    const float minor=max(min(lx,ly),1e-6);
+    // Magnification must use the authored magnification filter without
+    // averaging an anisotropic footprint smaller than a texel.
+    const uint taps=rho>1.0 ? uint(clamp(ceil(rho/minor),1.0,8.0)) : 1;
+    const float2 major_uv=(lx>=ly ? dx : dy);
     float lod=clamp(log2(max(1.0,rho/float(taps))),0.0,metadata.z-1);
     uint lo=uint(floor(lod));uint flags=uint(metadata.w);
     float4 value=0;
     [loop] for(uint k=0;k<taps;++k) {
         const float2 at=uv+major_uv*((float(k)+0.5)/float(taps)-0.5);
+        if(!all(isfinite(at)) || any(abs(at)>coordinate_limit)) { valid=false; return 0; }
         if((flags&4)==0) value+=sample_level(slot,at,uint(floor(lod+.5)),rho>1,metadata);
         else value+=lerp(sample_level(slot,at,lo,rho>1,metadata),sample_level(slot,at,min(lo+1,uint(metadata.z)-1),rho>1,metadata),frac(lod));
     }

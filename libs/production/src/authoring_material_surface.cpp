@@ -103,15 +103,22 @@ Value sample(const BoundTexture &t, core::Vec2d uv, core::Vec2d dx, core::Vec2d 
         throw std::runtime_error(
             "texture coordinates/derivatives exceed the finite sampling bound");
     const auto &base = t.mips->levels.front();
+    // GPU addressing converts scaled coordinates to signed 32-bit texels.
+    // Keep headroom for bilinear neighbours even at the largest admitted mip.
+    const double coordinate_limit = std::min(1e6, 1e9 / std::max(base.width, base.height));
+    if (std::abs(uv.x) > coordinate_limit || std::abs(uv.y) > coordinate_limit)
+        throw std::runtime_error("texture coordinates exceed the texel conversion bound");
     const double lx = std::hypot(dx.x * base.width, dx.y * base.height),
                  ly = std::hypot(dy.x * base.width, dy.y * base.height);
     const auto rho = std::max(lx, ly);
     if (!std::isfinite(rho))
         throw std::runtime_error("texture footprint overflow");
-    // Match the existing authoring surface shader's bounded anisotropic
-    // footprint. Derived from df811a3; no shader or sampler intent is changed.
+    // Match the GPU sampler: preserve magnification, otherwise bound the
+    // elongated footprint to eight taps along its major derivative.
     const double minor = std::max(std::min(lx, ly), 1e-6);
-    const unsigned taps = static_cast<unsigned>(std::clamp(std::ceil(rho / minor), 1.0, 8.0));
+    const unsigned taps = rho > 1.0
+        ? static_cast<unsigned>(std::clamp(std::ceil(rho / minor), 1.0, 8.0))
+        : 1U;
     const core::Vec2d major = lx >= ly ? dx : dy;
     const auto last = static_cast<unsigned>(t.mips->levels.size() - 1);
     const double lod = std::clamp(std::log2(std::max(1.0, rho / taps)), 0.0, double(last));
@@ -120,10 +127,12 @@ Value sample(const BoundTexture &t, core::Vec2d uv, core::Vec2d dx, core::Vec2d 
     for (unsigned k = 0; k < taps; ++k) {
         const double offset = (double(k) + 0.5) / double(taps) - 0.5;
         const core::Vec2d at{uv.x + major.x * offset, uv.y + major.y * offset};
+        if (!at.finite() || std::abs(at.x) > coordinate_limit || std::abs(at.y) > coordinate_limit)
+            throw std::runtime_error("anisotropic sample coordinates exceed the finite sampling bound");
         const Value tap = t.sampler.mip == project::SamplerFilter::nearest
-            ? level_sample(t, static_cast<unsigned>(std::round(lod)), at, rho > 1)
-            : lerp(level_sample(t, lo, at, rho > 1),
-                level_sample(t, std::min(lo + 1, last), at, rho > 1), lod - lo);
+                              ? level_sample(t, static_cast<unsigned>(std::round(lod)), at, rho > 1)
+                              : lerp(level_sample(t, lo, at, rho > 1),
+                                     level_sample(t, std::min(lo + 1, last), at, rho > 1), lod - lo);
         for (unsigned c = 0; c < 4; ++c) value[c] += tap[c];
     }
     for (unsigned c = 0; c < 4; ++c) value[c] /= double(taps);
@@ -484,6 +493,10 @@ compile_authoring_material(const project::MaterialCatalog &catalog, render::Mate
     try {
         auto program = std::make_shared<AuthoringMaterialProgram::Impl>();
         program->source = program->base = need(catalog.resolve_material(id, variant));
+        if (program->base.transmission_map || program->base.thickness_map ||
+            program->base.anisotropy_map)
+            throw std::runtime_error(
+                "v5 texture maps for transmission, thickness and anisotropy are not supported by authoring surface programs");
         if (program->base.alpha_mode == render::AlphaMode::blended)
             throw std::runtime_error("alpha blending is not supported");
         const std::array refs{program->base.base_color, program->base.metallic_roughness,

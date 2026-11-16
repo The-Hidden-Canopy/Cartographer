@@ -27,7 +27,13 @@ void graphics_table_limits(d3d12::D3D12Device &device) {
     desc.push_constant_bytes = 216;
     for (unsigned i = 0; i < 9; ++i)
         desc.descriptor_bindings.push_back({0, i, gpu::ShaderStage::fragment});
-    const auto pipeline = take(device.create_pipeline(desc));
+    auto candidate = device.create_pipeline(desc);
+    if (!candidate) {
+        std::cerr << "D3D12 adapter: " << device.identity().adapter_name << '\n';
+        for (const auto &message : device.debug_receipts())
+            std::cerr << message << '\n';
+    }
+    const auto pipeline = take(std::move(candidate));
     device_ir::DeviceCommandStream forbidden_graphics;
     forbidden_graphics.append(device_ir::CmdBindPipeline{pipeline});
     const auto compute_draw=device.submit(forbidden_graphics,gpu::QueueType::compute);
@@ -92,10 +98,13 @@ void compare(const production::AuthoringViewportImage &cpu,
         check(cpu.faces[p] == gpu.faces[p], "GPU identity resolves authored faces");
         const auto a = cpu.linear_hdr[p], b = gpu.linear_hdr[p];
         for (auto [expected, actual] :
-             {std::pair{a.x, b.x}, std::pair{a.y, b.y}, std::pair{a.z, b.z}})
-            check(std::isfinite(actual) &&
-                      std::abs(expected - actual) < 2e-4 + std::abs(expected) * 1e-3,
-                  "GPU/CPU HDR BRDF parity");
+             {std::pair{a.x, b.x}, std::pair{a.y, b.y}, std::pair{a.z, b.z}}) {
+            if (!std::isfinite(actual) ||
+                std::abs(expected - actual) >= 2e-4 + std::abs(expected) * 1e-3)
+                throw std::runtime_error("GPU/CPU HDR BRDF parity at pixel " +
+                    std::to_string(p) + ": CPU=" + std::to_string(expected) +
+                    " GPU=" + std::to_string(actual));
+        }
         check(std::abs(cpu.depth[p] - gpu.depth[p]) < 0.003,
               "GPU depth reconstructs camera distance");
         for (std::size_t c = 0; c < 3; ++c)
@@ -130,6 +139,27 @@ void native_environment_cases(d3d12::AuthoringViewport &renderer,
               warm.geometry_upload_bytes == 0 &&
               warm.image.display_rgba8 == cold.image.display_rgba8,
           "warm environment reuses immutable source, convolution and GPU atlas");
+    auto high_request = r;
+    high_request.environment_lighting = take(production::compile_environment_lighting(
+        e, production::EnvironmentLightingQuality::high));
+    const auto high_cpu = take(production::render_authoring_viewport(f.document, high_request));
+    const auto high_gpu = take(renderer.render(source, high_request));
+    compare(high_cpu, high_gpu.image);
+    check(high_gpu.environment_upload_bytes == 256U * 335U * 16U &&
+              high_gpu.environment_resident_bytes == high_gpu.environment_upload_bytes,
+          "quality change uploads the higher-resolution atlas for the same source");
+    const auto high_warm = take(renderer.render(source, high_request));
+    check(high_warm.environment_upload_bytes == 0 &&
+              high_warm.image.display_rgba8 == high_gpu.image.display_rgba8,
+          "warm high-quality environment is stable and reused");
+    auto automatic = r;
+    automatic.environment_lighting.reset();
+    const auto restored = take(renderer.render(source, automatic));
+    compare(cpu, restored.image);
+    check(restored.environment_upload_bytes == 128U * 207U * 16U,
+          "automatic quality restores the source's standard atlas after a high-tier override");
+    check(take(renderer.render(source, r)).environment_upload_bytes == 0,
+          "an explicit matching standard product reuses the restored atlas");
     auto polar = r;
     polar.camera.reset();
     polar.view = cpu.view;
@@ -212,6 +242,47 @@ void native_environment_cases(d3d12::AuthoringViewport &renderer,
           "resident environment pixels match numeric reference under on-demand readback");
     check(take(resident.deferred_timing->resolve()).envelope_ms >= 0,
           "environment deferred GPU timing resolves after consumer fence");
+    auto detail = e;
+    detail.width = 256; detail.height = 128;
+    detail.linear_radiance.clear();
+    for (unsigned y=0; y<detail.height; ++y)
+        for (unsigned x=0; x<detail.width; ++x)
+            detail.linear_radiance.push_back({.05 + 8.0*std::pow(double(x)/detail.width, 8),
+                                              .1 + double(y)/detail.height, .3});
+    auto detail_fixture = environment_fixture(detail);
+    auto detail_request = request(detail_fixture);
+    auto detail_cpu_request = detail_request;
+    detail_cpu_request.environment_lighting = take(production::compile_environment_lighting(detail));
+    const auto detail_cpu = take(production::render_authoring_viewport(detail_fixture.document,
+                                                                       detail_cpu_request));
+    auto detail_source = std::make_shared<const project::ProjectDocument>(detail_fixture.document);
+    const auto detail_gpu = take(renderer.render(detail_source, detail_request));
+    compare(detail_cpu, detail_gpu.image);
+    check(detail_gpu.environment_upload_bytes == 256U*335U*16U &&
+              detail_gpu.environment_compile_milliseconds > 0,
+          "higher-detail source automatically compiles and uploads the high-quality atlas");
+    const auto detail_warm = take(renderer.render(detail_source, detail_request));
+    check(detail_warm.environment_upload_bytes == 0 &&
+              detail_warm.image.display_rgba8 == detail_gpu.image.display_rgba8,
+          "automatically selected high-quality environment is reused");
+    auto detail_standard = detail_request;
+    detail_standard.environment_lighting = take(production::compile_environment_lighting(
+        detail, production::EnvironmentLightingQuality::standard));
+    const auto detail_standard_cpu = take(production::render_authoring_viewport(
+        detail_fixture.document, detail_standard));
+    const auto detail_standard_gpu = take(renderer.render(detail_source, detail_standard));
+    compare(detail_standard_cpu, detail_standard_gpu.image);
+    check(detail_standard_gpu.environment_upload_bytes == 128U*207U*16U,
+          "detailed source can use the bounded standard tier");
+    const auto detail_auto_restored = take(renderer.render(detail_source, detail_request));
+    compare(detail_cpu, detail_auto_restored.image);
+    check(detail_auto_restored.environment_upload_bytes == 256U*335U*16U,
+          "automatic quality restores the high atlas after a standard-tier override");
+    std::cout << "high-detail native environment: compile_ms="
+              << detail_gpu.environment_compile_milliseconds
+              << "; upload_bytes=" << detail_gpu.environment_upload_bytes
+              << "; upload_gpu_ms=" << detail_gpu.environment_gpu_upload_milliseconds
+              << "; raster_gpu_ms=" << detail_gpu.gpu_milliseconds << '\n';
     if (!output.empty()) {
         std::filesystem::create_directories(output);
         static_cast<void>(take(f.document.save_atomic(output / "environment-gpu.carto")));
@@ -485,8 +556,17 @@ void native_surface_cases(d3d12::AuthoringViewport &renderer, const std::filesys
             take(renderer.render(f.document, r)).image);
     r.width = 96;
     r.height = 48;
-    compare(take(production::render_authoring_viewport(f.document, r)),
-            take(renderer.render(f.document, r)).image);
+    const auto isotropic = take(renderer.render(f.document, r)).image;
+    compare(take(production::render_authoring_viewport(f.document, r)), isotropic);
+    material = c.materials().at(1);
+    material.revision = material.revision.next();
+    material.definition.base_color.transform.scale = {64, .25};
+    okay(c.replace_material(material));
+    set_materials(f.document, c);
+    const auto elongated = take(renderer.render(f.document, r)).image;
+    compare(take(production::render_authoring_viewport(f.document, r)), elongated);
+    check(elongated.display_rgba8 != isotropic.display_rgba8,
+          "elongated footprint changes sampled material pixels");
     graph.revision = graph.revision.next();
     graph.nodes[2].constants[0] = 2;
     graph.outputs.roughness = 3;

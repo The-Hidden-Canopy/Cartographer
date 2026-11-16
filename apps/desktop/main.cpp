@@ -4602,10 +4602,18 @@ struct DesktopState {
         }
         action_feedback = result.value().action + " accepted at revision " +
             std::to_string(result.value().revision_after.value());
+        const bool material_import = std::holds_alternative<
+            carto::application::ImportGltfMaterialLibraryAction>(action);
+        std::size_t shown_warnings = 0;
         for(const auto& warning:result.value().warnings) {
-            if(action_feedback.size()>6000)break;
+            if(!material_import && action_feedback.size()>6000)break;
             action_feedback+="\nWarning: "+warning.message;
+            ++shown_warnings;
         }
+        if (shown_warnings < result.value().warnings.size())
+            action_feedback += "\nWarning: " +
+                std::to_string(result.value().warnings.size() - shown_warnings) +
+                " additional warnings are not shown.";
         action_feedback_error = false;
         return true;
     }
@@ -6554,7 +6562,6 @@ struct DesktopState {
                     action_feedback = imported.value().action + " accepted at revision " +
                         std::to_string(imported.value().revision_after.value());
                     for (const auto& warning : imported.value().warnings) {
-                        if (action_feedback.size() > 6'000U) break;
                         action_feedback += "\nWarning: " + warning.message;
                     }
                     workbench.assets = true;

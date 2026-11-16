@@ -364,6 +364,33 @@ void material_v5_round_trips_through_gltf(const std::filesystem::path &root) {
                   with_texture.value().losses.front().find("clearcoat textures") != std::string::npos,
               "a clearcoat texture is reported as a loss rather than silently dropped");
     }
+    {
+        application::ApplicationSession session;
+        take(application::testing::dispatch(session, application::SaveProjectAction{root / "loss-report.carto"}));
+        const auto snap = session.snapshot();
+        std::vector<std::uint8_t> source(foreign.begin(), foreign.end());
+        const auto receipt = take(application::testing::dispatch(session,
+            application::ImportGltfMaterialLibraryAction{snap.project_generation, snap.project_revision, source, true}));
+        check(std::any_of(receipt.warnings.begin(), receipt.warnings.end(), [](const auto& warning) {
+            return warning.message.find("clearcoat textures") != std::string::npos;
+        }), "material-library import surfaces clearcoat loss in its receipt");
+        const auto scene = take(io::import_gltf_scene(foreign_bytes));
+        check(std::any_of(scene.warnings.begin(), scene.warnings.end(), [](const auto& warning) {
+            return warning.find("clearcoat textures") != std::string::npos;
+        }), "scene import propagates material losses into its warnings");
+        const auto scene_path = root / "loss-scene.gltf";
+        std::ofstream output(scene_path, std::ios::binary);
+        output.write(foreign.data(), static_cast<std::streamsize>(foreign.size()));
+        output.close();
+        check(static_cast<bool>(output), "lossy scene fixture is saved");
+        application::ApplicationSession scene_session;
+        take(application::testing::dispatch(scene_session,
+            application::SaveProjectAction{root / "loss-scene.carto"}));
+        const auto scene_receipt = take(carto::testing::import_gltf_scene_file(scene_session, scene_path, true));
+        check(std::any_of(scene_receipt.warnings.begin(), scene_receipt.warnings.end(), [](const auto& warning) {
+            return warning.message.find("clearcoat textures") != std::string::npos;
+        }), "scene application receipt surfaces clearcoat loss");
+    }
 }
 
 int main(int argc, char **argv) {
@@ -465,6 +492,33 @@ int main(int argc, char **argv) {
             invalid.replace(sampler, std::string_view("\"sampler\":0").size(), "\"sampler\":1");
             check(!io::import_gltf_materials({reinterpret_cast<const std::uint8_t*>(invalid.data()), invalid.size()}),
                   "explicit out-of-range sampler cannot alias synthesized default sampler");
+        }
+        {
+            // A sampler that disables mipmapping imports with a named loss.
+            auto no_mips = read(root / "material.gltf");
+            const auto at = no_mips.find("\"minFilter\":9986");
+            check(at != std::string::npos, "sampler minFilter mutation target exists");
+            no_mips.replace(at, std::string_view("\"minFilter\":9986").size(), "\"minFilter\":9728");
+            const auto imported = io::import_gltf_materials(
+                {reinterpret_cast<const std::uint8_t*>(no_mips.data()), no_mips.size()});
+            check(static_cast<bool>(imported) && !imported.value().losses.empty() &&
+                      imported.value().losses.front().find("disables mipmapping") != std::string::npos,
+                  "a non-mipmapped sampler imports with an explicit loss instead of failing");
+            application::ApplicationSession session;
+            take(application::testing::dispatch(session,
+                application::SaveProjectAction{root / "non-mip-loss.carto"}));
+            const auto snap = session.snapshot();
+            const std::vector<std::uint8_t> source(no_mips.begin(), no_mips.end());
+            const auto receipt = take(application::testing::dispatch(session,
+                application::ImportGltfMaterialLibraryAction{snap.project_generation, snap.project_revision, source, true}));
+            check(std::any_of(receipt.warnings.begin(), receipt.warnings.end(), [](const auto& warning) {
+                return warning.message.find("disables mipmapping") != std::string::npos;
+            }), "non-mip sampler substitution is visible in the application receipt");
+            const auto scene = take(io::import_gltf_scene(
+                {reinterpret_cast<const std::uint8_t*>(no_mips.data()), no_mips.size()}));
+            check(std::any_of(scene.warnings.begin(), scene.warnings.end(), [](const auto& warning) {
+                return warning.find("disables mipmapping") != std::string::npos;
+            }), "non-mip sampler substitution is visible in scene import warnings");
         }
         for(const auto& file:{root/"material.gltf",root/"material.glb"}) {
             const auto encoded=read(file);const auto bytes=std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()),encoded.size());
@@ -683,11 +737,16 @@ int main(int argc, char **argv) {
         for(auto key:{"materials","images","textures","samplers"})
             check(member(baked_payload.json,key)==member(baked_glb.json,key),"baked GLTF/GLB payload agreement");
         check(std::any_of(baked_report.warnings.begin(),baked_report.warnings.end(),[](const auto& w){return w.find("finite-resolution")!=std::string::npos;}),"lossy bake is explicit in export receipt");
-        check(std::any_of(baked_report.warnings.begin(),baked_report.warnings.end(),[](const auto& w){return w.find("cannot reimport")!=std::string::npos;}),"baked output import limitation is explicit in export receipt");
+        check(std::any_of(baked_report.warnings.begin(),baked_report.warnings.end(),[](const auto& w){return w.find("named losses")!=std::string::npos;}),"baked output reimport losses are explicit in export receipt");
         {
             const auto data = read(root/"baked.gltf");
             const auto imported = io::import_gltf_materials({reinterpret_cast<const std::uint8_t*>(data.data()), data.size()});
-            check(!imported, "baked clearcoat and non-mip sampler are rejected instead of silently changed on import");
+            // Reimport keeps what Cartographer can represent and names the rest.
+            check(static_cast<bool>(imported) && !imported.value().losses.empty(),
+                  "baked clearcoat textures and non-mip samplers import with explicit losses, not silently");
+            const auto& losses = imported.value().losses;
+            check(std::any_of(losses.begin(), losses.end(), [](const auto& l) { return l.find("clearcoat textures") != std::string::npos; }),
+                  "the baked clearcoat texture loss is named");
         }
         const auto linear=[](std::uint8_t v){const double s=double(v)/255;return s<=.04045?s/12.92:std::pow((s+.055)/1.055,2.4);};
         for(unsigned v=0;v<2;++v) {

@@ -170,9 +170,30 @@ core::Result<void> validate(const GpuTemporalConstants& constants) {
     return core::Result<void>::success();
 }
 
+core::Result<void> validate_native_material_optics(
+    const StandardMaterial& material) {
+    // This ABI predates Material V5. Refuse authored fields that cannot be
+    // represented instead of binding a digest to constants that lost them.
+    if (material.ior != 1.5 || material.transmission != 0.0 ||
+        material.thickness != 0.0 || material.attenuation_color.x != 1.0 ||
+        material.attenuation_color.y != 1.0 || material.attenuation_color.z != 1.0 ||
+        material.attenuation_distance != 0.0 || material.anisotropy != 0.0 ||
+        material.anisotropy_rotation != 0.0 || material.transmission_map ||
+        material.thickness_map || material.anisotropy_map) {
+        return core::Result<void>::failure(
+            core::Diagnostic(core::ErrorCode::unsupported,
+                "native PBR material ABI cannot preserve authored IOR, transmission, "
+                "volume, anisotropy, or their texture maps"));
+    }
+    return core::Result<void>::success();
+}
+
 core::Result<GpuMaterialConstants> pack_material_for_gpu(
     const StandardMaterial& material) {
     if (auto result = material.validate(); !result) {
+        return core::Result<GpuMaterialConstants>::failure(result.error());
+    }
+    if (auto result = validate_native_material_optics(material); !result) {
         return core::Result<GpuMaterialConstants>::failure(result.error());
     }
     for (const TextureRef* binding : {

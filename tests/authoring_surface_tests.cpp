@@ -47,13 +47,8 @@ void sampling_and_failure_atomicity() {
     auto program = compile(c, l);
     near(at(program, .5).material.base_color_factor.x,
          .5); // linear-light bilinear, not sRGB .5 decoded
-    // Equal two-texel footprint lengths select mip 1 with one tap.
-    auto mip = at(program, .23, .5, {1, 0}, {0, 2});
+    auto mip = at(program, .23, .5, {2, 0}, {0, 2});
     near(mip.material.base_color_factor.x, std::pow((188.0 / 255 + .055) / 1.055, 2.4));
-    // Eight bilinear taps across a one-texel-wide, zero-height footprint at
-    // the black texel center average the surrounding black/white ramp to .25.
-    // An isotropic single center lookup would incorrectly return zero.
-    near(at(program, .25, .5, {.5, 0}).material.base_color_factor.x, .25);
     check(program.texture_bytes() == 12 && l.resident_bytes() == 20,
           "decoded and mip budgets counted separately");
     auto malformed = p.encoded;
@@ -78,6 +73,39 @@ void sampling_and_failure_atomicity() {
     check(!program.evaluate({{std::numeric_limits<double>::infinity(), 0}, {}, {}}),
           "nonfinite UV rejected");
     check(!program.evaluate({{1e7, 0}, {}, {}}), "coordinate bound enforced");
+}
+void anisotropic_minification_preserves_magnification() {
+    auto p = pixels(30, 8, 1, {{0, 0, 0, 255}, {255, 255, 255, 255},
+        {0, 0, 0, 255}, {0, 0, 0, 255}, {0, 0, 0, 255}, {0, 0, 0, 255},
+        {255, 255, 255, 255}, {0, 0, 0, 255}});
+    production::AuthoringTextureLibrary library;
+    okay(library.admit(p.record, p.encoded));
+    auto catalog = mapped_catalog(p);
+    project::SamplerIntent sampler;
+    sampler.id = 30;
+    sampler.name = "Nearest footprint test";
+    sampler.minification = sampler.magnification = sampler.mip = project::SamplerFilter::nearest;
+    okay(catalog.insert_sampler(sampler));
+    auto material = catalog.materials().at(1).definition;
+    material.base_color.sampler = sampler.id;
+    replace(catalog, material);
+    const auto program = compile(catalog, library);
+    near(at(program, .5, .5, {.5, 0}, {0, .01}).material.base_color_factor.x, 0);
+    near(at(program, .125, .5, {.1, 0}, {}).material.base_color_factor.x, 1);
+    check(!program.evaluate({{.5, .5}, {1e8, 0}, {}}),
+          "oversized anisotropic tap coordinates fail before texel conversion");
+
+    auto wide = pixels(31, 1, 1, {{0, 0, 0, 255}});
+    wide.encoded.resize(18 + 4096 * 4, 0);
+    wide.encoded[12] = 0;
+    wide.encoded[13] = 16;
+    wide.record.width = 4096;
+    wide.record.content_digest = assets::sha256(wide.encoded);
+    production::AuthoringTextureLibrary wide_library;
+    okay(wide_library.admit(wide.record, wide.encoded));
+    const auto wide_program = compile(mapped_catalog(wide), wide_library);
+    check(!wide_program.evaluate({{300000, .5}, {}, {}}),
+          "4K texture coordinates cannot overflow GPU signed texel addressing");
 }
 void sampler_identity_transform_and_data() {
     auto p = pixels(2, 2, 1, {{128, 64, 32, 255}, {255, 128, 64, 255}});
@@ -358,6 +386,15 @@ void perspective_uv_raster() {
 }
 void gpu_packet_contract() {
     auto c = fixture().document.material_catalog();
+    auto glass = c.materials().at(1).definition;
+    glass.transmission = .8;
+    glass.ior = 1.52;
+    glass.thickness = .003;
+    glass.attenuation_distance = .01;
+    glass.attenuation_color = {.7, .4, .2};
+    glass.anisotropy = .6;
+    glass.anisotropy_rotation = .7;
+    replace(c, glass);
     auto g = surface_graph();
     okay(c.insert_material_graph(g));
     okay(c.bind_material_graph(1, g.identity));
@@ -366,6 +403,15 @@ void gpu_packet_contract() {
     check(packet.words.size() % 32 == 0 && packet.words[0][0] == 2 && packet.words[0][3] <= 32,
           "native packet version, row alignment and register bound");
     check(packet.words.size() * 16 <= 6656, "bounded native packet payload");
+    near(packet.words[24][0], .8, 1e-6);
+    near(packet.words[24][1], 1.52, 1e-6);
+    near(packet.words[24][2], .003, 1e-6);
+    near(packet.words[24][3], .01, 1e-6);
+    near(packet.words[25][0], .7, 1e-6);
+    near(packet.words[25][1], .4, 1e-6);
+    near(packet.words[25][2], .2, 1e-6);
+    near(packet.words[25][3], .6, 1e-6);
+    near(packet.words[26][0], .7, 1e-6);
     // Decode the packed register machine independently of the CPU graph's
     // node-ID evaluator. This catches last-use reuse and output-register bugs.
     for (float u : {.1F, .3F, .7F, .9F}) {
@@ -513,15 +559,56 @@ void gpu_packet_contract() {
               take(compile(c, library).gpu_packet()).digest == textured.digest,
           "failed admission retains prior good GPU packet and authored source");
 }
+void unsupported_v5_texture_maps_are_rejected() {
+    auto catalog = fixture().document.material_catalog();
+    const auto source = pixels(82, 1, 1, {{255, 128, 64, 255}});
+    okay(catalog.insert_texture(source.record));
+    auto material = catalog.materials().at(1).definition;
+    material.transmission = .8;
+    material.thickness = .01;
+    material.anisotropy = .5;
+    replace(catalog, material);
+    check(bool(production::compile_authoring_material(catalog, 1)),
+          "scalar-only v5 material remains executable");
+    production::AuthoringTextureLibrary admitted;
+    okay(admitted.admit(source.record, source.encoded));
+    // These slots have no evaluator yet. Both missing and admitted pixels must
+    // fail explicitly rather than silently dropping an authored texture map.
+    const std::array refs{&render::StandardMaterial::transmission_map,
+                          &render::StandardMaterial::thickness_map,
+                          &render::StandardMaterial::anisotropy_map};
+    const std::array names{"transmission", "thickness", "anisotropy"};
+    std::string accepted;
+    for (std::size_t i = 0; i < refs.size(); ++i) {
+        auto with_map = material;
+        (with_map.*refs[i]).asset = source.record.id;
+        replace(catalog, with_map);
+        const auto missing = production::compile_authoring_material(catalog, 1);
+        const auto available = production::compile_authoring_material(catalog, 1, {}, &admitted);
+        if (!missing)
+            check(missing.error().message.find("v5 texture maps") != std::string::npos,
+                  "missing map failure identifies the unsupported v5 texture path");
+        if (!available)
+            check(available.error().message.find("v5 texture maps") != std::string::npos,
+                  "admitted map failure identifies the unsupported v5 texture path");
+        if (missing || available) {
+            if (!accepted.empty()) accepted += ", ";
+            accepted += names[i];
+        }
+    }
+    check(accepted.empty(), ("unsupported v5 texture maps were silently accepted: " + accepted).c_str());
+}
 } // namespace
 int main() {
     try {
         sampling_and_failure_atomicity();
+        anisotropic_minification_preserves_magnification();
         sampler_identity_transform_and_data();
         executable_uv_graphs();
         masked_raster_normal_and_reopen();
         perspective_uv_raster();
         gpu_packet_contract();
+        unsupported_v5_texture_maps_are_rejected();
         std::cout << "authoring surface CPU: linear sampling/mips, sampler/UV "
                      "identity, failure atomicity, executable UV/texture graphs, "
                      "mask/depth/picking, normal conventions and reopen passed\n";

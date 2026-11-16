@@ -124,6 +124,10 @@ ApplicationSession::import_gltf_material_library(const ImportGltfMaterialLibrary
         auto receipt = execute_command(std::make_unique<editor::ReplaceProjectDocumentCommand>(
                                            admission, document_, std::move(candidate), label),
                                        label + " " + imported.value().artifact_digest.hex(), {});
+        if (receipt) {
+            for (const auto &loss : imported.value().losses)
+                receipt.value().warnings.emplace_back(core::ErrorCode::unsupported, loss);
+        }
         return receipt;
     } catch (const std::exception &e) {
         return failure({core::ErrorCode::validation_failed, e.what()});
