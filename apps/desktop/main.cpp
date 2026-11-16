@@ -12391,13 +12391,15 @@ struct DesktopState {
             request.temporal.session = snapshot.project_generation;
 #endif
             const double scale = std::array{1.0, 0.5, 0.25}[static_cast<std::size_t>(material_viewport_scale)];
-#if defined(CARTO_DESKTOP_D3D12_VIEWPORT) || defined(CARTO_DESKTOP_ASYNC_READBACK) || defined(CARTO_DESKTOP_RESIDENT_WORKER)
-            constexpr std::uint64_t max_viewport_pixels = carto::d3d12::kAuthoringViewportMaxPixels;
-#else
-            // The CPU reference renderer has a separate one-megapixel budget.
-            constexpr std::uint64_t max_viewport_pixels = 1'048'576ULL;
+            std::uint64_t max_pixels = carto::production::kAuthoringCpuMaxPixels;
+#if defined(CARTO_DESKTOP_ASYNC_READBACK) || defined(CARTO_DESKTOP_RESIDENT_WORKER)
+            max_pixels = carto::production::kAuthoringNativeMaxPixels;
 #endif
-            constexpr double max_readback_pixels = static_cast<double>(max_viewport_pixels);
+#ifdef CARTO_DESKTOP_D3D12_VIEWPORT
+            max_pixels = material_viewport_cpu_reference ? carto::production::kAuthoringCpuMaxPixels
+                : carto::production::kAuthoringNativeMaxPixels;
+#endif
+            const double max_readback_pixels = static_cast<double>(max_pixels);
             // Clamp both dimensions before multiplication/conversion, then
             // scale proportionally and retain the canvas aspect in the view.
             const double requested_width = std::clamp(static_cast<double>(extent.x) * scale,
@@ -12405,11 +12407,12 @@ struct DesktopState {
             const double requested_height = std::clamp(static_cast<double>(extent.y) * scale,
                 1.0, max_readback_pixels);
             const double limit_scale = std::min(1.0,
-                std::sqrt(max_readback_pixels / (requested_width * requested_height)));
+                std::min(std::sqrt(max_readback_pixels / (requested_width * requested_height)),
+                    double(carto::production::kAuthoringNativeMaxDimension) / std::max(requested_width, requested_height)));
             request.width = static_cast<std::uint32_t>(std::max(1.0, std::floor(requested_width * limit_scale)));
             request.height = static_cast<std::uint32_t>(std::max(1.0, std::floor(requested_height * limit_scale)));
-            if (std::uint64_t(request.width) * request.height > max_viewport_pixels)
-                request.width = static_cast<std::uint32_t>(max_viewport_pixels / request.height);
+            if (std::uint64_t(request.width) * request.height > max_pixels)
+                request.width = static_cast<std::uint32_t>(max_pixels / request.height);
             const bool render_extent_capped = limit_scale < 1.0 ||
                 static_cast<double>(extent.x) * scale > max_readback_pixels ||
                 static_cast<double>(extent.y) * scale > max_readback_pixels;

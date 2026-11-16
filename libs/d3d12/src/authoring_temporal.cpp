@@ -10,7 +10,7 @@
 namespace carto::d3d12 {
 namespace {
 bool bounded(unsigned w, unsigned h) {
-    return w && h && w <= 4096 && h <= 4096 && std::uint64_t(w) * h <= 1048576;
+    return production::valid_authoring_native_extent(w, h);
 }
 core::Diagnostic invalid(const char *s) { return {core::ErrorCode::invalid_argument, s}; }
 } // namespace

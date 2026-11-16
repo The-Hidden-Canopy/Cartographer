@@ -11,6 +11,21 @@
 
 namespace carto::production {
 
+// CPU reference attachments use doubles and multiple history copies. Keep that
+// path at its established 1M limit; native temporal targets have a separate
+// bounded 4K budget. 128 bytes/pixel reserves <=1 GiB for native frame/history
+// attachments at the admitted extent (material/source budgets are separate).
+inline constexpr std::uint64_t kAuthoringCpuMaxPixels = 1'048'576ULL;
+inline constexpr std::uint64_t kAuthoringNativeMaxPixels = 3840ULL * 2160ULL;
+inline constexpr std::uint32_t kAuthoringNativeMaxDimension = 4096;
+inline constexpr std::uint64_t kAuthoringNativeAttachmentBudget = 1024ULL * 1024ULL * 1024ULL;
+[[nodiscard]] constexpr bool valid_authoring_native_extent(std::uint32_t w, std::uint32_t h) noexcept {
+    const auto pixels = std::uint64_t(w) * h;
+    return w && h && w <= kAuthoringNativeMaxDimension && h <= kAuthoringNativeMaxDimension &&
+        pixels <= kAuthoringNativeMaxPixels && pixels <= kAuthoringNativeAttachmentBudget / 128ULL;
+}
+
+
 // A bounded reference rasterizer for the authoring viewport. This is CPU
 // execution, not a GPU renderer or a complete lighting implementation.
 struct AuthoringView {

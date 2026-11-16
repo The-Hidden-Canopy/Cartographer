@@ -187,6 +187,13 @@ int main() {
         check(take(d3d12::prepare_authoring_temporal(epoch, epoch, true, true))
                       .constants.extent_flags[3] == 1,
               "camera cut reaches shader contract");
+        auto native4k = epoch;
+        native4k.width = 3840; native4k.height = 2160;
+        check(bool(d3d12::prepare_authoring_temporal(native4k, native4k, false, false)),
+              "native 4K temporal contract fits explicit attachment budget");
+        native4k.height = 2161;
+        check(!d3d12::prepare_authoring_temporal(native4k, native4k, false, false),
+              "one row beyond 4K budget rejects before allocation");
         auto invalid = epoch;
         invalid.width = 4097;
         check(!d3d12::prepare_authoring_temporal(invalid, epoch, false, false),

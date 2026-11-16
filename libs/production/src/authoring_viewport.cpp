@@ -128,7 +128,7 @@ render_reference(const project::ProjectDocument &document, const AuthoringViewpo
         return Result::success(std::move(image));
     if (auto valid = request.shadows.validate(); !valid)
         return Result::failure(valid.error());
-    constexpr std::uint64_t max_pixels = 1'048'576U;
+    constexpr std::uint64_t max_pixels = kAuthoringCpuMaxPixels;
     constexpr std::uint64_t max_visits = 16'777'216U;
     const std::uint64_t count = std::uint64_t(request.width) * request.height;
     const auto display = resolve_authoring_display(document, request);
