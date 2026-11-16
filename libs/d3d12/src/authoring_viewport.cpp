@@ -1826,7 +1826,7 @@ core::Result<AuthoringGpuFrame> AuthoringViewport::render_impl(
             return core::Result<AuthoringGpuFrame>::success(std::move(frame));
         }
         const auto display = need(production::resolve_authoring_display(source, request));
-        if (std::uint64_t(request.width) * request.height > 1048576U)
+        if (std::uint64_t(request.width) * request.height > kAuthoringViewportMaxPixels)
             throw std::runtime_error("GPU viewport extent/display budget invalid");
         if(request.temporal.enabled) {
             need(request.temporal.settings.validate());

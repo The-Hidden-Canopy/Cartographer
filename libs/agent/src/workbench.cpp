@@ -533,14 +533,17 @@ bool same_material_texture_dependencies(
     return left.base_color == right.base_color &&
         left.metallic_roughness == right.metallic_roughness &&
         left.normal == right.normal && left.occlusion == right.occlusion &&
-        left.emissive == right.emissive;
+        left.emissive == right.emissive && left.transmission_map == right.transmission_map &&
+        left.thickness_map == right.thickness_map && left.anisotropy_map == right.anisotropy_map;
 }
 
 bool material_has_texture_dependencies(const render::StandardMaterial& material) noexcept {
     return static_cast<bool>(material.base_color) ||
         static_cast<bool>(material.metallic_roughness) ||
         static_cast<bool>(material.normal) || static_cast<bool>(material.occlusion) ||
-        static_cast<bool>(material.emissive);
+        static_cast<bool>(material.emissive) ||
+        static_cast<bool>(material.transmission_map) || static_cast<bool>(material.thickness_map) ||
+        static_cast<bool>(material.anisotropy_map);
 }
 
 bool material_uses_texture(
@@ -564,6 +567,10 @@ bool same_material_surface_definition(
         left.dielectric_f0 == right.dielectric_f0 &&
         left.clearcoat == right.clearcoat &&
         left.clearcoat_roughness == right.clearcoat_roughness &&
+        left.ior == right.ior && left.transmission == right.transmission &&
+        left.thickness == right.thickness && same_vec3d(left.attenuation_color, right.attenuation_color) &&
+        left.attenuation_distance == right.attenuation_distance &&
+        left.anisotropy == right.anisotropy && left.anisotropy_rotation == right.anisotropy_rotation &&
         left.alpha_mode == right.alpha_mode && left.alpha_cutoff == right.alpha_cutoff;
 }
 

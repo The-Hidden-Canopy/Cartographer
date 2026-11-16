@@ -8515,6 +8515,27 @@ core::Result<AgentProjectMergeView> UiController::compare_agent_project_merge() 
                 append_definition_transition("clearcoat roughness", [](const auto& definition) {
                     return definition.clearcoat_roughness;
                 }, number_text);
+                append_definition_transition("IOR", [](const auto& definition) {
+                    return definition.ior;
+                }, number_text);
+                append_definition_transition("transmission", [](const auto& definition) {
+                    return definition.transmission;
+                }, number_text);
+                append_definition_transition("thickness", [](const auto& definition) {
+                    return definition.thickness;
+                }, number_text);
+                append_definition_transition("absorption colour", [](const auto& definition) {
+                    return definition.attenuation_color;
+                }, vec3_text);
+                append_definition_transition("absorption distance", [](const auto& definition) {
+                    return definition.attenuation_distance;
+                }, number_text);
+                append_definition_transition("anisotropy", [](const auto& definition) {
+                    return definition.anisotropy;
+                }, number_text);
+                append_definition_transition("anisotropy rotation", [](const auto& definition) {
+                    return definition.anisotropy_rotation;
+                }, number_text);
                 append_definition_transition("alpha mode", [](const auto& definition) {
                     return definition.alpha_mode;
                 }, alpha_mode_text);

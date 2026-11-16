@@ -1,4 +1,6 @@
-// Independent bounded authoring-material interpreter, packet ABI v1.
+// Independent bounded authoring-material interpreter, packet ABI v2
+// (v2: words 24..27 carry transmission, volume and anisotropy; instructions
+// start at word 28).
 // Exact sampler intent is evaluated per map. Typed sRGB Load decodes texels
 // before manual filtering; data/normal resources use linear UNORM views.
 Texture2D<float4> base_color_texture : register(t0);
@@ -44,15 +46,24 @@ float4 sample_map(uint slot, float2 uv, float2 dx, float2 dy, inout bool valid) 
     float4 transform=program_word(5+slot*4), rotation=program_word(6+slot*4);
     uv=rotate_uv((uv-rotation.zw)*transform.zw,rotation.xy)+rotation.zw+transform.xy;
     dx=rotate_uv(dx*transform.zw,rotation.xy);dy=rotate_uv(dy*transform.zw,rotation.xy);
-    float rho=max(length(dx*metadata.xy),length(dy*metadata.xy));
+    const float2 ax=dx*metadata.xy, ay=dy*metadata.xy;
+    const float lx=length(ax), ly=length(ay);
+    float rho=max(lx,ly);
+    const float minor=max(min(lx,ly),1e-6);
+    const uint taps=uint(clamp(ceil(rho/minor),1.0,8.0));
+    const float2 major_uv=(lx>=ly ? dx : dy);
     bool finite=all(isfinite(uv)) && all(isfinite(dx)) && all(isfinite(dy)) && isfinite(rho) && all(abs(uv)<=1e6);
     valid=valid && finite;
     if(!finite) return 0;
-    float lod=clamp(log2(max(1.0,rho)),0.0,metadata.z-1);
+    float lod=clamp(log2(max(1.0,rho/float(taps))),0.0,metadata.z-1);
     uint lo=uint(floor(lod));uint flags=uint(metadata.w);
-    float4 value;
-    if((flags&4)==0) value=sample_level(slot,uv,uint(floor(lod+.5)),rho>1,metadata);
-    else value=lerp(sample_level(slot,uv,lo,rho>1,metadata),sample_level(slot,uv,min(lo+1,uint(metadata.z)-1),rho>1,metadata),frac(lod));
+    float4 value=0;
+    [loop] for(uint k=0;k<taps;++k) {
+        const float2 at=uv+major_uv*((float(k)+0.5)/float(taps)-0.5);
+        if((flags&4)==0) value+=sample_level(slot,at,uint(floor(lod+.5)),rho>1,metadata);
+        else value+=lerp(sample_level(slot,at,lo,rho>1,metadata),sample_level(slot,at,min(lo+1,uint(metadata.z)-1),rho>1,metadata),frac(lod));
+    }
+    value/=float(taps);
     uint4 mapping=uint4(program_word(7+slot*4));float4 mapped;
     [unroll] for(uint c=0;c<4;++c) {
         uint channel=mapping[c];
@@ -66,6 +77,8 @@ struct EvaluatedMaterial {
     float4 base;
     float3 emission, tangent_normal;
     float roughness, metallic, coat, coat_roughness, ao;
+    float transmission, ior, thickness, attenuation_distance, anisotropy, anisotropy_rotation;
+    float3 attenuation_color;
     bool normal_mapped, valid;
 };
 EvaluatedMaterial evaluate_material(float2 uv,float4 base,float3 emission,float4 factors,float f0) {
@@ -73,14 +86,18 @@ EvaluatedMaterial evaluate_material(float2 uv,float4 base,float3 emission,float4
     m.base=base;m.emission=emission;m.metallic=factors.x;m.roughness=factors.y;
     m.coat=program_word(3).x;m.coat_roughness=program_word(3).y;m.ao=1;
     m.tangent_normal=float3(0,0,1);m.normal_mapped=false;m.valid=true;
+    {float4 v5a=program_word(24),v5b=program_word(25),v5c=program_word(26);
+     m.transmission=saturate(v5a.x);m.ior=clamp(v5a.y,1.0,4.0);m.thickness=max(v5a.z,0.0);
+     m.attenuation_distance=max(v5a.w,0.0);m.attenuation_color=saturate(v5b.rgb);
+     m.anisotropy=saturate(v5b.w);m.anisotropy_rotation=v5c.x;}
     float2 ux=ddx(uv),uy=ddy(uv);
     float4 r[32],rx[32],ry[32];
     float4 header=program_word(0);
     [loop] for(uint i=0;i<uint(header.y);++i) {
-        uint4 instruction=uint4(program_word(24+i*3)), slots=uint4(program_word(25+i*3));
+        uint4 instruction=uint4(program_word(28+i*3)), slots=uint4(program_word(29+i*3));
         float4 value=0,dx=0,dy=0;
         uint op=instruction.x,parameter=instruction.z;
-        if(op<2) value=program_word(26+i*3);
+        if(op<2) value=program_word(30+i*3);
         else if(op==2 || op==3) {
             if(parameter==0) value=base;
             else if(parameter==1) value=float4(emission,1);
