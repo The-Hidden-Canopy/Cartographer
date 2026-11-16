@@ -66,6 +66,22 @@ int main() {
         check(warm.material_upload_bytes == 0, "4K texture is reused on warm frame");
         check(cold.image.display_rgba8 == warm.image.display_rgba8,
               "4K texture produces stable displayed pixels");
+        {
+            auto full = r;
+            full.width = 3840;
+            full.height = 2160;
+            full.temporal.enabled = true;
+            full.temporal.session = 1;
+            const auto frame = take(renderer->render_resident(source, full));
+            check(bool(frame.resident_image) && frame.image.width == full.width &&
+                      frame.image.height == full.height && frame.material_upload_bytes == 0,
+                  "4K texture and temporal 4K target coexist and reuse the texture");
+            std::cout << "4K textured temporal target: logical_resident_bytes="
+                      << frame.logical_resident_bytes << "; raster_gpu_ms="
+                      << frame.gpu_milliseconds << "; temporal_motion_gpu_ms="
+                      << frame.gpu_temporal_motion_ms << "; temporal_resolve_gpu_ms="
+                      << frame.gpu_temporal_resolve_ms << '\n';
+        }
         // The same source has different linear and sRGB semantic mip artifacts.
         // Two full 4K chains exceed the bounded material payload admission.
         material.revision = material.revision.next();
