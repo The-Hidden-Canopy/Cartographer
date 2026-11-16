@@ -10,6 +10,7 @@
 #endif
 #include <carto/journal/journal.hpp>
 #include <carto/project/recovery.hpp>
+#include <carto/project/transaction.hpp>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -99,11 +100,81 @@ void malformed_v2(const std::filesystem::path& root) {
         check(!project::recover_latest_snapshot(journal), "malformed V2 metadata refused");
     }
 }
+
+void transaction_journal_open(const std::filesystem::path& root) {
+    using namespace application;
+    const auto path = root / "transaction.carto";
+    auto document = project::ProjectDocument::create("transaction");
+    check(bool(document), "transaction project");
+    journal::Journal journal(std::filesystem::path(path.string() + ".journal"));
+    const auto initial = document.value().serialize();
+    const auto checkpoint = "CARTOGRAPHER_PROJECT_SNAPSHOT_V1\ndocument_bytes=" +
+        std::to_string(initial.size()) + "\n" + initial;
+    check(bool(journal.append({{}, document.value().revision(), "cartographer.snapshot",
+        {reinterpret_cast<const std::uint8_t*>(checkpoint.data()), checkpoint.size()}, {}})), "initial journal");
+    auto tx = project::ProjectTransaction::begin(document.value(), journal, "artist");
+    check(bool(tx) && bool(tx.value().create_object("fur")), "transaction edit");
+    check(bool(tx.value().commit("study.fur")), "transaction commit");
+    check(bool(document.value().save_atomic(path)), "transaction save");
+    const auto before = journal.read_all();
+    check(before && before.value().back().event_type == "study.fur", "transaction event retained");
+    ApplicationSession session;
+    check(bool(HumanApplicationAccess::dispatch(session, OpenProjectAction{path})), "open transaction journal");
+    check(bool(HumanApplicationAccess::dispatch(session, CreateBoxAction{"continued", {1,1,1}})),
+        "edit after transaction open");
+    const auto after = journal.read_all();
+    check(after && after.value().size() == before.value().size()+1 &&
+        after.value()[before.value().size()-1].payload == before.value().back().payload &&
+        after.value().back().event_type == "cartographer.application_action", "journal lineage retained");
+    check(bool(HumanApplicationAccess::dispatch(session, SaveProjectAction{})), "save continued edit");
+    ApplicationSession reopened;
+    check(bool(HumanApplicationAccess::dispatch(reopened, OpenProjectAction{path})), "reopen continued edit");
+    check(reopened.snapshot().project_revision == session.snapshot().project_revision,
+        "continued project revision preserved");
+}
+
+void malformed_transaction_open(const std::filesystem::path& root) {
+    using namespace application;
+    const std::vector<std::pair<std::string,std::string>> cases{
+        {"actor=\noperation=study.fur\n", "study.fur"},
+        {"actor=bad\tactor\noperation=study.fur\n", "study.fur"},
+        {"actor=" + std::string(257,'a') + "\noperation=study.fur\n", "study.fur"},
+        {"actor=artist\noperation=other\n", "study.fur"},
+        {"actor=artist\noperation=study.fur\nextra=bad\n", "study.fur"},
+        {"actor=artist\noperation=study.fur\n", "cartographer.application_action"}};
+    for (std::size_t i=0; i<cases.size(); ++i) {
+        auto document = project::ProjectDocument::create("invalid transaction");
+        check(bool(document), "invalid transaction project");
+        const auto path = root / ("invalid-transaction-"+std::to_string(i)+".carto");
+        check(bool(document.value().save_atomic(path)), "save invalid transaction fixture");
+        const auto snapshot = document.value().serialize();
+        const auto payload = "CARTOGRAPHER_PROJECT_TRANSACTION_V1\n"+cases[i].first+
+            "document_bytes="+std::to_string(snapshot.size())+"\n"+snapshot;
+        journal::Journal journal(std::filesystem::path(path.string()+".journal"));
+        check(bool(journal.append({{},document.value().revision(),cases[i].second,
+            {reinterpret_cast<const std::uint8_t*>(payload.data()),payload.size()}, {}})), "append malformed transaction");
+        ApplicationSession session;
+        check(!HumanApplicationAccess::dispatch(session,OpenProjectAction{path}), "invalid transaction refused");
+    }
+    auto saved = project::ProjectDocument::create("saved");
+    auto other = project::ProjectDocument::create("different same-revision document");
+    check(saved && other && saved.value().revision() == other.value().revision(), "stale fixture");
+    const auto path = root / "stale-transaction.carto";
+    check(bool(saved.value().save_atomic(path)), "save stale fixture");
+    const auto snapshot = other.value().serialize();
+    const auto payload = "CARTOGRAPHER_PROJECT_TRANSACTION_V1\nactor=artist\noperation=study.fur\n"
+        "document_bytes=" + std::to_string(snapshot.size()) + "\n" + snapshot;
+    journal::Journal journal(std::filesystem::path(path.string()+".journal"));
+    check(bool(journal.append({{},saved.value().revision(),"study.fur",
+        {reinterpret_cast<const std::uint8_t*>(payload.data()),payload.size()}, {}})), "append stale snapshot");
+    ApplicationSession session;
+    check(!HumanApplicationAccess::dispatch(session,OpenProjectAction{path}), "same-revision different snapshot refused");
+}
 }
 int main() {
     const auto dir = std::filesystem::temp_directory_path() /
         ("carto-provenance-sprint2-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    try { std::filesystem::create_directories(dir); legacy_recovery(dir); human_attribution_gate(dir); malformed_v2(dir); std::filesystem::remove_all(dir); }
+    try { std::filesystem::create_directories(dir); legacy_recovery(dir); human_attribution_gate(dir); malformed_v2(dir); transaction_journal_open(dir); malformed_transaction_open(dir); std::filesystem::remove_all(dir); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
     catch (...) { std::cerr << "unknown provenance test failure\n"; return 1; }
     return 0;
