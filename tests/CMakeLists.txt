@@ -2496,3 +2496,11 @@ add_executable(cartographer_authoring_viewport_budget_tests authoring_viewport_b
 target_link_libraries(cartographer_authoring_viewport_budget_tests PRIVATE carto_production)
 carto_target(cartographer_authoring_viewport_budget_tests)
 add_test(NAME cartographer_authoring_viewport_budget_tests COMMAND cartographer_authoring_viewport_budget_tests)
+
+if(CARTO_ENABLE_D3D12)
+    add_executable(cartographer_authoring_native_4k_tests authoring_native_4k_tests.cpp)
+    target_link_libraries(cartographer_authoring_native_4k_tests PRIVATE carto_d3d12_viewport)
+    carto_target(cartographer_authoring_native_4k_tests)
+    add_test(NAME cartographer_authoring_native_4k_tests COMMAND cartographer_authoring_native_4k_tests)
+    set_tests_properties(cartographer_authoring_native_4k_tests PROPERTIES TIMEOUT 120 LABELS "GPU")
+endif()
