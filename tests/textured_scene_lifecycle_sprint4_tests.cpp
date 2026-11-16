@@ -318,8 +318,12 @@ int main() {
     std::cout << "SKIP: textured glTF fixture needs the supported Windows image decoder\n";
     return 0;
 #else
-    const auto root=std::filesystem::temp_directory_path()/
+    auto root=std::filesystem::temp_directory_path()/
         ("carto-textured-lifecycle-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    // Native source blobs include SHA-256 fanout; sandbox temp roots can make
+    // those paths exceed MAX_PATH even though import itself uses long paths.
+    if (root.native().rfind(L"\\\\?\\", 0) != 0)
+        root = std::filesystem::path(L"\\\\?\\" + std::filesystem::absolute(root).native());
     try {
         std::filesystem::create_directories(root);
         lifecycle(root);
