@@ -672,9 +672,11 @@ ai::Context make_ai_context(
         ai::effect_mask(ai::CapabilityEffect::geometry) |
         ai::effect_mask(ai::CapabilityEffect::topology)) {
     auto ontology = ai::build_operation_ontology(snapshot.tools);
-    // Slide is exposed only in the bounded workbench, with ghost review,
+    // Slide and edge split are exposed only in the bounded workbench, with ghost review,
     // shared-instance scope, effect budgets and project-generation fencing.
-    std::erase_if(ontology, [](const auto& operation) { return operation.id == "mesh.slide-vertex"; });
+    std::erase_if(ontology, [](const auto& operation) {
+        return operation.id == "mesh.slide-vertex" || operation.id == "mesh.split-edge";
+    });
     return ai::Context{
         snapshot.project_revision,
         authoring,
@@ -3986,9 +3988,14 @@ core::Result<void> UiController::queue_agent_step(
         authoring.value().vertices.size() == 1U) {
         target.object = *authoring.value().component_object;
         target.component = authoring.value().vertices.front();
+    } else if (authoring.value().selection_mode == editor::SelectionMode::edge &&
+        authoring.value().component_object.has_value() &&
+        authoring.value().edges.size() == 1U) {
+        target.object = *authoring.value().component_object;
+        target.component = authoring.value().edges.front();
     } else {
         return core::Result<void>::failure(invalid_state(
-            "capture one selected object, face, or vertex for each agent plan step"));
+            "capture one selected object, face, vertex, or edge for each agent plan step"));
     }
 
     agent::AgentPlanStep step{

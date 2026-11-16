@@ -230,6 +230,8 @@ assets::Sha256Digest clarification_plan_context_digest(const AgentPlan& plan) {
             append_number(canonical, face->value);
         } else if (const auto* vertex = std::get_if<geometry::VertexId>(&step.target.component)) {
             append_number(canonical, vertex->value);
+        } else if (const auto* edge = std::get_if<geometry::EdgeId>(&step.target.component)) {
+            append_number(canonical, edge->value);
         }
         append_field(canonical, step.intent);
         auto dependencies = step.dependencies;
@@ -4283,6 +4285,9 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
                    std::get_if<geometry::VertexId>(&step.target.component)) {
         select_mode = application::SetSelectionModeAction{editor::SelectionMode::vertex};
         select_component = application::SelectVertexAction{step.target.object, *vertex};
+    } else if (const auto* edge = std::get_if<geometry::EdgeId>(&step.target.component)) {
+        select_mode = application::SetSelectionModeAction{editor::SelectionMode::edge};
+        select_component = application::SelectEdgeAction{step.target.object, *edge};
     } else {
         return fail(invalid("plan target component is not a supported native operation target"));
     }

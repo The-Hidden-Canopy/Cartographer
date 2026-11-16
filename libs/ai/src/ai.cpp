@@ -145,6 +145,7 @@ std::string preview_name(editor::PreviewKind kind) {
     case editor::PreviewKind::inset_face: return "inset_face";
     case editor::PreviewKind::set_vertex_position: return "set_vertex_position";
     case editor::PreviewKind::slide_vertex: return "slide_vertex";
+    case editor::PreviewKind::split_edge: return "split_edge";
     case editor::PreviewKind::poke_face: return "poke_face";
     case editor::PreviewKind::set_material_region_assignment:
         return "set_material_region_assignment";
@@ -683,6 +684,13 @@ core::Result<void> Proposal::validate(const Context& expected) const {
             return core::Result<void>::failure(invalid_state(
                 "face proposal requires exactly one object-bound selected face"));
         }
+    } else if (preview_kind == editor::PreviewKind::split_edge) {
+        if (expected.authoring.selection_mode != editor::SelectionMode::edge ||
+            expected.authoring.edges.size() != 1U ||
+            !expected.authoring.component_object.has_value()) {
+            return core::Result<void>::failure(invalid_state(
+                "edge proposal requires exactly one object-bound selected edge"));
+        }
     } else if (preview_kind == editor::PreviewKind::set_vertex_position ||
         preview_kind == editor::PreviewKind::slide_vertex) {
         if (expected.authoring.selection_mode != editor::SelectionMode::vertex ||
@@ -781,7 +789,9 @@ std::vector<OperationDescriptor> build_operation_ontology(
             descriptor.kernel_operation = "geometry.EditableMesh.split_edge";
             descriptor.parameters = {"factor"};
             descriptor.precondition =
-                "exactly one object-bound edge selected; finite factor strictly between zero and one; operation requires a future preview contract";
+                "exactly one object-bound edge selected; finite factor strictly between zero and one; native shared-mesh and mesh-validity restrictions apply";
+            descriptor.preview_supported = true;
+            descriptor.preview_kind = editor::PreviewKind::split_edge;
         } else if (matches("mesh.loop-cut", editor::ToolKernelKind::editable_mesh_loop_cut)) {
             descriptor.kernel_operation = "unclassified";
             descriptor.precondition =
@@ -1285,6 +1295,26 @@ core::Result<Proposal> NativePlanner::propose(
                 parsed_numbers.value()[2]});
     }
 
+    if (words.front() == "split" || words.front() == "split-edge") {
+        const std::size_t factor_index = words.front() == "split-edge" ? 1U : 2U;
+        const bool prefix = words.front() == "split-edge" ||
+            (words.size() > 1U && words[1] == "edge");
+        if (!prefix || words.size() != factor_index + 1U || words[factor_index].ends_with('m')) {
+            return core::Result<Proposal>::failure(invalid(
+                "split intent must be `split edge <factor>` or `split-edge <factor>` with a dimensionless factor"));
+        }
+        const auto factor = parse_number(words[factor_index]);
+        if (!factor) return core::Result<Proposal>::failure(factor.error());
+        editor::PreviewParameters parameters;
+        parameters.factor = factor.value();
+        Proposal proposal{request_id, context.project_revision, context.authoring,
+            editor::PreviewKind::split_edge, parameters, "mesh.split-edge", std::string(intent),
+            "Split the selected edge by a unit-interval factor using the native kernel; explicit review required."};
+        if (auto valid = proposal.validate(context); !valid) {
+            return core::Result<Proposal>::failure(valid.error());
+        }
+        return core::Result<Proposal>::success(std::move(proposal));
+    }
     if (words.front() == "slide" || words.front() == "slide-vertex") {
         const std::size_t factor_index = words.front() == "slide-vertex" ? 1U : 2U;
         const bool prefix = words.front() == "slide-vertex" ||
@@ -1379,7 +1409,7 @@ core::Result<Proposal> NativePlanner::propose(
         return core::Result<Proposal>::success(std::move(proposal));
     }
     return core::Result<Proposal>::failure(invalid(
-        "native planner supports translate object, extrude, inset, poke face, move vertex, slide vertex, "
+        "native planner supports translate object, extrude, inset, poke face, move vertex, slide vertex, split edge, "
         "material assignment, and lightmap UV generation intents"));
 }
 

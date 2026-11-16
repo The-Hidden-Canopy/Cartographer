@@ -299,6 +299,66 @@ void vertex_slide_preview_cancellation_staleness_and_support_are_atomic() {
     REQUIRE(session.snapshot().project_revision == replacement.project_revision);
 }
 
+void edge_split_preview_cancellation_staleness_and_support_are_atomic() {
+    using namespace carto;
+    application::ApplicationSession session;
+    ui::UiController ui(session);
+    REQUIRE(ui.dispatch(application::CreateBoxAction{"Slide", {1.0, 1.0, 1.0}}));
+    REQUIRE(!session.begin_preview(editor::PreviewKind::split_edge));
+    const auto object = session.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::edge}));
+    REQUIRE(ui.dispatch(application::SelectEdgeAction{object, geometry::EdgeId{1U}}));
+    const auto before = session.snapshot();
+    editor::PreviewParameters parameters;
+    parameters.factor = 0.25;
+    auto canceled = session.begin_preview(editor::PreviewKind::split_edge);
+    REQUIRE(canceled);
+    REQUIRE(canceled.value().update(parameters));
+    canceled.value().cancel();
+    REQUIRE(!ui.commit_preview(canceled.value()));
+    REQUIRE(session.snapshot().project_revision == before.project_revision);
+    auto invalid_edge = session.begin_preview(editor::PreviewKind::split_edge);
+    REQUIRE(invalid_edge);
+    parameters.support_edge = geometry::EdgeId{999999U};
+    REQUIRE(!invalid_edge.value().update(parameters));
+    REQUIRE(!ui.commit_preview(invalid_edge.value()));
+    REQUIRE(session.snapshot().project_revision == before.project_revision);
+    auto stale = session.begin_preview(editor::PreviewKind::split_edge);
+    REQUIRE(stale);
+    parameters.support_edge.reset();
+    REQUIRE(stale.value().update(parameters));
+    auto valid = session.begin_preview(editor::PreviewKind::split_edge);
+    REQUIRE(valid);
+    REQUIRE(valid.value().update(parameters));
+    REQUIRE(ui.commit_preview(valid.value()));
+    REQUIRE(!ui.commit_preview(valid.value()));
+    REQUIRE(!ui.commit_preview(stale.value()));
+    REQUIRE(session.snapshot().project_revision == before.project_revision.next());
+
+    std::optional<geometry::EdgeId> remaining_edge;
+    for (const auto& triangle : session.snapshot().viewport.scene.instances().front().mesh->triangle_edges) {
+        for (const auto& edge : triangle) if (edge) remaining_edge = edge;
+    }
+    REQUIRE(remaining_edge);
+    REQUIRE(ui.dispatch(application::SelectEdgeAction{object, *remaining_edge}));
+    auto old_generation = session.begin_preview(editor::PreviewKind::split_edge);
+    REQUIRE(old_generation);
+    REQUIRE(old_generation.value().update(parameters));
+    const auto temporary = std::filesystem::temp_directory_path() /
+        ("cartographer-split-generation-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(temporary);
+    const auto project_path = temporary / "generation.carto";
+    REQUIRE(ui.dispatch(application::SaveProjectAction{project_path}));
+    const auto generation_before_reopen = session.snapshot().project_generation;
+    REQUIRE(ui.dispatch(application::OpenProjectAction{project_path, true}));
+    REQUIRE(session.snapshot().project_generation != generation_before_reopen);
+    const auto replacement = session.snapshot();
+    REQUIRE(replacement.project_revision == old_generation.value().base_revision());
+    REQUIRE(!ui.commit_preview(old_generation.value()));
+    REQUIRE(session.snapshot().project_revision == replacement.project_revision);
+}
+
 void preview_validation_is_fail_closed() {
     carto::editor::AuthoringContext context;
     context.selection_mode = carto::editor::SelectionMode::object;
@@ -326,6 +386,7 @@ int main() {
         unique_lightmap_uv_preview_is_typed_bounded_and_object_scoped();
         ui_preview_facade_records_only_the_committed_operation();
         vertex_slide_preview_cancellation_staleness_and_support_are_atomic();
+        edge_split_preview_cancellation_staleness_and_support_are_atomic();
         preview_validation_is_fail_closed();
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';

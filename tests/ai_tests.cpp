@@ -178,7 +178,7 @@ void ontology_is_derived_from_native_tools() {
                 !operation.writes.empty() && !operation.validators.empty();
         }));
     REQUIRE(std::count_if(context.operations.begin(), context.operations.end(),
-        [](const auto& operation) { return operation.provider_requestable; }) == 8);
+        [](const auto& operation) { return operation.provider_requestable; }) == 9);
     REQUIRE(inset->parameter_schema.size() == 1U);
     REQUIRE(inset->parameter_schema.front().type == carto::ai::ParameterType::length);
     REQUIRE(inset->parameter_schema.front().unit == carto::ai::ParameterUnit::world_length);
@@ -299,7 +299,7 @@ void ontology_fails_closed_on_tool_kernel_contract_drift() {
     const auto projected = carto::ai::project_capabilities(ontology,
         carto::ai::effect_mask(carto::ai::CapabilityEffect::geometry) |
         carto::ai::effect_mask(carto::ai::CapabilityEffect::topology));
-    REQUIRE(projected.size() == 4U);
+    REQUIRE(projected.size() == 5U);
     REQUIRE(std::none_of(projected.begin(), projected.end(), [](const auto& capability) {
         return capability.id == "mesh.extrude-face";
     }));
@@ -751,11 +751,44 @@ void vertex_slide_proposals_are_typed_bounded_and_review_only() {
     REQUIRE(!proposal.value().validate(stale));
 }
 
+void edge_split_proposals_are_typed_bounded_and_review_only() {
+    using namespace carto;
+    application::ApplicationSession session;
+    REQUIRE(application::HumanApplicationAccess::dispatch(session,
+        application::CreateBoxAction{"Split", {1.0, 1.0, 1.0}}));
+    REQUIRE(application::HumanApplicationAccess::dispatch(session,
+        application::SetSelectionModeAction{editor::SelectionMode::edge}));
+    REQUIRE(application::HumanApplicationAccess::dispatch(session,
+        application::SelectEdgeAction{scene::ObjectId{1U}, geometry::EdgeId{1U}}));
+    const auto context = context_for(session);
+    ai::NativePlanner planner;
+    const auto proposal = planner.propose("split edge 0.25", context);
+    REQUIRE(proposal);
+    REQUIRE(proposal.value().preview_kind == editor::PreviewKind::split_edge);
+    REQUIRE(proposal.value().parameters.factor == 0.25);
+    REQUIRE(!proposal.value().validate_auto_approval(context));
+    REQUIRE(planner.propose("split-edge 0.25", context));
+    for (const auto* intent : {"split edge 0", "split edge 1", "split edge -0.1",
+        "split edge nan", "split edge 0.2m", "split edge 0.2 extra", "split edge 0.2 0.3"}) {
+        REQUIRE(!planner.propose(intent, context));
+    }
+    auto parameters = proposal.value().parameters;
+    parameters.support_edge = geometry::EdgeId{1U};
+    REQUIRE(!parameters.validate(editor::PreviewKind::split_edge));
+    parameters.support_edge.reset();
+    parameters.factor = std::numeric_limits<double>::infinity();
+    REQUIRE(!parameters.validate(editor::PreviewKind::split_edge));
+    auto stale = context;
+    stale.project_revision = context.project_revision.next();
+    REQUIRE(!proposal.value().validate(stale));
+}
+
 } // namespace
 
 int main() {
     try {
         vertex_slide_proposals_are_typed_bounded_and_review_only();
+        edge_split_proposals_are_typed_bounded_and_review_only();
         ontology_is_derived_from_native_tools();
         ontology_json_preserves_kernel_and_approval_contract();
         capability_projection_filters_by_preview_and_work_envelope();

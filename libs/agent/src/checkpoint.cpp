@@ -338,6 +338,8 @@ void write_plan(Writer& writer, const AgentPlan& plan) {
         } else if (const auto* vertex =
                        std::get_if<geometry::VertexId>(&step.target.component)) {
             writer.number(vertex->value);
+        } else if (const auto* edge = std::get_if<geometry::EdgeId>(&step.target.component)) {
+            writer.number(edge->value);
         }
         writer.field(step.intent);
         write_strings(writer, step.dependencies);
@@ -421,6 +423,8 @@ AgentPlan read_plan(Reader& reader, std::uint64_t version) {
                 step.target.component = geometry::VertexId{reader.number()};
             } else if (target_kind == 2U) {
                 step.target.component = std::monostate{};
+            } else if (target_kind == 3U && version >= 13U) {
+                step.target.component = geometry::EdgeId{reader.number()};
             } else {
                 reader.fail("checkpoint plan target kind is unknown");
             }

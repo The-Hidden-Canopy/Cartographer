@@ -1,3 +1,8 @@
+add_executable(cartographer_agent_edge_checkpoint_tests agent_edge_checkpoint_tests.cpp)
+target_link_libraries(cartographer_agent_edge_checkpoint_tests PRIVATE carto_agent carto_application)
+carto_target(cartographer_agent_edge_checkpoint_tests)
+add_test(NAME cartographer_agent_edge_checkpoint_tests COMMAND cartographer_agent_edge_checkpoint_tests)
+
 
 add_executable(cartographer_agent_workbench_tests
     agent_workbench_tests.cpp

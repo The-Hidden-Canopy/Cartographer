@@ -4421,6 +4421,15 @@ core::Result<ApplicationAction> ApplicationSession::preview_action(
             "mesh.inset-face", editor::ToolArguments{
                 *parameters.distance, {}, true, 0.5, std::nullopt}});
     }
+    if (preview.kind() == editor::PreviewKind::split_edge) {
+        if (auto valid = parameters.validate(preview.kind()); !valid) {
+            return core::Result<ApplicationAction>::failure(valid.error());
+        }
+        editor::ToolArguments arguments;
+        arguments.factor = *parameters.factor;
+        return core::Result<ApplicationAction>::success(InvokeToolAction{
+            "mesh.split-edge", arguments});
+    }
     if (preview.kind() == editor::PreviewKind::slide_vertex) {
         if (auto valid = parameters.validate(preview.kind()); !valid) {
             return core::Result<ApplicationAction>::failure(valid.error());
@@ -4497,10 +4506,11 @@ core::Result<DispatchReceipt> ApplicationSession::commit_preview(
     editor::AuthoringPreview& preview,
     OperationSource source,
     std::string_view provenance_id) {
-    if (preview.kind() == editor::PreviewKind::slide_vertex &&
+    if ((preview.kind() == editor::PreviewKind::slide_vertex ||
+         preview.kind() == editor::PreviewKind::split_edge) &&
         (preview.session_owner_ != this || preview.project_generation_ != project_generation_)) {
         return failure(core::Diagnostic(core::ErrorCode::stale_data,
-            "vertex slide preview belongs to another project generation or session"));
+            "mesh preview belongs to another project generation or session"));
     }
     if (auto result = preview.validate_commit(document_.revision()); !result) {
         return failure(result.error().with_context("preview commit"));

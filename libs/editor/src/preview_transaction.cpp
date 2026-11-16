@@ -29,7 +29,8 @@ bool valid_kind(PreviewKind kind) noexcept {
         kind == PreviewKind::inset_face || kind == PreviewKind::set_vertex_position ||
         kind == PreviewKind::poke_face ||
         kind == PreviewKind::set_material_region_assignment ||
-        kind == PreviewKind::generate_unique_lightmap_uv || kind == PreviewKind::slide_vertex;
+        kind == PreviewKind::generate_unique_lightmap_uv || kind == PreviewKind::slide_vertex ||
+        kind == PreviewKind::split_edge;
 }
 
 } // namespace
@@ -38,7 +39,8 @@ core::Result<void> PreviewParameters::validate(PreviewKind kind) const {
     if (!valid_kind(kind)) {
         return core::Result<void>::failure(invalid("preview kind is invalid"));
     }
-    if (kind != PreviewKind::slide_vertex && (factor.has_value() || support_edge.has_value())) {
+    if (kind != PreviewKind::slide_vertex && kind != PreviewKind::split_edge &&
+        (factor.has_value() || support_edge.has_value())) {
         return core::Result<void>::failure(invalid("non-slide preview contains slide parameters"));
     }
     const bool has_material_parameters = material_region_id.has_value() ||
@@ -53,6 +55,14 @@ core::Result<void> PreviewParameters::validate(PreviewKind kind) const {
     if (kind != PreviewKind::generate_unique_lightmap_uv && has_lightmap_uv_parameters) {
         return core::Result<void>::failure(invalid(
             "non-lightmap preview contains lightmap UV parameters"));
+    }
+    if (kind == PreviewKind::split_edge) {
+        if (!factor.has_value() || !std::isfinite(*factor) || *factor <= 0.0 || *factor >= 1.0 ||
+            support_edge.has_value() || transform.has_value() || distance.has_value() || position.has_value()) {
+            return core::Result<void>::failure(invalid(
+                "edge split requires only a finite factor strictly between zero and one"));
+        }
+        return core::Result<void>::success();
     }
     if (kind == PreviewKind::slide_vertex) {
         if (!factor.has_value() || !std::isfinite(*factor) || *factor <= 0.0 || *factor >= 1.0 ||
@@ -173,6 +183,13 @@ core::Result<AuthoringPreview> AuthoringPreview::begin(
          !context.component_object.has_value())) {
         return core::Result<AuthoringPreview>::failure(invalid(
             "vertex position preview requires exactly one object-bound selected vertex"));
+    }
+
+    if (kind == PreviewKind::split_edge &&
+        (context.selection_mode != SelectionMode::edge || context.edges.size() != 1U ||
+         !context.component_object.has_value())) {
+        return core::Result<AuthoringPreview>::failure(invalid(
+            "edge split preview requires exactly one object-bound selected edge"));
     }
 
     AuthoringPreview preview;

@@ -38,7 +38,8 @@ using Effect = ai::CapabilityEffect;
 
 struct TargetRef {
     scene::ObjectId object;
-    std::variant<geometry::FaceId, geometry::VertexId, std::monostate> component;
+    // Keep persisted alternatives 0 (face), 1 (vertex), and 2 (object) stable.
+    std::variant<geometry::FaceId, geometry::VertexId, std::monostate, geometry::EdgeId> component;
 
     [[nodiscard]] core::Result<void> validate() const;
 };
@@ -1818,7 +1819,7 @@ struct AgentDemonstrationRecipe {
 // resumed task can run. Project bytes remain artifacts owned by this record;
 // they are never applied to the live source by loading a checkpoint.
 struct AgentTaskCheckpoint {
-    static constexpr std::uint32_t kFormatVersion = 12U;
+    static constexpr std::uint32_t kFormatVersion = 13U;
 
     TaskStatus status = TaskStatus::prepared;
     AgentPlan plan;

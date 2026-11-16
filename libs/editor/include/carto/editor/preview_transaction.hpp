@@ -27,6 +27,7 @@ enum class PreviewKind {
     set_material_region_assignment,
     generate_unique_lightmap_uv,
     slide_vertex,
+    split_edge,
 };
 
 struct PreviewParameters {
