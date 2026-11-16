@@ -34,6 +34,7 @@
 #include <carto/project/project.hpp>
 #include <carto/project/material_catalog.hpp>
 #include <carto/production/decal.hpp>
+#include <carto/production/closure.hpp>
 #include <carto/production/sculpt_stack.hpp>
 #include <carto/production/uv_island_pack.hpp>
 #include <carto/production/uv_planar_projection.hpp>
@@ -1751,6 +1752,30 @@ struct ImportMaterialTextureSourceAction {
     assets::TextureSourceFormat format = assets::TextureSourceFormat::png;
     std::uint32_t width = 0U;
     std::uint32_t height = 0U;
+    std::string name;
+};
+
+// Explicit adoption of a published single-tile CPU bake. The receipt and exact
+// artifact bytes are retained; no worker is allowed to mutate project truth.
+struct AdoptBakedMaterialMapAction {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    scene::ObjectId object;
+    render::MaterialId material = 0U;
+    core::Revision expected_material_revision;
+    production::ProductionArtifactReceipt receipt;
+    std::vector<std::uint8_t> artifact_bytes;
+    std::string justification;
+};
+
+// Source maps stay intact. R is unused, G is roughness, B is metallic.
+struct PackMaterialMapsAction {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    render::MaterialId material = 0U;
+    core::Revision expected_material_revision;
+    assets::TextureAssetId roughness = 0U;
+    assets::TextureAssetId metallic = 0U;
 };
 
 struct ReimportMaterialTextureSourceAction {
@@ -1925,6 +1950,8 @@ using ApplicationAction = std::variant<
     SetMaterialGraphBindingAction,
     SetMaterialGraphInputsAction,
     ImportMaterialTextureSourceAction,
+    AdoptBakedMaterialMapAction,
+    PackMaterialMapsAction,
     ReimportMaterialTextureSourceAction,
     SetPresentationCatalogAction,
     SetProjectAuthoringStandardsAction,
@@ -1938,6 +1965,26 @@ using ApplicationAction = std::variant<
     CreateBiologicalProxyInstanceAction,
     UndoAction,
     RedoAction>;
+
+using TexturingCommand = std::variant<CreateMaterialAction, UpdateMaterialAction,
+    AssignMaterialToMeshAction>;
+
+// AI and human hosts can inspect the same command on a private copy. Applying
+// a review still requires the existing human admission boundary.
+class TexturingReview final {
+public:
+    [[nodiscard]] bool active() const noexcept { return active_; }
+    void cancel() noexcept { active_ = false; }
+    [[nodiscard]] const std::string& before() const noexcept { return before_; }
+    [[nodiscard]] const std::string& after() const noexcept { return after_; }
+private:
+    friend class ApplicationSession;
+    TexturingCommand command_;
+    std::uint64_t generation_ = 0U;
+    const ApplicationSession* owner_ = nullptr;
+    std::string before_, after_;
+    bool active_ = true;
+};
 
 // Complete explicit input for a human-reviewed autorig commit. The source
 // content and source-binding provenance remain caller assertions.
@@ -2106,6 +2153,8 @@ struct HistoricalAutorigView {
 // be used as a public raw AI mutation route.
 class HumanApplicationAccess final {
 public:
+    [[nodiscard]] static core::Result<DispatchReceipt> accept_texturing(
+        ApplicationSession& session, TexturingReview& review, std::string justification);
     [[nodiscard]] static core::Result<DispatchReceipt> adopt_control_workspace(
         ApplicationSession& session, const AdoptControlWorkspaceRequest& request);
     [[nodiscard]] static core::Result<DispatchReceipt> accept_ik_fk_key(
@@ -2351,6 +2400,8 @@ public:
         std::string_view identity) const;
     [[nodiscard]] core::Result<editor::AuthoringPreview> begin_preview(
         editor::PreviewKind kind) const;
+    [[nodiscard]] core::Result<TexturingReview> review_texturing(
+        const TexturingCommand& command) const;
     [[nodiscard]] core::Result<MeshCleanupReview> review_mesh_cleanup(
         scene::ObjectId object, std::vector<geometry::VertexId> candidates,
         MeshCleanupOptions options) const;
@@ -2597,6 +2648,14 @@ private:
         const SetMaterialGraphInputsAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> import_material_texture_source(
         const ImportMaterialTextureSourceAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> adopt_baked_material_map(
+        const AdoptBakedMaterialMapAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> pack_material_maps(
+        const PackMaterialMapsAction& action);
+    [[nodiscard]] core::Result<void> copy_managed_sources_for_save(
+        const std::filesystem::path& destination) const;
+    [[nodiscard]] core::Result<DispatchReceipt> accept_texturing(
+        HumanActionAdmission, TexturingReview& review, std::string justification);
     [[nodiscard]] core::Result<DispatchReceipt> reimport_material_texture_source(
         const ReimportMaterialTextureSourceAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> set_presentation_catalog(

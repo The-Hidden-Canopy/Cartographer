@@ -512,6 +512,30 @@ core::Result<void> for_each_texture_binding(
 
 } // namespace
 
+core::Result<std::vector<assets::Sha256Digest>> TextureSourceRecord::lineage_digests() const {
+    using Result = core::Result<std::vector<assets::Sha256Digest>>;
+    std::vector<assets::Sha256Digest> digests;
+    std::vector<std::string_view> keys;
+    if (provenance.starts_with("cartographer.bake_adoption.v1;"))
+        keys = {"artifact=", "receipt=", "reason="};
+    else if (provenance.starts_with("cartographer.pbr_pack.v1;"))
+        keys = {"roughness.R=", "metallic.R="};
+    for (const auto key : keys) {
+        const auto marker = ";" + std::string(key);
+        const auto start = provenance.find(marker);
+        if (start == std::string::npos)
+            return Result::failure(invalid("generated texture lineage is incomplete"));
+        const auto value_start = start + marker.size();
+        const auto end = provenance.find(';', value_start);
+        const auto digest = assets::Sha256Digest::from_hex(std::string_view(provenance).substr(
+            value_start, end == std::string::npos ? end : end - value_start));
+        if (!digest || digest.value().is_zero())
+            return Result::failure(invalid("generated texture lineage digest is invalid"));
+        digests.push_back(digest.value());
+    }
+    return Result::success(std::move(digests));
+}
+
 core::Result<void> TextureSourceRecord::validate() const {
     const bool dimensions_known = width != 0U || height != 0U;
     if (id == 0U || !safe_text(name, kMaxNameBytes) ||
@@ -523,6 +547,8 @@ core::Result<void> TextureSourceRecord::validate() const {
         return core::Result<void>::failure(invalid(
             "texture source identity, locator, digest, format, dimensions, or provenance is invalid"));
     }
+    const auto lineage = lineage_digests();
+    if (!lineage) return core::Result<void>::failure(lineage.error());
     return core::Result<void>::success();
 }
 

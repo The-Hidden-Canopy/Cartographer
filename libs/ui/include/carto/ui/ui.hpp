@@ -1063,6 +1063,10 @@ public:
 
     [[nodiscard]] core::Result<application::DispatchReceipt> dispatch(
         const application::ApplicationAction& action);
+    [[nodiscard]] core::Result<application::TexturingReview> begin_texturing_review(
+        const application::TexturingCommand& command) const;
+    [[nodiscard]] core::Result<application::DispatchReceipt> commit_texturing_review(
+        application::TexturingReview& review, std::string justification);
     [[nodiscard]] core::Result<project::MaterialGraph> material_graph_source(
         std::string_view identity) const;
     [[nodiscard]] core::Result<editor::MaterialGraphAuthoringReview>
@@ -1271,6 +1275,9 @@ public:
     // source metadata. Pixel decoding and viewport shading are not implied.
     [[nodiscard]] core::Result<application::DispatchReceipt> import_material_texture(
         const std::filesystem::path& path);
+    [[nodiscard]] core::Result<application::DispatchReceipt> adopt_baked_material_map(
+        const std::filesystem::path& receipt_manifest, scene::ObjectId object,
+        render::MaterialId material, std::string justification);
     // Replaces the exact source bytes for one current texture identity while
     // retaining its material bindings. The project command is human-admitted
     // and revision-bound; pixel decoding and viewport shading are not implied.

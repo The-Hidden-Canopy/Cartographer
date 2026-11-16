@@ -35,6 +35,8 @@ struct TextureSourceRecord {
     core::Revision revision{};
 
     [[nodiscard]] core::Result<void> validate() const;
+    // Managed generated-map lineage only; arbitrary provenance is descriptive.
+    [[nodiscard]] core::Result<std::vector<assets::Sha256Digest>> lineage_digests() const;
 };
 
 enum class SamplerAddressMode : std::uint8_t {

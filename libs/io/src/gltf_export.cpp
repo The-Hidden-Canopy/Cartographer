@@ -455,8 +455,8 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
             return core::Result<GltfExportReport>::failure(validation(
                 "glTF export cannot preserve authored material slots without a catalog on mesh " + std::to_string(mesh_id)));
         const auto& uv_sets = mesh.uv_sets();
-        if ((!export_materials && uv_sets.descriptors().size() > 1U) ||
-            (!uv_sets.descriptors().empty() && uv_sets.active_for_render() == nullptr))
+        if (!export_materials && (uv_sets.descriptors().size() > 1U ||
+            (!uv_sets.descriptors().empty() && uv_sets.active_for_render() == nullptr)))
             return core::Result<GltfExportReport>::failure(validation(
                 "glTF export cannot preserve all authored UV sets on mesh " + std::to_string(mesh_id)));
         for (const auto& [id, layer] : mesh.attributes().layers()) {
@@ -561,6 +561,9 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
             if (!uv)
                 if (const auto *active = mesh.uv_sets().active_for_render())
                     uv = active->id;
+            if (!uv && !mesh.uv_sets().descriptors().empty())
+                return core::Result<GltfExportReport>::failure(validation(
+                    "glTF material primitive requires an explicitly bound or active authored UV set"));
             auto found = streams.find(uv);
             if (found == streams.end()) {
                 auto options = base_options;

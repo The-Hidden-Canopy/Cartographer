@@ -51,6 +51,7 @@
 #include "studio_face_tools.hpp"
 #include "studio_vertex_tools.hpp"
 #include "studio_material_draft.hpp"
+#include "studio_texture_binding.hpp"
 #include "starter_material_library.hpp"
 #include "studio_material_graph_draft.hpp"
 #include "studio_sweep_source.hpp"
@@ -2811,6 +2812,7 @@ enum class FileDialogKind {
     ply,
     stl,
     texture_source,
+    bake_receipt_manifest,
     environment_image,
     material_surface_id_recipe,
     bake_output_directory,
@@ -2968,6 +2970,9 @@ carto::studio::FilePickerTheme file_picker_theme = carto::studio::FilePickerThem
             L"Supported Texture Sources (*.png;*.jpg;*.jpeg;*.tga;*.dds;*.exr;*.pfm)\0"
             L"*.png;*.jpg;*.jpeg;*.tga;*.dds;*.exr;*.pfm\0"
             L"All Files\0*.*\0";
+        break;
+    case FileDialogKind::bake_receipt_manifest:
+        dialog.lpstrFilter = L"Published bake receipts (*.carto-production-receipts)\0*.carto-production-receipts\0All Files\0*.*\0";
         break;
     case FileDialogKind::environment_image:
         dialog.lpstrFilter =
@@ -3432,6 +3437,7 @@ struct DesktopState {
     std::optional<carto::geometry::EdgeId> uv_selected_seam_edge;
     std::string uv_inspection_message;
     std::string uv_tile_bake_message;
+    std::optional<std::filesystem::path> completed_bake_manifest;
     std::stop_source uv_tile_bake_stop_source;
 #if defined(CARTO_DESKTOP_HAS_D3D12_BAKE)
     bool uv_tile_bake_use_d3d12 = false;
@@ -3481,6 +3487,12 @@ struct DesktopState {
     carto::render::StandardMaterial material_draft;
     bool material_draft_loaded = false;
     bool material_draft_dirty = false;
+    bool material_live_apply = true;
+    std::optional<carto::application::TexturingReview> material_source_review;
+    carto::render::StandardMaterial material_review_before, material_review_after;
+    std::array<char, 256> material_review_reason{};
+    carto::assets::TextureAssetId material_roughness_source = 0U;
+    carto::assets::TextureAssetId material_metallic_source = 0U;
     std::array<char, 257> material_graph_identity_buffer{};
     std::string selected_material_graph_identity;
     std::optional<carto::studio::PendingMaterialGraphSelection> pending_material_graph_selection;
@@ -5288,6 +5300,7 @@ struct DesktopState {
                         result.error().message;
                 return;
             }
+            completed_bake_manifest = result.value().output_directory / "receipts.carto-production-receipts";
             uv_tile_bake_message = std::string(backend_name) + " " +
                 result.value().map_kind + " tiles published: " +
                 std::to_string(result.value().tile_count) + " tile(s), " +
@@ -11132,18 +11145,30 @@ struct DesktopState {
 #else
             ImGui::TextWrapped("Readback preview is capped at 1,048,576 pixels and has no temporal accumulation.");
 #endif
-            if (!material_viewport_diagnostic.empty() && !material_viewport_displayed)
-                ImGui::TextWrapped("Rendered preview: %s", material_viewport_diagnostic.c_str());
+            // Status must not resize the canvas whose extent is part of the
+            // worker request key. Removing this row on completion invalidated
+            // the completed frame and could keep readback in a retry loop.
+            const bool current_frame_displayed = material_viewport_displayed && material_viewport_image &&
+                material_viewport_generation == snapshot.project_generation &&
+                material_viewport_image->source_revision == snapshot.project_revision;
+            const char* idle_status = current_frame_displayed ? "Ready" : "Awaiting current frame";
+            std::string status = material_viewport_diagnostic.empty()
+                ? idle_status : material_viewport_diagnostic;
+            std::replace(status.begin(), status.end(), '\n', ' ');
+            std::replace(status.begin(), status.end(), '\r', ' ');
+            ImGui::Text("Rendered preview: %s", status.c_str());
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", material_viewport_diagnostic.empty()
+                ? idle_status : material_viewport_diagnostic.c_str());
         }
-        ImGui::SameLine();
+        if (!material_viewport_enabled) ImGui::SameLine();
         if (ImGui::Button("Environment")) ImGui::OpenPopup("Environment lighting");
         draw_environment_controls(snapshot);
         ImGui::SameLine();
         if(ImGui::Button("Shared rigs"))shared_rigs_open=true;
         if (material_viewport_enabled) {
 #if defined(CARTO_DESKTOP_ASYNC_READBACK) || defined(CARTO_DESKTOP_RESIDENT_WORKER)
-            if (!material_viewport_diagnostic.empty()) {
-                ImGui::SameLine();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(material_viewport_diagnostic.empty());
                 if (ImGui::SmallButton("Retry render")) {
                     renderer.cancel_authoring_viewport_upload();
                     material_pending_upload.reset();
@@ -11155,7 +11180,7 @@ struct DesktopState {
 #endif
                     material_requested_key.clear();
                 }
-            }
+            ImGui::EndDisabled();
 #endif
             ImGui::SameLine();
             ImGui::Checkbox("Authored camera", &material_viewport_authored_camera);
@@ -18416,6 +18441,54 @@ struct DesktopState {
             source_blob_inventory_pending_mesh_review == pending_mesh_reimport;
 
         ImGui::TextDisabled("Project-owned PBR source · .carto persisted");
+        ImGui::Checkbox("Live apply when an edit finishes", &material_live_apply);
+        if (material_source_review) {
+            ImGui::TextWrapped("Pending material proposal: compare the saved and proposed values below. Acceptance revalidates this session, project and revisions.");
+            const auto show_material = [](const carto::render::StandardMaterial& value) {
+                ImGui::Text("Base RGBA: %.3f %.3f %.3f %.3f", value.base_color_factor.x, value.base_color_factor.y, value.base_color_factor.z, value.base_color_factor.w);
+                ImGui::Text("Metallic %.3f / Roughness %.3f", value.metallic, value.roughness);
+                ImGui::Text("Normal strength %.3f / AO %.3f", value.normal_scale, value.occlusion_strength);
+                ImGui::Text("Emission %.3f %.3f %.3f x %.3f", value.emissive_factor.x, value.emissive_factor.y, value.emissive_factor.z, value.emissive_strength);
+                ImGui::Text("F0 %.3f / Coat %.3f / Coat roughness %.3f", value.dielectric_f0, value.clearcoat, value.clearcoat_roughness);
+                ImGui::Text("IOR %.3f / Transmission %.3f / Thickness %.3f m", value.ior, value.transmission, value.thickness);
+                ImGui::Text("Absorption %.3f %.3f %.3f at %.3f m", value.attenuation_color.x, value.attenuation_color.y, value.attenuation_color.z, value.attenuation_distance);
+                ImGui::Text("Anisotropy %.3f / Rotation %.3f rad", value.anisotropy, value.anisotropy_rotation);
+                ImGui::Text("Alpha mode %d / Cutoff %.3f", static_cast<int>(value.alpha_mode), value.alpha_cutoff);
+                const auto show_map = [](const char* label, const carto::render::TextureRef& ref) {
+                    ImGui::Text("%s: source %llu / UV %llu / sampler %llu", label,
+                        static_cast<unsigned long long>(ref.asset), static_cast<unsigned long long>(ref.uv_set), static_cast<unsigned long long>(ref.sampler));
+                    if (!ref) return;
+                    ImGui::Text("Offset %.3f %.3f / Scale %.3f %.3f", ref.transform.offset.x, ref.transform.offset.y, ref.transform.scale.x, ref.transform.scale.y);
+                    ImGui::Text("Pivot %.3f %.3f / Rotation %.3f rad", ref.transform.pivot.x, ref.transform.pivot.y, ref.transform.rotation);
+                    ImGui::Text("Space: %s / Normal: %s", ref.interpretation == carto::render::TextureInterpretation::linear ? "linear" : ref.interpretation == carto::render::TextureInterpretation::srgb ? "sRGB" : "slot default",
+                        ref.normal_convention == carto::render::NormalConvention::opengl_y_plus ? "Y+" : "Y-");
+                    constexpr const char* channels[]{"R","G","B","A","1-R","1-G","1-B","1-A","0","1"};
+                    ImGui::Text("RGBA channels: %s %s %s %s", channels[static_cast<unsigned>(ref.channels.rgba[0])], channels[static_cast<unsigned>(ref.channels.rgba[1])], channels[static_cast<unsigned>(ref.channels.rgba[2])], channels[static_cast<unsigned>(ref.channels.rgba[3])]);
+                };
+                show_map("Base color", value.base_color); show_map("Metal/rough", value.metallic_roughness);
+                show_map("Normal", value.normal); show_map("AO", value.occlusion); show_map("Emission", value.emissive);
+            };
+            if (ImGui::TreeNode("Before proposal")) {
+                ImGui::BeginChild("before source", ImVec2(0, 120), true);
+                show_material(material_review_before);
+                ImGui::EndChild(); ImGui::TreePop();
+            }
+            if (ImGui::TreeNode("After proposal")) {
+                ImGui::BeginChild("after source", ImVec2(0, 120), true);
+                show_material(material_review_after);
+                ImGui::EndChild(); ImGui::TreePop();
+            }
+            ImGui::InputText("Acceptance reason", material_review_reason.data(), material_review_reason.size());
+            if (ImGui::Button("Accept reviewed texturing change", ImVec2(-1, 26))) {
+                const auto accepted = ui.commit_texturing_review(*material_source_review, material_review_reason.data());
+                action_feedback_error = !accepted;
+                action_feedback = accepted ? "Reviewed texturing command committed through project history." : accepted.error().message;
+                if (accepted) { material_source_review.reset(); material_draft_dirty = false; material_draft_loaded = false; }
+            }
+            if (ImGui::Button("Cancel texturing proposal", ImVec2(-1, 24))) material_source_review.reset();
+        }
+        ImGui::TextWrapped("Edits use reversible project commands. Enable Rendered viewport in the work-surface toolbar to inspect shading; viewport mesh gestures then require a restart. Material and UV panel commands remain available.");
+        ImGui::TextWrapped("Height maps can be baked and retained, but this renderer has no height/displacement material slot. UDIM baking does not imply UDIM material sampling. Optical V5 texture maps are unsupported; scalar optical controls are available.");
         ImGui::TextWrapped(
             "Edit PBR factors and bounded UV/texture graphs. "
             "Surface-input nodes and unsupported outputs fail visibly.");
@@ -18498,6 +18571,25 @@ struct DesktopState {
             }
         }
         ImGui::Separator();
+
+        const auto bake_target = uv_target_object(snapshot);
+        ImGui::BeginDisabled(!snapshot.project_path || !bake_target || !selected_material_id || material_draft_dirty);
+        if (ImGui::Button("Adopt published AO / tangent normal...", ImVec2(-1, 26))) {
+            if (const auto path = choose_file(false, FileDialogKind::bake_receipt_manifest)) {
+                const auto adopted = ui.adopt_baked_material_map(*path, *bake_target, selected_material_id,
+                    "Human selected this published bake for the current material");
+                action_feedback_error = !adopted;
+                action_feedback = adopted ? "Bake retained with its receipt and assigned to the material. Undo restores the previous map." : adopted.error().message;
+            }
+        }
+        if (completed_bake_manifest && ImGui::Button("Adopt last completed bake", ImVec2(-1, 26))) {
+            const auto adopted = ui.adopt_baked_material_map(*completed_bake_manifest, *bake_target, selected_material_id,
+                "Human adopted the last completed bake into the current material");
+            action_feedback_error = !adopted;
+            action_feedback = adopted ? "Completed bake assigned through project history." : adopted.error().message;
+        }
+        ImGui::EndDisabled();
+        ImGui::TextWrapped("Bake adoption retains exact artifact and receipt bytes. It requires a current same-project mesh, one tile at (0,0), and an AO or complete tangent-normal output. Baking never changes a material in the background.");
 
         if (snapshot.materials.empty()) {
             ImGui::TextDisabled("No material sources in this project.");
@@ -18709,6 +18801,11 @@ struct DesktopState {
                         material_draft_dirty = true;
                     }
                 }
+                ImGui::PushID("Base mapping");
+                ImGui::BeginDisabled(material_draft_stale);
+                material_draft_dirty |= carto::studio::draw_texture_mapping(material_draft.base_color, true);
+                ImGui::EndDisabled();
+                ImGui::PopID();
                 // Standard PBR slots share source selection while preserving mapping.
                 const auto draw_texture_slot = [&](const char* label, carto::render::TextureRef& binding) {
                     std::string preview = "None";
@@ -18737,11 +18834,39 @@ struct DesktopState {
                         }
                         ImGui::EndCombo();
                     }
+                    material_draft_dirty |= carto::studio::draw_texture_mapping(
+                        binding, &binding == &material_draft.emissive);
                     ImGui::EndDisabled();
                     ImGui::PopID();
                 };
                 ImGui::TextDisabled("Metallic-roughness (default: G roughness, B metallic)");
                 draw_texture_slot("Metallic-roughness", material_draft.metallic_roughness);
+                if (ImGui::TreeNode("Pack separate roughness and metallic maps")) {
+                    const auto source_combo = [&](const char* label, carto::assets::TextureAssetId& id) {
+                        const auto source = std::find_if(snapshot.texture_sources.begin(), snapshot.texture_sources.end(),
+                            [id](const auto& texture) { return texture.id == id; });
+                        if (ImGui::BeginCombo(label, source == snapshot.texture_sources.end() ? "Choose source" : source->name.c_str())) {
+                            for (const auto& texture : snapshot.texture_sources) {
+                                const auto widget_id = carto::studio::material_source_widget_id(snapshot.project_generation, texture.id);
+                                ImGui::PushID(widget_id.c_str());
+                                if (ImGui::Selectable(texture.name.c_str(), id == texture.id)) id = texture.id;
+                                ImGui::PopID();
+                            }
+                            ImGui::EndCombo();
+                        }
+                    };
+                    source_combo("Roughness source (R)", material_roughness_source);
+                    source_combo("Metallic source (R)", material_metallic_source);
+                    ImGui::TextWrapped("Reads both red channels as linear data; dimensions must match. Preserves sources and mapping; outputs G roughness / B metallic. Material factors still multiply these maps.");
+                    ImGui::BeginDisabled(material_draft_dirty || material_draft_stale || !material_roughness_source || !material_metallic_source);
+                    if (ImGui::Button("Pack and bind maps", ImVec2(-1, 24))) {
+                        dispatch(carto::application::PackMaterialMapsAction{snapshot.project_generation,
+                            snapshot.project_revision, selected->id, selected->revision,
+                            material_roughness_source, material_metallic_source});
+                    }
+                    ImGui::EndDisabled();
+                    ImGui::TreePop();
+                }
                 ImGui::TextDisabled("Normal map");
                 draw_texture_slot("Normal", material_draft.normal);
                 if (material_draft.normal.asset != 0U) {
@@ -18862,7 +18987,27 @@ struct DesktopState {
                 }
                 ImGui::TextDisabled(
                     "Emission contributes linear HDR radiance; camera exposure controls its displayed brightness.");
-                ImGui::BeginDisabled(!material_draft_dirty || material_draft_stale);
+                const auto draft_valid = material_draft.validate();
+                if (!draft_valid) ImGui::TextWrapped("Invalid material: %s", draft_valid.error().message.c_str());
+                ImGui::BeginDisabled(!material_draft_dirty || material_draft_stale || !draft_valid || material_source_review.has_value());
+                if (ImGui::Button("Review source changes before applying", ImVec2(-1, 26))) {
+                    auto proposed = ui.begin_texturing_review(carto::application::UpdateMaterialAction{
+                        snapshot.project_revision, selected->id, selected->revision, material_draft});
+                    if (proposed) {
+                        material_review_before = selected->definition; material_review_after = material_draft;
+                        material_source_review.emplace(std::move(proposed.value())); material_review_reason.fill('\0');
+                    }
+                    else { action_feedback_error = true; action_feedback = proposed.error().message; }
+                }
+                ImGui::EndDisabled();
+                if (material_live_apply && !material_source_review && material_draft_dirty && !material_draft_stale && draft_valid && !ImGui::IsAnyItemActive()) {
+                    if (dispatch(carto::application::UpdateMaterialAction{snapshot.project_revision,
+                            selected->id, selected->revision, material_draft})) {
+                        material_draft_dirty = false;
+                        material_draft_loaded = false;
+                    } else material_live_apply = false;
+                }
+                ImGui::BeginDisabled(!material_draft_dirty || material_draft_stale || !draft_valid);
                 if (ImGui::Button("Apply source changes", ImVec2(-1, 28))) {
                     if (dispatch(carto::application::UpdateMaterialAction{
                             snapshot.project_revision, selected->id,
@@ -32186,6 +32331,8 @@ struct DesktopState {
                 workbench.tools = true;
             } else if (snapshot.workspace_kind == carto::ui::Workspace::uv) {
                 workbench.assets = true;
+                workbench.material = true;
+            } else if (snapshot.workspace_kind == carto::ui::Workspace::material) {
                 workbench.material = true;
             } else if (snapshot.workspace_kind == carto::ui::Workspace::engineering) {
                 workbench.scene = true;

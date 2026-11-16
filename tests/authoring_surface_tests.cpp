@@ -47,8 +47,13 @@ void sampling_and_failure_atomicity() {
     auto program = compile(c, l);
     near(at(program, .5).material.base_color_factor.x,
          .5); // linear-light bilinear, not sRGB .5 decoded
-    auto mip = at(program, .23, .5, {2, 0});
+    // Equal two-texel footprint lengths select mip 1 with one tap.
+    auto mip = at(program, .23, .5, {1, 0}, {0, 2});
     near(mip.material.base_color_factor.x, std::pow((188.0 / 255 + .055) / 1.055, 2.4));
+    // Eight bilinear taps across a one-texel-wide, zero-height footprint at
+    // the black texel center average the surrounding black/white ramp to .25.
+    // An isotropic single center lookup would incorrectly return zero.
+    near(at(program, .25, .5, {.5, 0}).material.base_color_factor.x, .25);
     check(program.texture_bytes() == 12 && l.resident_bytes() == 20,
           "decoded and mip budgets counted separately");
     auto malformed = p.encoded;

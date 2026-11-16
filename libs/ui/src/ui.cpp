@@ -9839,6 +9839,19 @@ core::Result<application::DispatchReceipt> UiController::import_generated_botani
     return admitted;
 }
 
+core::Result<application::TexturingReview> UiController::begin_texturing_review(
+    const application::TexturingCommand& command) const {
+    return session_.review_texturing(command);
+}
+
+core::Result<application::DispatchReceipt> UiController::commit_texturing_review(
+    application::TexturingReview& review, std::string justification) {
+    auto result = application::HumanApplicationAccess::accept_texturing(session_, review, std::move(justification));
+    if (result) record_operation(result.value(), OperationCategory::committed_command);
+    else record_ui_problem(result.error().with_context("texturing proposal acceptance"));
+    return result;
+}
+
 core::Result<application::DispatchReceipt> UiController::import_material_texture(
     const std::filesystem::path& path) {
     const auto fail = [this](core::Diagnostic diagnostic) {
@@ -9878,14 +9891,46 @@ core::Result<application::DispatchReceipt> UiController::import_material_texture
         *application_snapshot.project_path, encoded.value(), inspected.value(), limits);
     if (!locator) return fail(locator.error());
 
+    const auto filename = path.filename().u8string();
+    auto name_bytes = std::min<std::size_t>(filename.size(), 128U);
+    while (name_bytes < filename.size() &&
+        (static_cast<unsigned char>(filename[name_bytes]) & 0xc0U) == 0x80U) --name_bytes;
+    const std::string source_name(reinterpret_cast<const char*>(filename.data()), name_bytes);
     auto imported = dispatch(application::ImportMaterialTextureSourceAction{
         application_snapshot.project_revision,
         inspected.value().source.digest,
         inspected.value().format,
         inspected.value().width,
-        inspected.value().height});
+        inspected.value().height,
+        source_name});
     if (!imported) return fail(imported.error());
     return imported;
+}
+
+core::Result<application::DispatchReceipt> UiController::adopt_baked_material_map(
+    const std::filesystem::path& manifest, scene::ObjectId object,
+    render::MaterialId material, std::string justification) {
+    const auto fail = [this](core::Diagnostic diagnostic) {
+        record_ui_problem(diagnostic);
+        return core::Result<application::DispatchReceipt>::failure(std::move(diagnostic));
+    };
+    const auto snapshot = session_.snapshot();
+    const auto found = std::find_if(snapshot.materials.begin(), snapshot.materials.end(),
+        [material](const auto& entry) { return entry.id == material; });
+    if (found == snapshot.materials.end()) return fail(invalid("select a current material before adopting a bake"));
+    const auto text = read_bounded_file(manifest, production::ProductionReceiptLedger::max_serialized_bytes,
+        "bake receipt manifest");
+    if (!text) return fail(text.error());
+    const auto ledger = production::ProductionReceiptLedger::deserialize(text.value());
+    if (!ledger) return fail(ledger.error());
+    if (ledger.value().size() != 1U)
+        return fail(invalid("material adoption requires one published tile; UDIM material binding is unsupported"));
+    const auto& receipt = ledger.value().records().front();
+    assets::BlobStore store(manifest.parent_path() / "blobs", {68U * 1024U * 1024U, 256U});
+    const auto bytes = store.read(receipt.output_digest);
+    if (!bytes) return fail(bytes.error());
+    return dispatch(application::AdoptBakedMaterialMapAction{snapshot.project_generation,
+        snapshot.project_revision, object, material, found->revision, receipt, bytes.value(), std::move(justification)});
 }
 
 core::Result<application::DispatchReceipt> UiController::reimport_material_texture(

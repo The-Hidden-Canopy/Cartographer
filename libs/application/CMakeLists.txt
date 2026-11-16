@@ -5,6 +5,7 @@ add_library(carto_application STATIC
     src/gltf_scene_import.cpp
     src/shared_rig.cpp
     src/material_library.cpp
+    src/material_texturing.cpp
     src/object_aging.cpp
     src/viewport_appearance.cpp
 )

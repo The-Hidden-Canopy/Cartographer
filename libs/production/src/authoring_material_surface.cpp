@@ -103,17 +103,30 @@ Value sample(const BoundTexture &t, core::Vec2d uv, core::Vec2d dx, core::Vec2d 
         throw std::runtime_error(
             "texture coordinates/derivatives exceed the finite sampling bound");
     const auto &base = t.mips->levels.front();
-    const auto rho = std::max(std::hypot(dx.x * base.width, dx.y * base.height),
-                              std::hypot(dy.x * base.width, dy.y * base.height));
+    const double lx = std::hypot(dx.x * base.width, dx.y * base.height),
+                 ly = std::hypot(dy.x * base.width, dy.y * base.height);
+    const auto rho = std::max(lx, ly);
     if (!std::isfinite(rho))
         throw std::runtime_error("texture footprint overflow");
+    // Match the existing authoring surface shader's bounded anisotropic
+    // footprint. Derived from df811a3; no shader or sampler intent is changed.
+    const double minor = std::max(std::min(lx, ly), 1e-6);
+    const unsigned taps = static_cast<unsigned>(std::clamp(std::ceil(rho / minor), 1.0, 8.0));
+    const core::Vec2d major = lx >= ly ? dx : dy;
     const auto last = static_cast<unsigned>(t.mips->levels.size() - 1);
-    const double lod = std::clamp(std::log2(std::max(1.0, rho)), 0.0, double(last));
+    const double lod = std::clamp(std::log2(std::max(1.0, rho / taps)), 0.0, double(last));
     const auto lo = static_cast<unsigned>(std::floor(lod));
-    Value value = t.sampler.mip == project::SamplerFilter::nearest
-                      ? level_sample(t, static_cast<unsigned>(std::round(lod)), uv, rho > 1)
-                      : lerp(level_sample(t, lo, uv, rho > 1),
-                             level_sample(t, std::min(lo + 1, last), uv, rho > 1), lod - lo);
+    Value value{};
+    for (unsigned k = 0; k < taps; ++k) {
+        const double offset = (double(k) + 0.5) / double(taps) - 0.5;
+        const core::Vec2d at{uv.x + major.x * offset, uv.y + major.y * offset};
+        const Value tap = t.sampler.mip == project::SamplerFilter::nearest
+            ? level_sample(t, static_cast<unsigned>(std::round(lod)), at, rho > 1)
+            : lerp(level_sample(t, lo, at, rho > 1),
+                level_sample(t, std::min(lo + 1, last), at, rho > 1), lod - lo);
+        for (unsigned c = 0; c < 4; ++c) value[c] += tap[c];
+    }
+    for (unsigned c = 0; c < 4; ++c) value[c] /= double(taps);
     Value mapped{};
     for (unsigned c = 0; c < 4; ++c) {
         const auto channel = static_cast<unsigned>(t.binding.channels.rgba[c]);

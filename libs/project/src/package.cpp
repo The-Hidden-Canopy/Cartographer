@@ -510,6 +510,11 @@ core::Result<ProjectPackage> ProjectPackage::migrate_flat_project(
             if (auto copied = copy_captured(texture.content_digest,
                     "flat project captured texture " + std::to_string(id)); !copied)
                 return core::Result<ProjectPackage>::failure(copied.error());
+            const auto lineage = texture.lineage_digests();
+            if (!lineage) return core::Result<ProjectPackage>::failure(lineage.error());
+            for (const auto& digest : lineage.value())
+                if (auto copied = copy_captured(digest, "generated texture lineage"); !copied)
+                    return core::Result<ProjectPackage>::failure(copied.error());
         }
     }
 

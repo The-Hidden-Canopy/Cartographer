@@ -2887,6 +2887,10 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return set_material_graph_inputs(value);
             } else if constexpr (std::is_same_v<Action, ImportMaterialTextureSourceAction>) {
                 return import_material_texture_source(value);
+            } else if constexpr (std::is_same_v<Action, AdoptBakedMaterialMapAction>) {
+                return adopt_baked_material_map(value);
+            } else if constexpr (std::is_same_v<Action, PackMaterialMapsAction>) {
+                return pack_material_maps(value);
             } else if constexpr (
                 std::is_same_v<Action, ReimportMaterialTextureSourceAction>) {
                 return reimport_material_texture_source(value);
@@ -3214,6 +3218,9 @@ core::Result<assets::BlobOrphanReport> ApplicationSession::inspect_source_blob_s
         for (const auto& [identity, texture] : document.material_catalog().textures()) {
             static_cast<void>(identity);
             reachable_digests.insert(texture.content_digest);
+            const auto lineage = texture.lineage_digests();
+            if (!lineage) return false;
+            reachable_digests.insert(lineage.value().begin(), lineage.value().end());
         }
         for (const auto& [identity, plane] : document.presentation_catalog().reference_planes()) {
             static_cast<void>(identity);
@@ -4885,6 +4892,8 @@ core::Result<DispatchReceipt> ApplicationSession::save_project(const SaveProject
             }
         }
     }
+    if (auto copied = copy_managed_sources_for_save(*selected); !copied)
+        return failure(copied.error().with_context("save project source assets"));
     auto prepared_journal = prepare_journal(*selected, document_);
     if (!prepared_journal) {
         return failure(prepared_journal.error().with_context("save project journal"));
@@ -12000,7 +12009,8 @@ core::Result<DispatchReceipt> ApplicationSession::import_material_texture_source
 
     project::TextureSourceRecord source;
     source.id = next_id;
-    source.name = "Texture " + action.content_digest.hex().substr(0U, 12U);
+    source.name = action.name.empty()
+        ? "Texture " + action.content_digest.hex().substr(0U, 12U) : action.name;
     source.relative_locator = store.path_for(action.content_digest)
         .lexically_relative(project_root).generic_string();
     source.content_digest = action.content_digest;
@@ -12052,6 +12062,11 @@ core::Result<DispatchReceipt> ApplicationSession::reimport_material_texture_sour
             "material texture reimport source is no longer registered"));
     }
     const auto& current = found->second;
+    if (current.provenance.starts_with("cartographer.bake_adoption.v1;") ||
+        current.provenance.starts_with("cartographer.pbr_pack.v1;")) {
+        return failure(core::Diagnostic(core::ErrorCode::unsupported,
+            "generated maps retain immutable bake/pack lineage; import the replacement as a new texture source and bind it"));
+    }
     if (current.revision != action.expected_texture_revision ||
         current.content_digest != action.expected_content_digest) {
         return failure(core::Diagnostic(
