@@ -5275,6 +5275,38 @@ void orthographic_viewport_zoom_changes_projection_height() {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 3 && std::string_view(argv[1]) == "--write-material-review") {
+            const std::filesystem::path folder(argv[2]);
+            std::filesystem::create_directories(folder);
+            auto device = take(d3d12::D3D12Device::create({{}, false, true}));
+            auto scene = request();
+            scene.width = scene.height = 513U;
+            scene.light = {{0.6, 0.0, 0.8}, {3.0, 3.0, 3.0}};
+            scene.objects.front().materials.front().current_material.definition.base_color_factor = {0.6,0.4,0.2,1.0};
+            rebind(scene.objects.front());
+            std::ofstream receipt(folder / "receipt.txt");
+            receipt << "Synthetic native D3D12 material evidence, not photoreal asset acceptance\n";
+            for (const auto weight : {0.0, 0.5, 1.0}) {
+                scene.objects.front().materials.front().sheen_weight = weight;
+                const auto first = capture(*device, scene);
+                const auto repeat = capture(*device, scene);
+                require(first.srgb_rgba == repeat.srgb_rgba && first.depth == repeat.depth,
+                    "visual review capture is repeatable at matching source identity");
+                const std::string name = "sheen-" + std::to_string(static_cast<int>(weight*100));
+                std::ofstream output(folder / (name+".ppm"), std::ios::binary);
+                output << "P6\n" << scene.width << ' ' << scene.height << "\n255\n";
+                for (std::size_t i=0; i<first.srgb_rgba.size(); i+=4)
+                    output.write(reinterpret_cast<const char*>(first.srgb_rgba.data()+i),3);
+                require(bool(output), "review pixels written");
+                receipt << name << " request=" << first.request_digest.hex()
+                    << " pixels=" << first.pixel_digest.hex() << " adapter=" << first.device.adapter_name << '\n';
+                for (const auto& shader : first.shader_digests) receipt << "shader=" << shader.hex() << '\n';
+                for (const auto& limitation : first.limitations) receipt << "limitation=" << limitation << '\n';
+            }
+            require(bool(receipt) && device->debug_receipts().empty() && !device->device_lost(),
+                "review receipt and native device remain valid");
+            return 0;
+        }
         if (argc == 3 && std::string_view(argv[1]) == "--write-persisted-hdr-fixture") {
             const std::filesystem::path project_path=argv[2];const auto root=project_path.parent_path();
             std::vector<std::uint8_t> encoded{'P','F','\n','1',' ','1','\n','-','1','.','0','\n'};
