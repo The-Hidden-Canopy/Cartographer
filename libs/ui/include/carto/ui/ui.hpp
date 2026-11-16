@@ -410,6 +410,14 @@ struct CommandView {
     std::string unavailable_reason;
 };
 
+// ASCII-insensitive discovery; non-ASCII bytes are compared unchanged.
+[[nodiscard]] bool command_palette_matches(const CommandView& command, std::string_view query) noexcept;
+[[nodiscard]] std::vector<std::size_t> command_palette_results(
+    const std::vector<CommandView>& commands, std::string_view query);
+[[nodiscard]] std::optional<std::size_t> command_palette_next(
+    const std::vector<CommandView>& commands, const std::vector<std::size_t>& results,
+    std::optional<std::size_t> selected, int direction) noexcept;
+
 namespace selection_commands {
 inline constexpr std::string_view to_vertex = "selection.convert.vertex";
 inline constexpr std::string_view to_edge = "selection.convert.edge";

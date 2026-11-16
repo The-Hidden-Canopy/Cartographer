@@ -29,7 +29,7 @@ bool valid_kind(PreviewKind kind) noexcept {
         kind == PreviewKind::inset_face || kind == PreviewKind::set_vertex_position ||
         kind == PreviewKind::poke_face ||
         kind == PreviewKind::set_material_region_assignment ||
-        kind == PreviewKind::generate_unique_lightmap_uv;
+        kind == PreviewKind::generate_unique_lightmap_uv || kind == PreviewKind::slide_vertex;
 }
 
 } // namespace
@@ -37,6 +37,9 @@ bool valid_kind(PreviewKind kind) noexcept {
 core::Result<void> PreviewParameters::validate(PreviewKind kind) const {
     if (!valid_kind(kind)) {
         return core::Result<void>::failure(invalid("preview kind is invalid"));
+    }
+    if (kind != PreviewKind::slide_vertex && (factor.has_value() || support_edge.has_value())) {
+        return core::Result<void>::failure(invalid("non-slide preview contains slide parameters"));
     }
     const bool has_material_parameters = material_region_id.has_value() ||
         material_id.has_value() || material_variant_id.has_value();
@@ -50,6 +53,15 @@ core::Result<void> PreviewParameters::validate(PreviewKind kind) const {
     if (kind != PreviewKind::generate_unique_lightmap_uv && has_lightmap_uv_parameters) {
         return core::Result<void>::failure(invalid(
             "non-lightmap preview contains lightmap UV parameters"));
+    }
+    if (kind == PreviewKind::slide_vertex) {
+        if (!factor.has_value() || !std::isfinite(*factor) || *factor <= 0.0 || *factor >= 1.0 ||
+            (support_edge.has_value() && support_edge->value == 0U) ||
+            transform.has_value() || distance.has_value() || position.has_value()) {
+            return core::Result<void>::failure(invalid(
+                "vertex slide requires only a finite factor strictly between zero and one and an optional non-zero support edge"));
+        }
+        return core::Result<void>::success();
     }
     if (kind == PreviewKind::object_transform) {
         if (!transform.has_value() || distance.has_value() || position.has_value()) {
@@ -156,7 +168,7 @@ core::Result<AuthoringPreview> AuthoringPreview::begin(
             return core::Result<AuthoringPreview>::failure(invalid(
             "face operation preview requires exactly one object-bound selected face"));
     }
-    if (kind == PreviewKind::set_vertex_position &&
+    if ((kind == PreviewKind::set_vertex_position || kind == PreviewKind::slide_vertex) &&
         (context.selection_mode != SelectionMode::vertex || context.vertices.size() != 1U ||
          !context.component_object.has_value())) {
         return core::Result<AuthoringPreview>::failure(invalid(

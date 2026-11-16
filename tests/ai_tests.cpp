@@ -111,7 +111,7 @@ void ontology_is_derived_from_native_tools() {
     REQUIRE(merge_vertices != context.operations.end() && !merge_vertices->preview_supported);
     REQUIRE(dissolve_edge != context.operations.end() && !dissolve_edge->preview_supported);
     REQUIRE(tri_to_quad != context.operations.end() && !tri_to_quad->preview_supported);
-    REQUIRE(slide_vertex != context.operations.end() && !slide_vertex->preview_supported);
+    REQUIRE(slide_vertex != context.operations.end() && slide_vertex->preview_supported);
     REQUIRE(bevel_edge != context.operations.end() && !bevel_edge->preview_supported);
     REQUIRE(bevel_vertex != context.operations.end() && !bevel_vertex->preview_supported);
     REQUIRE(loop_cut != context.operations.end());
@@ -178,7 +178,7 @@ void ontology_is_derived_from_native_tools() {
                 !operation.writes.empty() && !operation.validators.empty();
         }));
     REQUIRE(std::count_if(context.operations.begin(), context.operations.end(),
-        [](const auto& operation) { return operation.provider_requestable; }) == 7);
+        [](const auto& operation) { return operation.provider_requestable; }) == 8);
     REQUIRE(inset->parameter_schema.size() == 1U);
     REQUIRE(inset->parameter_schema.front().type == carto::ai::ParameterType::length);
     REQUIRE(inset->parameter_schema.front().unit == carto::ai::ParameterUnit::world_length);
@@ -229,7 +229,7 @@ void capability_projection_filters_by_preview_and_work_envelope() {
     REQUIRE(!sharp_edge->auto_approvable);
     const auto geometry_only = carto::ai::project_capabilities(
         registry, carto::ai::effect_mask(carto::ai::CapabilityEffect::geometry));
-    REQUIRE(geometry_only.size() == 1U);
+    REQUIRE(geometry_only.size() == 2U);
     REQUIRE(geometry_only.front().id == "mesh.set-vertex-position");
     REQUIRE(geometry_only.front().provider_requestable);
     REQUIRE(carto::ai::project_capabilities(registry, 0U).empty());
@@ -254,7 +254,7 @@ void capability_projection_filters_by_preview_and_work_envelope() {
     const auto geometry_and_material = carto::ai::project_capabilities(
         registry, carto::ai::effect_mask(carto::ai::CapabilityEffect::geometry) |
             carto::ai::effect_mask(carto::ai::CapabilityEffect::material));
-    REQUIRE(geometry_and_material.size() == 2U);
+    REQUIRE(geometry_and_material.size() == 3U);
     REQUIRE(std::none_of(geometry_and_material.begin(), geometry_and_material.end(),
         [](const auto& capability) { return capability.id == "object.translate"; }));
 
@@ -299,7 +299,7 @@ void ontology_fails_closed_on_tool_kernel_contract_drift() {
     const auto projected = carto::ai::project_capabilities(ontology,
         carto::ai::effect_mask(carto::ai::CapabilityEffect::geometry) |
         carto::ai::effect_mask(carto::ai::CapabilityEffect::topology));
-    REQUIRE(projected.size() == 3U);
+    REQUIRE(projected.size() == 4U);
     REQUIRE(std::none_of(projected.begin(), projected.end(), [](const auto& capability) {
         return capability.id == "mesh.extrude-face";
     }));
@@ -709,10 +709,53 @@ void auto_apply_delegates_invalid_geometry_to_the_kernel_without_mutation() {
             before.viewport.scene.instances().front().mesh->triangle_faces.size());
 }
 
+void vertex_slide_proposals_are_typed_bounded_and_review_only() {
+    using namespace carto;
+    application::ApplicationSession source;
+    ui::UiController ui(source);
+    REQUIRE(ui.dispatch(application::CreateBoxAction{"Slide", {1.0, 1.0, 1.0}}));
+    const auto object = source.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::vertex}));
+    REQUIRE(ui.dispatch(application::SelectVertexAction{object, geometry::VertexId{1U}}));
+    const auto context = context_for(source);
+    ai::NativePlanner planner;
+    auto proposal = planner.propose("slide vertex 0.25", context);
+    REQUIRE(proposal);
+    REQUIRE(proposal.value().preview_kind == editor::PreviewKind::slide_vertex);
+    REQUIRE(proposal.value().parameters.factor == 0.25);
+    const auto exact_edge = planner.propose("slide vertex 0.25 along edge 9007199254740993", context);
+    REQUIRE(exact_edge);
+    REQUIRE(exact_edge.value().parameters.support_edge->value == 9007199254740993ULL);
+    REQUIRE(!planner.propose("slide vertex 0.25 along edge 1.5", context));
+    REQUIRE(!planner.propose("slide vertex 0.25 along edge 0", context));
+    REQUIRE(!planner.propose("slide vertex 0.25 along edge 18446744073709551616", context));
+    REQUIRE(!proposal.value().validate_auto_approval(context));
+    REQUIRE(ai::proposal_json(proposal.value()).find("\"factor\":0.250000") != std::string::npos);
+    for (const auto* intent : {"slide vertex 0", "slide vertex 1", "slide vertex -0.1",
+        "slide vertex nan", "slide vertex 0.2m", "slide vertex 0.2 extra", "slide vertex 0.2 0.3"}) {
+        REQUIRE(!planner.propose(intent, context));
+    }
+    auto parameters = proposal.value().parameters;
+    parameters.factor = std::numeric_limits<double>::infinity();
+    REQUIRE(!parameters.validate(editor::PreviewKind::slide_vertex));
+    parameters.factor = 0.5;
+    parameters.support_edge = geometry::EdgeId{0U};
+    REQUIRE(!parameters.validate(editor::PreviewKind::slide_vertex));
+    parameters.support_edge = geometry::EdgeId{1U};
+    REQUIRE(parameters.validate(editor::PreviewKind::slide_vertex));
+    REQUIRE(!parameters.validate(editor::PreviewKind::poke_face));
+    parameters.distance = 0.1;
+    REQUIRE(!parameters.validate(editor::PreviewKind::slide_vertex));
+    auto stale = context;
+    stale.project_revision = context.project_revision.next();
+    REQUIRE(!proposal.value().validate(stale));
+}
+
 } // namespace
 
 int main() {
     try {
+        vertex_slide_proposals_are_typed_bounded_and_review_only();
         ontology_is_derived_from_native_tools();
         ontology_json_preserves_kernel_and_approval_contract();
         capability_projection_filters_by_preview_and_work_envelope();

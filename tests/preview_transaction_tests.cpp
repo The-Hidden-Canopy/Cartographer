@@ -3,6 +3,8 @@
 #include <carto/editor/preview_transaction.hpp>
 #include <carto/ui/ui.hpp>
 
+#include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -242,6 +244,61 @@ void ui_preview_facade_records_only_the_committed_operation() {
     REQUIRE(ui.snapshot().objects.front().object.local_transform.translation.x == 4.0);
 }
 
+void vertex_slide_preview_cancellation_staleness_and_support_are_atomic() {
+    using namespace carto;
+    application::ApplicationSession session;
+    ui::UiController ui(session);
+    REQUIRE(ui.dispatch(application::CreateBoxAction{"Slide", {1.0, 1.0, 1.0}}));
+    REQUIRE(!session.begin_preview(editor::PreviewKind::slide_vertex));
+    const auto object = session.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::vertex}));
+    REQUIRE(ui.dispatch(application::SelectVertexAction{object, geometry::VertexId{1U}}));
+    const auto before = session.snapshot();
+    editor::PreviewParameters parameters;
+    parameters.factor = 0.25;
+    auto canceled = session.begin_preview(editor::PreviewKind::slide_vertex);
+    REQUIRE(canceled);
+    REQUIRE(canceled.value().update(parameters));
+    canceled.value().cancel();
+    REQUIRE(!ui.commit_preview(canceled.value()));
+    REQUIRE(session.snapshot().project_revision == before.project_revision);
+    auto invalid_edge = session.begin_preview(editor::PreviewKind::slide_vertex);
+    REQUIRE(invalid_edge);
+    parameters.support_edge = geometry::EdgeId{999999U};
+    REQUIRE(invalid_edge.value().update(parameters));
+    REQUIRE(!ui.commit_preview(invalid_edge.value()));
+    REQUIRE(session.snapshot().project_revision == before.project_revision);
+    auto stale = session.begin_preview(editor::PreviewKind::slide_vertex);
+    REQUIRE(stale);
+    parameters.support_edge.reset();
+    REQUIRE(stale.value().update(parameters));
+    auto valid = session.begin_preview(editor::PreviewKind::slide_vertex);
+    REQUIRE(valid);
+    REQUIRE(valid.value().update(parameters));
+    REQUIRE(ui.commit_preview(valid.value()));
+    REQUIRE(!ui.commit_preview(valid.value()));
+    REQUIRE(!ui.commit_preview(stale.value()));
+    REQUIRE(session.snapshot().project_revision == before.project_revision.next());
+
+    REQUIRE(ui.dispatch(application::SelectVertexAction{object, geometry::VertexId{1U}}));
+    auto old_generation = session.begin_preview(editor::PreviewKind::slide_vertex);
+    REQUIRE(old_generation);
+    REQUIRE(old_generation.value().update(parameters));
+    const auto temporary = std::filesystem::temp_directory_path() /
+        ("cartographer-slide-generation-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(temporary);
+    const auto project_path = temporary / "generation.carto";
+    REQUIRE(ui.dispatch(application::SaveProjectAction{project_path}));
+    const auto generation_before_reopen = session.snapshot().project_generation;
+    REQUIRE(ui.dispatch(application::OpenProjectAction{project_path, true}));
+    REQUIRE(session.snapshot().project_generation != generation_before_reopen);
+    const auto replacement = session.snapshot();
+    REQUIRE(replacement.project_revision == old_generation.value().base_revision());
+    REQUIRE(!ui.commit_preview(old_generation.value()));
+    REQUIRE(session.snapshot().project_revision == replacement.project_revision);
+}
+
 void preview_validation_is_fail_closed() {
     carto::editor::AuthoringContext context;
     context.selection_mode = carto::editor::SelectionMode::object;
@@ -268,6 +325,7 @@ int main() {
         material_assignment_preview_requires_exact_typed_ids();
         unique_lightmap_uv_preview_is_typed_bounded_and_object_scoped();
         ui_preview_facade_records_only_the_committed_operation();
+        vertex_slide_preview_cancellation_staleness_and_support_are_atomic();
         preview_validation_is_fail_closed();
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';

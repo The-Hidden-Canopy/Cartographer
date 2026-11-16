@@ -3,6 +3,7 @@
 #include <imgui.h>
 
 #include "../apps/desktop/carto_studio_dock.hpp"
+#include "../apps/desktop/studio_command_palette.hpp"
 
 #include <algorithm>
 #include <array>
@@ -987,7 +988,109 @@ void require_viewport_close_restore_keeps_dock_identity() {
 
 } // namespace
 
+void require_palette_keyboard_ownership() {
+    ImGuiContext* previous = ImGui::GetCurrentContext();
+    ImGuiContext* context = ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(640.0F, 480.0F);
+    io.DeltaTime = 1.0F / 60.0F;
+    io.IniFilename = nullptr;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    require(io.Fonts->Build(), "palette font atlas must build");
+    carto::studio::CommandPaletteState state;
+    const std::vector<carto::ui::CommandView> commands{
+        {"mode.first", "First", {}, true, {}},
+        {"mode.future", "Future", {}, false, "Unavailable"},
+        {"mode.third", "Third", {}, true, {}}};
+    std::string query;
+    bool visible = true;
+    auto frame = [&] {
+        ImGui::NewFrame();
+        if (visible) ImGui::SetNextWindowPos(ImVec2(10.0F, 10.0F), ImGuiCond_Always);
+        auto result = carto::studio::draw_command_palette(state, visible, query, commands);
+        query = result.query;
+        if (result.closed) visible = false;
+        ImGui::Render();
+        return result;
+    };
+    const auto open = [&] {
+        visible = false;
+        static_cast<void>(frame());
+        query.clear();
+        visible = true;
+        static_cast<void>(frame());
+        static_cast<void>(frame());
+    };
+    open();
+    auto* window = ImGui::FindWindowByName("Command Palette");
+    require(window != nullptr && ImGui::GetActiveID() == window->GetID("Search"),
+        "palette opening must focus Search");
+    io.AddInputCharactersUTF8("MODE");
+    static_cast<void>(frame());
+    require(query == "MODE", "palette text input must update case-insensitive query");
+    io.AddKeyEvent(ImGuiKey_DownArrow, true);
+    static_cast<void>(frame());
+    require(state.selected == 2U, "search Down must skip unavailable commands");
+    io.AddKeyEvent(ImGuiKey_DownArrow, false);
+    static_cast<void>(frame());
+    io.AddKeyEvent(ImGuiKey_Enter, true);
+    const auto entered = frame();
+    require(entered.command == 2U && entered.closed, "search Enter must invoke selected command once");
+    require(!frame().command.has_value(), "held Enter must not re-invoke a closed palette");
+    io.AddKeyEvent(ImGuiKey_Enter, false);
+    static_cast<void>(frame());
+    open();
+    const ImGuiID third_id = window->GetID("Third##mode.third");
+    for (int tab = 0; tab < 8 && ImGui::GetCurrentContext()->NavId != third_id; ++tab) {
+        io.AddKeyEvent(ImGuiKey_Tab, true);
+        static_cast<void>(frame());
+        io.AddKeyEvent(ImGuiKey_Tab, false);
+        static_cast<void>(frame());
+        static_cast<void>(frame());
+    }
+    require(ImGui::GetActiveID() != window->GetID("Search") &&
+            ImGui::GetCurrentContext()->NavId == third_id,
+        "Tab must leave Search and reach enabled command results");
+    io.AddKeyEvent(ImGuiKey_Enter, true);
+    const auto tab_enter = frame();
+    require(tab_enter.command == 2U && tab_enter.closed,
+        "Enter after real Tab navigation must invoke the focused command");
+    io.AddKeyEvent(ImGuiKey_Enter, false);
+    static_cast<void>(frame());
+    open();
+    // A native navigation selection must win over the Search cursor. This is
+    // the state reached after keyboard focus leaves the text field.
+    ImGui::ClearActiveID();
+    ImGui::FocusWindow(window);
+    ImGui::SetNavID(window->GetID("Third##mode.third"), ImGuiNavLayer_Main, 0,
+        ImRect(ImVec2(0.0F, 0.0F), ImVec2(1.0F, 1.0F)));
+    io.AddKeyEvent(ImGuiKey_Enter, true);
+    const auto native_enter = frame();
+    require(native_enter.command == 2U && native_enter.closed,
+        "native Enter must not invoke the stale default Search selection");
+    io.AddKeyEvent(ImGuiKey_Enter, false);
+    static_cast<void>(frame());
+    open();
+    io.AddKeyEvent(ImGuiKey_Escape, true);
+    const auto escaped = frame();
+    require(escaped.closed && !escaped.command.has_value(), "Escape dismisses without command invocation");
+    io.AddKeyEvent(ImGuiKey_Escape, false);
+    static_cast<void>(frame());
+    open();
+    io.AddInputCharactersUTF8("future");
+    static_cast<void>(frame());
+    io.AddKeyEvent(ImGuiKey_Enter, true);
+    const auto unavailable = frame();
+    require(!unavailable.closed && !unavailable.command.has_value(),
+        "Enter must never activate an unavailable search result");
+    io.AddKeyEvent(ImGuiKey_Enter, false);
+    static_cast<void>(frame());
+    ImGui::DestroyContext(context);
+    ImGui::SetCurrentContext(previous);
+}
+
 int main() {
+    require_palette_keyboard_ownership();
     ImGuiContext* context = ImGui::CreateContext();
     if (context == nullptr) return 2;
     ImGuiIO& io = ImGui::GetIO();

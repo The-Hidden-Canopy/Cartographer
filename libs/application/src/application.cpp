@@ -4363,7 +4363,12 @@ core::Result<editor::AuthoringPreview> ApplicationSession::begin_preview(
     if (!context) {
         return core::Result<editor::AuthoringPreview>::failure(context.error());
     }
-    return editor::AuthoringPreview::begin(document_.revision(), context.value(), kind);
+    auto preview = editor::AuthoringPreview::begin(document_.revision(), context.value(), kind);
+    if (preview) {
+        preview.value().session_owner_ = this;
+        preview.value().project_generation_ = project_generation_;
+    }
+    return preview;
 }
 
 core::Result<ApplicationAction> ApplicationSession::preview_action(
@@ -4415,6 +4420,16 @@ core::Result<ApplicationAction> ApplicationSession::preview_action(
         return core::Result<ApplicationAction>::success(InvokeToolAction{
             "mesh.inset-face", editor::ToolArguments{
                 *parameters.distance, {}, true, 0.5, std::nullopt}});
+    }
+    if (preview.kind() == editor::PreviewKind::slide_vertex) {
+        if (auto valid = parameters.validate(preview.kind()); !valid) {
+            return core::Result<ApplicationAction>::failure(valid.error());
+        }
+        editor::ToolArguments arguments;
+        arguments.factor = *parameters.factor;
+        arguments.support_edge = parameters.support_edge;
+        return core::Result<ApplicationAction>::success(InvokeToolAction{
+            "mesh.slide-vertex", arguments});
     }
     if (preview.kind() == editor::PreviewKind::poke_face) {
         if (parameters.transform.has_value() || parameters.distance.has_value() ||
@@ -4482,6 +4497,11 @@ core::Result<DispatchReceipt> ApplicationSession::commit_preview(
     editor::AuthoringPreview& preview,
     OperationSource source,
     std::string_view provenance_id) {
+    if (preview.kind() == editor::PreviewKind::slide_vertex &&
+        (preview.session_owner_ != this || preview.project_generation_ != project_generation_)) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "vertex slide preview belongs to another project generation or session"));
+    }
     if (auto result = preview.validate_commit(document_.revision()); !result) {
         return failure(result.error().with_context("preview commit"));
     }

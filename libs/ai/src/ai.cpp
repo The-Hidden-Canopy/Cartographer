@@ -144,6 +144,7 @@ std::string preview_name(editor::PreviewKind kind) {
     case editor::PreviewKind::extrude_face: return "extrude_face";
     case editor::PreviewKind::inset_face: return "inset_face";
     case editor::PreviewKind::set_vertex_position: return "set_vertex_position";
+    case editor::PreviewKind::slide_vertex: return "slide_vertex";
     case editor::PreviewKind::poke_face: return "poke_face";
     case editor::PreviewKind::set_material_region_assignment:
         return "set_material_region_assignment";
@@ -304,7 +305,8 @@ void add_capability_contract(
     if (descriptor.kernel_operation == "unclassified") return;
 
     const bool position_only =
-        tool.kernel == editor::ToolKernelKind::editable_mesh_set_vertex_position;
+        tool.kernel == editor::ToolKernelKind::editable_mesh_set_vertex_position ||
+        tool.kernel == editor::ToolKernelKind::editable_mesh_slide_vertex;
     const bool topology_change = !position_only;
     const std::uint32_t geometry = effect_mask(CapabilityEffect::geometry);
     const std::uint32_t topology = effect_mask(CapabilityEffect::topology);
@@ -681,7 +683,8 @@ core::Result<void> Proposal::validate(const Context& expected) const {
             return core::Result<void>::failure(invalid_state(
                 "face proposal requires exactly one object-bound selected face"));
         }
-    } else if (preview_kind == editor::PreviewKind::set_vertex_position) {
+    } else if (preview_kind == editor::PreviewKind::set_vertex_position ||
+        preview_kind == editor::PreviewKind::slide_vertex) {
         if (expected.authoring.selection_mode != editor::SelectionMode::vertex ||
             expected.authoring.vertices.size() != 1U ||
             !expected.authoring.component_object.has_value()) {
@@ -766,7 +769,9 @@ std::vector<OperationDescriptor> build_operation_ontology(
             descriptor.kernel_operation = "geometry.EditableMesh.slide_vertex";
             descriptor.parameters = {"factor", "support_edge"};
             descriptor.precondition =
-                "exactly one object-bound vertex selected; support edge must be incident or omitted for deterministic lowest-edge selection; finite factor strictly between zero and one; resulting mesh remains valid; operation requires a future preview contract";
+                "exactly one object-bound vertex selected; support edge must be incident or omitted for deterministic lowest-edge selection; finite factor strictly between zero and one; resulting mesh remains valid";
+            descriptor.preview_supported = true;
+            descriptor.preview_kind = editor::PreviewKind::slide_vertex;
         } else if (matches("mesh.remove-face", editor::ToolKernelKind::editable_mesh_delete_face)) {
             descriptor.kernel_operation = "geometry.EditableMesh.delete_face";
             descriptor.parameters = {"remove_orphaned_vertices"};
@@ -1110,6 +1115,12 @@ std::string proposal_json(const Proposal& proposal) {
         "\",\"preview_kind\":\"" + preview_name(proposal.preview_kind) +
         "\",\"intent\":\"" + json_escape(proposal.intent) +
         "\",\"rationale\":\"" + json_escape(proposal.rationale) + "\"";
+    if (proposal.parameters.factor.has_value()) {
+        result += ",\"factor\":" + std::to_string(*proposal.parameters.factor);
+    }
+    if (proposal.parameters.support_edge.has_value()) {
+        result += ",\"support_edge\":" + std::to_string(proposal.parameters.support_edge->value);
+    }
     if (proposal.parameters.distance.has_value()) {
         result += ",\"distance\":" + std::to_string(*proposal.parameters.distance);
     }
@@ -1274,6 +1285,36 @@ core::Result<Proposal> NativePlanner::propose(
                 parsed_numbers.value()[2]});
     }
 
+    if (words.front() == "slide" || words.front() == "slide-vertex") {
+        const std::size_t factor_index = words.front() == "slide-vertex" ? 1U : 2U;
+        const bool prefix = words.front() == "slide-vertex" ||
+            (words.size() > 1U && words[1] == "vertex");
+        const bool with_edge = words.size() == factor_index + 4U &&
+            words[factor_index + 1U] == "along" && words[factor_index + 2U] == "edge";
+        if (!prefix || (words.size() != factor_index + 1U && !with_edge)) {
+            return core::Result<Proposal>::failure(invalid(
+                "slide intent must be `slide vertex <factor>` or `slide-vertex <factor>`, optionally followed by `along edge <id>`"));
+        }
+        if (words[factor_index].ends_with('m')) {
+            return core::Result<Proposal>::failure(invalid("slide factor is dimensionless, not a length"));
+        }
+        const auto factor = parse_number(words[factor_index]);
+        if (!factor) return core::Result<Proposal>::failure(factor.error());
+        editor::PreviewParameters parameters;
+        parameters.factor = factor.value();
+        if (with_edge) {
+            const auto edge = parse_unsigned_identity(words.back());
+            if (!edge) return core::Result<Proposal>::failure(edge.error());
+            parameters.support_edge = geometry::EdgeId{edge.value()};
+        }
+        Proposal proposal{request_id, context.project_revision, context.authoring,
+            editor::PreviewKind::slide_vertex, parameters, "mesh.slide-vertex", std::string(intent),
+            "Slide along an incident edge (lowest stable edge when omitted) by a unit-interval factor; explicit review required."};
+        if (auto valid = proposal.validate(context); !valid) {
+            return core::Result<Proposal>::failure(valid.error());
+        }
+        return core::Result<Proposal>::success(std::move(proposal));
+    }
     if (words.front() == "extrude" || words.front() == "extrude-face") {
         const bool exact_syntax = parsed_numbers.value().size() == 1U &&
             static_cast<bool>(parse_number(words.back())) &&
@@ -1338,7 +1379,7 @@ core::Result<Proposal> NativePlanner::propose(
         return core::Result<Proposal>::success(std::move(proposal));
     }
     return core::Result<Proposal>::failure(invalid(
-        "native planner supports translate object, extrude, inset, poke face, move vertex, "
+        "native planner supports translate object, extrude, inset, poke face, move vertex, slide vertex, "
         "material assignment, and lightmap UV generation intents"));
 }
 

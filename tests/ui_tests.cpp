@@ -3744,6 +3744,28 @@ void ui_failed_shortcuts_and_actions_remain_bounded() {
     REQUIRE(!ui.snapshot().problems.empty());
 }
 
+void command_palette_search_and_navigation_are_deterministic() {
+    using namespace carto::ui;
+    const std::vector<CommandView> commands{
+        {"mode.face", "Face Mode", "3", true, {}},
+        {"mesh.future", "Face Future", {}, false, "not supported"},
+        {"selection.face", "Select Face", {}, true, {}}};
+    REQUIRE(command_palette_matches(commands[0], "FACE"));
+    REQUIRE(command_palette_matches(commands[0], "MODE.F"));
+    REQUIRE(!command_palette_matches(commands[0], "facex"));
+    const auto results = command_palette_results(commands, "FaCe");
+    REQUIRE(results.size() == 3U);
+    REQUIRE(command_palette_next(commands, results, std::nullopt, 0) == 0U);
+    REQUIRE(command_palette_next(commands, results, 0U, 1) == 2U);
+    REQUIRE(command_palette_next(commands, results, 2U, 1) == 0U);
+    REQUIRE(command_palette_next(commands, results, 0U, -1) == 2U);
+    REQUIRE(command_palette_next(commands, results, 2U, 0) == 2U);
+    REQUIRE(!command_palette_next(commands, {1U}, std::nullopt, 1));
+    REQUIRE(!command_palette_next(commands, {}, 0U, -1));
+    REQUIRE(!command_palette_next(commands, {99U}, 0U, 1));
+    REQUIRE(command_palette_results(commands, "not found").empty());
+}
+
 void ui_command_palette_is_bounded_and_explicit_about_deferred_features() {
     carto::application::ApplicationSession session;
     carto::ui::UiController ui(session);
@@ -5551,6 +5573,7 @@ int main() {
         ui_routes_source_reimport_review_and_keeps_ai_out_of_mutation_path();
         ui_connects_local_market_boundary_and_fails_closed();
         ui_failed_shortcuts_and_actions_remain_bounded();
+        command_palette_search_and_navigation_are_deterministic();
         ui_command_palette_is_bounded_and_explicit_about_deferred_features();
         native_key_contract_maps_core_control_without_imgui();
         workspace_registry_is_canonical_and_fail_closed();

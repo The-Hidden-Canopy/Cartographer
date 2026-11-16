@@ -671,7 +671,10 @@ ai::Context make_ai_context(
     std::uint32_t permitted_effects =
         ai::effect_mask(ai::CapabilityEffect::geometry) |
         ai::effect_mask(ai::CapabilityEffect::topology)) {
-    const auto ontology = ai::build_operation_ontology(snapshot.tools);
+    auto ontology = ai::build_operation_ontology(snapshot.tools);
+    // Slide is exposed only in the bounded workbench, with ghost review,
+    // shared-instance scope, effect budgets and project-generation fencing.
+    std::erase_if(ontology, [](const auto& operation) { return operation.id == "mesh.slide-vertex"; });
     return ai::Context{
         snapshot.project_revision,
         authoring,
@@ -688,7 +691,8 @@ bool same_ai_preview(
     }
     const auto& expected = proposal.parameters;
     const auto& actual = preview.parameters();
-    if (expected.distance != actual.distance) return false;
+    if (expected.distance != actual.distance || expected.factor != actual.factor ||
+        expected.support_edge != actual.support_edge) return false;
     if (expected.position.has_value() != actual.position.has_value()) return false;
     if (expected.position.has_value()) {
         const auto& left = *expected.position;
@@ -11943,6 +11947,41 @@ core::Result<void> UiController::handle_shortcut(Shortcut shortcut) {
         return set_operator_mode(OperatorMode::ai_first);
     }
     return core::Result<void>::failure(invalid("shortcut is invalid"));
+}
+
+bool command_palette_matches(const CommandView& command, std::string_view query) noexcept {
+    const auto lower = [](unsigned char c) { return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c; };
+    const auto contains = [&](std::string_view text) {
+        return std::search(text.begin(), text.end(), query.begin(), query.end(),
+            [&](unsigned char a, unsigned char b) { return lower(a) == lower(b); }) != text.end();
+    };
+    return query.empty() || contains(command.label) || contains(command.id);
+}
+
+std::vector<std::size_t> command_palette_results(
+    const std::vector<CommandView>& commands, std::string_view query) {
+    std::vector<std::size_t> result;
+    for (std::size_t i = 0; i < commands.size(); ++i) {
+        if (command_palette_matches(commands[i], query)) result.push_back(i);
+    }
+    return result;
+}
+
+std::optional<std::size_t> command_palette_next(
+    const std::vector<CommandView>& commands, const std::vector<std::size_t>& results,
+    std::optional<std::size_t> selected, int direction) noexcept {
+    const auto valid = [&](std::size_t row) {
+        return row < results.size() && results[row] < commands.size() && commands[results[row]].supported;
+    };
+    if (results.empty()) return std::nullopt;
+    if (direction == 0 && selected && valid(*selected)) return selected;
+    std::size_t row = selected && *selected < results.size() ? *selected :
+        (direction < 0 ? 0U : results.size() - 1U);
+    for (std::size_t count = 0; count < results.size(); ++count) {
+        row = direction < 0 ? (row == 0 ? results.size() - 1U : row - 1U) : (row + 1U) % results.size();
+        if (valid(row)) return row;
+    }
+    return std::nullopt;
 }
 
 core::Result<void> UiController::set_command_palette_query(std::string query) {

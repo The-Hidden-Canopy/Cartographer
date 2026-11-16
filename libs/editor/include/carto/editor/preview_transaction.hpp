@@ -26,6 +26,7 @@ enum class PreviewKind {
     poke_face,
     set_material_region_assignment,
     generate_unique_lightmap_uv,
+    slide_vertex,
 };
 
 struct PreviewParameters {
@@ -62,6 +63,9 @@ struct PreviewParameters {
     std::optional<std::uint32_t> lightmap_resolution;
     std::optional<std::uint32_t> lightmap_padding_texels;
     std::optional<std::uint32_t> lightmap_maximum_udim_tiles;
+
+    std::optional<double> factor;
+    std::optional<geometry::EdgeId> support_edge;
 
     [[nodiscard]] core::Result<void> validate(PreviewKind kind) const;
 };
@@ -105,6 +109,8 @@ private:
         committed_ = true;
     }
 
+    const application::ApplicationSession* session_owner_ = nullptr;
+    std::uint64_t project_generation_ = 0U;
     core::Revision base_revision_;
     AuthoringContext context_;
     PreviewKind kind_ = PreviewKind::object_transform;

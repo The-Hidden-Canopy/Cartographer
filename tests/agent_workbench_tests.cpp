@@ -3301,6 +3301,74 @@ void agent_acceptance_rolls_back_when_durable_journal_append_fails() {
         baseline_recovery.value().journal_entry_count);
 }
 
+void vertex_slide_acceptance_rolls_back_on_journal_failure() {
+    TempDirectory temp;
+    const auto path = temp.path() / "agent-rollback.carto";
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 1U);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        source, carto::application::SaveProjectAction{path}));
+    const auto baseline_recovery =
+        carto::application::ApplicationSession::inspect_recovery(path);
+    REQUIRE(baseline_recovery);
+    REQUIRE(baseline_recovery.value().state ==
+        carto::application::RecoveryInspectionState::clean);
+
+    const auto read_bytes = [](const std::filesystem::path& file) {
+        std::ifstream input(file, std::ios::binary);
+        REQUIRE(input.good());
+        return std::string(std::istreambuf_iterator<char>(input),
+            std::istreambuf_iterator<char>());
+    };
+    const std::string project_bytes = read_bytes(path);
+    const std::filesystem::path journal_path = baseline_recovery.value().journal_path;
+    REQUIRE(journal_path.parent_path() == temp.path());
+    const std::string journal_bytes = read_bytes(journal_path);
+    const auto before = source.snapshot();
+    auto plan = plan_for(before, objects, {
+        {"step-1", {objects[0], carto::geometry::VertexId{1U}}, "slide vertex 0.25"},
+    });
+    auto task = carto::agent::AgentTask::begin(
+        source, std::move(plan), envelope_for(objects));
+    REQUIRE(task);
+    REQUIRE(task.value().run());
+    REQUIRE(task.value().snapshot().status == carto::agent::TaskStatus::review);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+
+    std::filesystem::path preserved_journal = journal_path;
+    preserved_journal += ".preserved";
+    std::error_code error;
+    std::filesystem::rename(journal_path, preserved_journal, error);
+    REQUIRE(!error);
+    REQUIRE(std::filesystem::create_directory(journal_path, error));
+    REQUIRE(!error);
+
+    const auto acceptance =
+        carto::application::HumanApplicationAccess::accept_agent_task(task.value());
+    REQUIRE(!acceptance);
+    REQUIRE(task.value().snapshot().status == carto::agent::TaskStatus::blocked);
+    const auto after_failure = source.snapshot();
+    REQUIRE(after_failure.project_revision == before.project_revision);
+    REQUIRE(after_failure.project_generation == before.project_generation);
+    REQUIRE(after_failure.dirty == before.dirty);
+    REQUIRE(after_failure.undo_count == before.undo_count);
+    REQUIRE(after_failure.redo_count == before.redo_count);
+    REQUIRE(read_bytes(path) == project_bytes);
+
+    std::filesystem::remove(journal_path, error);
+    REQUIRE(!error);
+    std::filesystem::rename(preserved_journal, journal_path, error);
+    REQUIRE(!error);
+    REQUIRE(read_bytes(journal_path) == journal_bytes);
+    const auto restored_recovery =
+        carto::application::ApplicationSession::inspect_recovery(path);
+    REQUIRE(restored_recovery);
+    REQUIRE(restored_recovery.value().state ==
+        carto::application::RecoveryInspectionState::clean);
+    REQUIRE(restored_recovery.value().journal_entry_count ==
+        baseline_recovery.value().journal_entry_count);
+}
+
 void agent_material_assignment_is_speculative_reviewed_and_checkpointed() {
     TempDirectory temp;
     carto::application::ApplicationSession source;
@@ -6823,6 +6891,62 @@ void shared_mesh_instances_must_be_in_scope_and_within_touch_budget() {
     REQUIRE(source.snapshot().project_revision == before.project_revision);
 }
 
+void vertex_slide_shared_mesh_scope_and_touch_budget() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 1U);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        source, carto::application::DuplicateMeshInstanceAction{
+            objects[0], "Shared mesh copy", {2.0, 0.0, 0.0}}));
+    const auto before = source.snapshot();
+    REQUIRE(before.objects.size() == 2U);
+    const auto shared_mesh = before.objects[0].object.mesh_asset;
+    REQUIRE(shared_mesh.has_value());
+    REQUIRE(before.objects[1].object.mesh_asset == shared_mesh);
+    const auto sibling = before.objects[0].object.id == objects[0]
+        ? before.objects[1].object.id : before.objects[0].object.id;
+
+    auto outside_scope = plan_for(before, {objects[0]}, {
+        {"step-1", {objects[0], carto::geometry::VertexId{1U}}, "slide vertex 0.25"},
+    });
+    auto isolated = carto::agent::AgentTask::begin(
+        source, std::move(outside_scope), envelope_for({objects[0]}));
+    REQUIRE(isolated);
+    const auto isolated_run = isolated.value().run();
+    REQUIRE(isolated_run);
+    REQUIRE(isolated_run.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(isolated_run.value().diagnostic->message.find("shared by an object outside") !=
+            std::string::npos);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+
+    auto over_budget = plan_for(before, {objects[0], sibling}, {
+        {"step-1", {objects[0], carto::geometry::VertexId{1U}}, "slide vertex 0.25"},
+    });
+    auto one_object_only = envelope_for({objects[0], sibling});
+    one_object_only.max_objects_touched = 1U;
+    auto bounded = carto::agent::AgentTask::begin(
+        source, std::move(over_budget), std::move(one_object_only));
+    REQUIRE(bounded);
+    const auto bounded_run = bounded.value().run();
+    REQUIRE(bounded_run);
+    REQUIRE(bounded_run.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(bounded_run.value().diagnostic->message.find("object-touch budget") !=
+            std::string::npos);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+
+    auto protects_sibling = plan_for(before, {objects[0], sibling}, {
+        {"step-1", {objects[0], carto::geometry::VertexId{1U}}, "slide vertex 0.25"},
+    }, {sibling});
+    auto protected_task = carto::agent::AgentTask::begin(
+        source, std::move(protects_sibling), envelope_for({objects[0], sibling}));
+    REQUIRE(protected_task);
+    const auto protected_run = protected_task.value().run();
+    REQUIRE(protected_run);
+    REQUIRE(protected_run.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(protected_run.value().diagnostic->message.find("protected by the objective") !=
+            std::string::npos);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+}
+
 void shared_mesh_geometry_respects_locked_instances_before_speculative_mutation() {
     using namespace carto;
     for (const bool vertex_edit : {false, true}) {
@@ -6918,6 +7042,94 @@ void shared_mesh_geometry_respects_locked_instances_before_speculative_mutation(
                     source, application::RedoAction{}));
                 REQUIRE(source.snapshot().viewport.scene.find(target)->mesh->source_revision ==
                     accepted.viewport.scene.find(target)->mesh->source_revision);
+            }
+        }
+    }
+}
+
+void vertex_slide_shared_mesh_locked_instances_are_refused() {
+    using namespace carto;
+    for (const bool vertex_edit : {true}) {
+        for (const bool locked_sibling : {true, false}) {
+            TempDirectory directory;
+            journal::Journal fixture_journal(directory.path() / "fixture.journal");
+            auto box = geometry::make_box({1.0, 1.0, 1.0});
+            REQUIRE(box);
+            std::uint64_t mesh_asset = 0U;
+            auto document = make_project_with_mesh(
+                fixture_journal, std::move(box.value()), mesh_asset);
+            auto fixture = project::ProjectTransaction::begin(
+                document, fixture_journal, "agent-shared-lock-fixture");
+            REQUIRE(fixture);
+            const scene::ObjectId target{1U};
+            const scene::ObjectId sibling{2U};
+            scene::SceneObject first;
+            first.id = target;
+            first.name = "Unlocked target";
+            first.mesh_asset = mesh_asset;
+            REQUIRE(fixture.value().insert_object(first));
+            scene::SceneObject second = first;
+            second.id = sibling;
+            second.name = "Shared sibling";
+            second.local_transform.translation.x = 2.0;
+            second.locked = locked_sibling;
+            REQUIRE(fixture.value().insert_object(second));
+            REQUIRE(fixture.value().commit("agent-shared-lock.fixture"));
+            const auto project_path = directory.path() / "shared-lock.carto";
+            REQUIRE(document.save_atomic(project_path));
+
+            application::ApplicationSession source;
+            REQUIRE(application::HumanApplicationAccess::dispatch(
+                source, application::OpenProjectAction{project_path}));
+            REQUIRE(application::HumanApplicationAccess::dispatch(
+                source, application::SaveProjectAction{project_path}));
+            const auto before = source.snapshot();
+            const auto recovery_before = application::ApplicationSession::inspect_recovery(
+                project_path);
+            REQUIRE(recovery_before);
+            const auto* before_mesh = before.viewport.scene.find(target)->mesh.get();
+            REQUIRE(before_mesh != nullptr);
+            agent::TargetRef step_target{target, geometry::FaceId{1U}};
+            if (vertex_edit) step_target.component = before_mesh->vertex_ids.front();
+            const auto plan = plan_for(before, {target, sibling}, {{
+                "step-1", step_target,
+                vertex_edit ? "slide vertex 0.25" : "inset face 0.1"}});
+            auto task = agent::AgentTask::begin(
+                source, plan, envelope_for({target, sibling}));
+            REQUIRE(task);
+            const auto run = task.value().run();
+            REQUIRE(run);
+            REQUIRE(source.snapshot().project_revision == before.project_revision);
+            REQUIRE(source.snapshot().project_generation == before.project_generation);
+            const auto recovery_after_preview = application::ApplicationSession::inspect_recovery(
+                project_path);
+            REQUIRE(recovery_after_preview);
+            REQUIRE(recovery_after_preview.value().journal_entry_count ==
+                recovery_before.value().journal_entry_count);
+
+            if (locked_sibling) {
+                REQUIRE(run.value().status == agent::TaskStatus::blocked);
+                REQUIRE(!run.value().can_accept);
+                REQUIRE(run.value().steps.size() == 1U);
+                REQUIRE(run.value().steps.front().status == agent::StepStatus::failed);
+                REQUIRE(run.value().steps.front().revision_before ==
+                    run.value().steps.front().revision_after);
+                REQUIRE(run.value().steps.front().diagnostic.has_value());
+                REQUIRE(run.value().steps.front().diagnostic->message.find(
+                    "locked shared-mesh instance") != std::string::npos);
+                REQUIRE(!run.value().diff.has_changes());
+                REQUIRE(!application::HumanApplicationAccess::accept_agent_task(task.value()));
+            } else {
+                REQUIRE(run.value().status == agent::TaskStatus::blocked);
+                REQUIRE(!run.value().can_accept);
+                REQUIRE(run.value().diagnostic.has_value());
+                REQUIRE(run.value().diagnostic->message.find(
+                    "project vertex sliding refuses mesh assets shared with other objects") != std::string::npos);
+                REQUIRE(!run.value().diff.has_changes());
+                REQUIRE(!application::HumanApplicationAccess::accept_agent_task(task.value()));
+                REQUIRE(source.snapshot().project_revision == before.project_revision);
+                REQUIRE(source.snapshot().viewport.scene.find(target)->mesh->source_revision ==
+                    before_mesh->source_revision);
             }
         }
     }
@@ -7875,6 +8087,67 @@ void ui_workbench_captures_selection_and_exposes_accept_reject_flow() {
     REQUIRE(ui.accept_agent_plan());
     REQUIRE(ui.snapshot().agent_task->status == carto::agent::TaskStatus::accepted);
     REQUIRE(ui.snapshot().project_revision == source_revision.next());
+}
+
+void vertex_slide_shares_human_semantics_and_review_history() {
+    using namespace carto;
+    application::ApplicationSession source;
+    application::ApplicationSession human;
+    ui::UiController ui(source), human_ui(human);
+    for (auto* controller : {&ui, &human_ui}) {
+        REQUIRE(controller->dispatch(application::CreateBoxAction{"Slide", {1.0, 1.0, 1.0}}));
+        REQUIRE(controller->dispatch(application::SetSelectionModeAction{editor::SelectionMode::vertex}));
+        REQUIRE(controller->dispatch(application::SelectVertexAction{scene::ObjectId{1U}, geometry::VertexId{1U}}));
+    }
+    const auto before = source.snapshot();
+    const auto positions = [](const application::ApplicationSnapshot& snapshot) {
+        return snapshot.viewport.scene.instances().front().mesh->positions;
+    };
+    const auto before_positions = positions(before);
+    REQUIRE(!ui.apply_ai_intent("slide vertex 0.25"));
+    REQUIRE(ui.queue_agent_step("slide vertex 0.25"));
+    const auto run = ui.run_agent_plan("Slide the selected vertex along its lowest stable incident edge");
+    REQUIRE(run);
+    if (!run.value().can_accept) throw TestFailure(run.value().diagnostic ? run.value().diagnostic->message : "slide not acceptable");
+    REQUIRE(run.value().status == agent::TaskStatus::review);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+    editor::ToolArguments arguments;
+    arguments.factor = 0.25;
+    REQUIRE(human_ui.dispatch(application::InvokeToolAction{"mesh.slide-vertex", arguments}));
+    REQUIRE(ui.accept_agent_plan());
+    REQUIRE(!ui.accept_agent_plan());
+    const auto after = source.snapshot();
+    const auto equivalent = [](const auto& a, const auto& b) {
+        if (a.size() != b.size()) return false;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            if (a[i].x != b[i].x || a[i].y != b[i].y || a[i].z != b[i].z) return false;
+        }
+        return true;
+    };
+    REQUIRE(equivalent(positions(after), positions(human.snapshot())));
+    const auto& mesh_after = *after.viewport.scene.instances().front().mesh;
+    const auto& mesh_before = *before.viewport.scene.instances().front().mesh;
+    const auto human_after = human.snapshot();
+    const auto& human_mesh = *human_after.viewport.scene.instances().front().mesh;
+    REQUIRE(mesh_after.indices == human_mesh.indices);
+    REQUIRE(mesh_after.vertex_ids == mesh_before.vertex_ids);
+    REQUIRE(mesh_after.triangle_faces == human_mesh.triangle_faces);
+    REQUIRE(mesh_after.triangle_edges == human_mesh.triangle_edges);
+    REQUIRE(!equivalent(positions(after), before_positions));
+    REQUIRE(after.project_revision == before.project_revision.next());
+    // Speculative acceptance replaces the document with one atomic undo boundary.
+    REQUIRE(after.undo_count == 1U);
+    REQUIRE(ui.dispatch(application::UndoAction{}));
+    REQUIRE(equivalent(positions(source.snapshot()), before_positions));
+    REQUIRE(ui.dispatch(application::RedoAction{}));
+    REQUIRE(equivalent(positions(source.snapshot()), positions(after)));
+    TempDirectory directory;
+    const auto path = directory.path() / "slide.carto";
+    REQUIRE(ui.dispatch(application::SaveProjectAction{path}));
+    application::ApplicationSession reopened;
+    ui::UiController reopened_ui(reopened);
+    REQUIRE(reopened_ui.dispatch(application::OpenProjectAction{path}));
+    REQUIRE(equivalent(positions(reopened.snapshot()), positions(after)));
 }
 
 void ui_agent_workbench_pokes_faces_only_on_a_reviewed_branch() {
@@ -10077,6 +10350,10 @@ int main() {
         ui_compiled_constraints_are_bound_to_clarification_and_gate_execution();
         acceptance_evidence_binds_validator_revision_assets_and_result();
         ui_workbench_captures_selection_and_exposes_accept_reject_flow();
+        vertex_slide_shared_mesh_locked_instances_are_refused();
+        vertex_slide_shared_mesh_scope_and_touch_budget();
+        vertex_slide_acceptance_rolls_back_on_journal_failure();
+        vertex_slide_shares_human_semantics_and_review_history();
         ui_agent_workbench_pokes_faces_only_on_a_reviewed_branch();
         ui_agent_entry_preserves_context_selection_across_workspaces();
         ui_prepared_task_supports_condition_preflight_and_rechecks_source_revision();

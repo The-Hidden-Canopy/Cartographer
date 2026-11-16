@@ -39,6 +39,7 @@
 #include "reference_image_decoder.hpp"
 #include "reference_image_projection.hpp"
 #include "studio_browser.hpp"
+#include "studio_command_palette.hpp"
 #include "studio_chrome.hpp"
 #include "studio_file_picker.hpp"
 #include "studio_native_chrome.hpp"
@@ -6902,6 +6903,7 @@ struct DesktopState {
     }
 
     bool route_native_key(const carto::ui::NativeKeyEvent& event) {
+        if (ui.snapshot().command_palette_open) return false;
         if (ImGui::GetCurrentContext() != nullptr && ImGui::GetIO().WantTextInput) {
             return false;
         }
@@ -10527,6 +10529,9 @@ struct DesktopState {
     }
 
     void route_shortcuts() {
+        // The palette owns keyboard dismissal while open. Do not also cancel
+        // placement, loop-cut picking or viewport focus underneath it.
+        if (ui.snapshot().command_palette_open) return;
         const ImGuiIO& io = ImGui::GetIO();
         if (workbench.placement_mode.has_value() &&
             ImGui::IsKeyPressed(ImGuiKey_Escape)) {
@@ -11259,32 +11264,16 @@ struct DesktopState {
         }
     }
 
+    carto::studio::CommandPaletteState command_palette_state;
+
     void draw_command_palette(const UiSnapshot& snapshot) {
-        if (!snapshot.command_palette_open) return;
-        bool open = true;
-        if (!ImGui::Begin("Command Palette", &open, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::End();
-            return;
+        const auto result = carto::studio::draw_command_palette(command_palette_state,
+            snapshot.command_palette_open, snapshot.command_palette_query, snapshot.commands);
+        if (result.query != snapshot.command_palette_query) {
+            static_cast<void>(ui.set_command_palette_query(result.query));
         }
-        std::array<char, 1025> query{};
-        const std::size_t copy_bytes = std::min(snapshot.command_palette_query.size(), query.size() - 1U);
-        std::copy_n(snapshot.command_palette_query.data(), copy_bytes, query.data());
-        if (ImGui::InputText("Search", query.data(), query.size())) {
-            static_cast<void>(ui.set_command_palette_query(std::string(query.data())));
-        }
-        for (const auto& command : snapshot.commands) {
-            if (!snapshot.command_palette_query.empty() &&
-                command.label.find(snapshot.command_palette_query) == std::string::npos &&
-                command.id.find(snapshot.command_palette_query) == std::string::npos) {
-                continue;
-            }
-            if (!command.supported) {
-                ImGui::TextDisabled("%s — unavailable: %s", command.label.c_str(),
-                                   command.unavailable_reason.c_str());
-                continue;
-            }
-            if (ImGui::Selectable((command.label +
-                                  (command.shortcut.empty() ? "" : "    " + command.shortcut)).c_str())) {
+        if (result.command.has_value()) {
+            const auto& command = snapshot.commands[*result.command];
                 if (command.id == "project.save") static_cast<void>(save_project(ui.snapshot()));
                 else if (command.id == "file.import-mesh") import_mesh();
                 else if (command.id == "edit.duplicate") duplicate_selected_object(ui.snapshot());
@@ -11324,12 +11313,8 @@ struct DesktopState {
                 }
                 else if (command.id == "create.box") dispatch(carto::application::CreateBoxAction{"Box", {2.0, 2.0, 2.0}});
                 else if (command.id == "create.plane") dispatch(carto::application::CreatePlaneAction{"Plane", 2.0, 2.0});
-                static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::close_overlay));
-                break;
-            }
         }
-        if (!open) static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::close_overlay));
-        ImGui::End();
+        if (result.closed) static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::close_overlay));
     }
 
     void draw_outliner(const ApplicationSnapshot& snapshot) {
