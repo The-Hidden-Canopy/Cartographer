@@ -417,7 +417,7 @@ struct GltfMaterialWriter::Impl {
             }
             auto t=baked_texture(baked->maps[5]);if(!t)return Result<GltfMaterialProjection>::failure(t.error());clearcoat_info=std::move(t.value());
             report.warnings.push_back("Explicit material graph bake: "+std::to_string(options.graph_bake_resolution)+
-                "x"+std::to_string(options.graph_bake_resolution)+" RGBA8, unit UV tile, finite-resolution/color quantization; program "+baked->program_digest.hex()+". Analytic/minification parity is not implied. Cartographer's current glTF importer cannot reimport baked clearcoat textures or non-mip samplers.");
+                "x"+std::to_string(options.graph_bake_resolution)+" RGBA8, unit UV tile, finite-resolution/color quantization; program "+baked->program_digest.hex()+". Analytic/minification parity is not implied. Reimporting into Cartographer keeps the factors and reports the baked clearcoat textures and non-mip sampler as named losses.");
         }
         for (unsigned i = 0; i < 5; ++i)
             if (refs[i]) {

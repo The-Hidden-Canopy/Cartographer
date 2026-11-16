@@ -493,6 +493,18 @@ int main(int argc, char **argv) {
             check(!io::import_gltf_materials({reinterpret_cast<const std::uint8_t*>(invalid.data()), invalid.size()}),
                   "explicit out-of-range sampler cannot alias synthesized default sampler");
         }
+        {
+            // A sampler that disables mipmapping imports with a named loss.
+            auto no_mips = read(root / "material.gltf");
+            const auto at = no_mips.find("\"minFilter\":9986");
+            check(at != std::string::npos, "sampler minFilter mutation target exists");
+            no_mips.replace(at, std::string_view("\"minFilter\":9986").size(), "\"minFilter\":9728");
+            const auto imported = io::import_gltf_materials(
+                {reinterpret_cast<const std::uint8_t*>(no_mips.data()), no_mips.size()});
+            check(static_cast<bool>(imported) && !imported.value().losses.empty() &&
+                      imported.value().losses.front().find("disables mipmapping") != std::string::npos,
+                  "a non-mipmapped sampler imports with an explicit loss instead of failing");
+        }
         for(const auto& file:{root/"material.gltf",root/"material.glb"}) {
             const auto encoded=read(file);const auto bytes=std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()),encoded.size());
             const auto imported=take(io::import_gltf_materials(bytes));
@@ -710,11 +722,16 @@ int main(int argc, char **argv) {
         for(auto key:{"materials","images","textures","samplers"})
             check(member(baked_payload.json,key)==member(baked_glb.json,key),"baked GLTF/GLB payload agreement");
         check(std::any_of(baked_report.warnings.begin(),baked_report.warnings.end(),[](const auto& w){return w.find("finite-resolution")!=std::string::npos;}),"lossy bake is explicit in export receipt");
-        check(std::any_of(baked_report.warnings.begin(),baked_report.warnings.end(),[](const auto& w){return w.find("cannot reimport")!=std::string::npos;}),"baked output import limitation is explicit in export receipt");
+        check(std::any_of(baked_report.warnings.begin(),baked_report.warnings.end(),[](const auto& w){return w.find("named losses")!=std::string::npos;}),"baked output reimport losses are explicit in export receipt");
         {
             const auto data = read(root/"baked.gltf");
             const auto imported = io::import_gltf_materials({reinterpret_cast<const std::uint8_t*>(data.data()), data.size()});
-            check(!imported, "baked clearcoat and non-mip sampler are rejected instead of silently changed on import");
+            // Reimport keeps what Cartographer can represent and names the rest.
+            check(static_cast<bool>(imported) && !imported.value().losses.empty(),
+                  "baked clearcoat textures and non-mip samplers import with explicit losses, not silently");
+            const auto& losses = imported.value().losses;
+            check(std::any_of(losses.begin(), losses.end(), [](const auto& l) { return l.find("clearcoat textures") != std::string::npos; }),
+                  "the baked clearcoat texture loss is named");
         }
         const auto linear=[](std::uint8_t v){const double s=double(v)/255;return s<=.04045?s/12.92:std::pow((s+.055)/1.055,2.4);};
         for(unsigned v=0;v<2;++v) {

@@ -435,12 +435,18 @@ core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::u
             sampler.address_v = wrap(integer(get(s, "wrapT", "10497")));
             const auto min = integer(get(s, "minFilter", "9987")),
                        mag = integer(get(s, "magFilter", "9729"));
-            if (min < 9984 || min > 9987 || (mag != 9728 && mag != 9729))
-                throw std::runtime_error(
-                    "sampler without representable mip filtering requires an explicit "
-                    "conversion; not silently substituted");
-            sampler.minification = (min == 9984 || min == 9986) ? project::SamplerFilter::nearest
-                                                                : project::SamplerFilter::linear;
+            if (min < 9728 || min > 9987 || (min > 9729 && min < 9984) || (mag != 9728 && mag != 9729))
+                throw std::runtime_error("sampler filter enumeration is invalid");
+            if (min == 9728 || min == 9729) {
+                // NEAREST/LINEAR minification disables mipmapping. Cartographer
+                // always builds mip chains, so the nearest-mip equivalent is used
+                // and the difference is reported, not silently substituted.
+                result.losses.push_back("Imported sampler " + std::to_string(sampler.id) +
+                    ": source disables mipmapping; Cartographer samples a mip chain "
+                    "(nearest mip), so heavily minified texels are averaged");
+            }
+            sampler.minification = (min == 9728 || min == 9984 || min == 9986)
+                ? project::SamplerFilter::nearest : project::SamplerFilter::linear;
             sampler.magnification =
                 mag == 9728 ? project::SamplerFilter::nearest : project::SamplerFilter::linear;
             sampler.mip =
