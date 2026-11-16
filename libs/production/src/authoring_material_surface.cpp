@@ -471,6 +471,10 @@ compile_authoring_material(const project::MaterialCatalog &catalog, render::Mate
     try {
         auto program = std::make_shared<AuthoringMaterialProgram::Impl>();
         program->source = program->base = need(catalog.resolve_material(id, variant));
+        if (program->base.transmission_map || program->base.thickness_map ||
+            program->base.anisotropy_map)
+            throw std::runtime_error(
+                "v5 texture maps for transmission, thickness and anisotropy are not supported by authoring surface programs");
         if (program->base.alpha_mode == render::AlphaMode::blended)
             throw std::runtime_error("alpha blending is not supported");
         const std::array refs{program->base.base_color, program->base.metallic_roughness,

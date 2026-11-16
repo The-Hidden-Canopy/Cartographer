@@ -353,6 +353,15 @@ void perspective_uv_raster() {
 }
 void gpu_packet_contract() {
     auto c = fixture().document.material_catalog();
+    auto glass = c.materials().at(1).definition;
+    glass.transmission = .8;
+    glass.ior = 1.52;
+    glass.thickness = .003;
+    glass.attenuation_distance = .01;
+    glass.attenuation_color = {.7, .4, .2};
+    glass.anisotropy = .6;
+    glass.anisotropy_rotation = .7;
+    replace(c, glass);
     auto g = surface_graph();
     okay(c.insert_material_graph(g));
     okay(c.bind_material_graph(1, g.identity));
@@ -361,6 +370,15 @@ void gpu_packet_contract() {
     check(packet.words.size() % 32 == 0 && packet.words[0][0] == 2 && packet.words[0][3] <= 32,
           "native packet version, row alignment and register bound");
     check(packet.words.size() * 16 <= 6656, "bounded native packet payload");
+    near(packet.words[24][0], .8, 1e-6);
+    near(packet.words[24][1], 1.52, 1e-6);
+    near(packet.words[24][2], .003, 1e-6);
+    near(packet.words[24][3], .01, 1e-6);
+    near(packet.words[25][0], .7, 1e-6);
+    near(packet.words[25][1], .4, 1e-6);
+    near(packet.words[25][2], .2, 1e-6);
+    near(packet.words[25][3], .6, 1e-6);
+    near(packet.words[26][0], .7, 1e-6);
     // Decode the packed register machine independently of the CPU graph's
     // node-ID evaluator. This catches last-use reuse and output-register bugs.
     for (float u : {.1F, .3F, .7F, .9F}) {
@@ -370,7 +388,7 @@ void gpu_packet_contract() {
             std::array<float, 4> value{};
             const unsigned op = unsigned(code[0]), dest = unsigned(slots[0]);
             if (op < 2)
-                value = packet.words[26 + i * 3];
+                value = packet.words[30 + i * 3];
             else if (op == 2 || op == 3) {
                 const auto &m = packet.material;
                 switch (unsigned(code[2])) {
@@ -508,6 +526,45 @@ void gpu_packet_contract() {
               take(compile(c, library).gpu_packet()).digest == textured.digest,
           "failed admission retains prior good GPU packet and authored source");
 }
+void unsupported_v5_texture_maps_are_rejected() {
+    auto catalog = fixture().document.material_catalog();
+    const auto source = pixels(82, 1, 1, {{255, 128, 64, 255}});
+    okay(catalog.insert_texture(source.record));
+    auto material = catalog.materials().at(1).definition;
+    material.transmission = .8;
+    material.thickness = .01;
+    material.anisotropy = .5;
+    replace(catalog, material);
+    check(bool(production::compile_authoring_material(catalog, 1)),
+          "scalar-only v5 material remains executable");
+    production::AuthoringTextureLibrary admitted;
+    okay(admitted.admit(source.record, source.encoded));
+    // These slots have no evaluator yet. Both missing and admitted pixels must
+    // fail explicitly rather than silently dropping an authored texture map.
+    const std::array refs{&render::StandardMaterial::transmission_map,
+                          &render::StandardMaterial::thickness_map,
+                          &render::StandardMaterial::anisotropy_map};
+    const std::array names{"transmission", "thickness", "anisotropy"};
+    std::string accepted;
+    for (std::size_t i = 0; i < refs.size(); ++i) {
+        auto with_map = material;
+        (with_map.*refs[i]).asset = source.record.id;
+        replace(catalog, with_map);
+        const auto missing = production::compile_authoring_material(catalog, 1);
+        const auto available = production::compile_authoring_material(catalog, 1, {}, &admitted);
+        if (!missing)
+            check(missing.error().message.find("v5 texture maps") != std::string::npos,
+                  "missing map failure identifies the unsupported v5 texture path");
+        if (!available)
+            check(available.error().message.find("v5 texture maps") != std::string::npos,
+                  "admitted map failure identifies the unsupported v5 texture path");
+        if (missing || available) {
+            if (!accepted.empty()) accepted += ", ";
+            accepted += names[i];
+        }
+    }
+    check(accepted.empty(), ("unsupported v5 texture maps were silently accepted: " + accepted).c_str());
+}
 } // namespace
 int main() {
     try {
@@ -517,6 +574,7 @@ int main() {
         masked_raster_normal_and_reopen();
         perspective_uv_raster();
         gpu_packet_contract();
+        unsupported_v5_texture_maps_are_rejected();
         std::cout << "authoring surface CPU: linear sampling/mips, sampler/UV "
                      "identity, failure atomicity, executable UV/texture graphs, "
                      "mask/depth/picking, normal conventions and reopen passed\n";
