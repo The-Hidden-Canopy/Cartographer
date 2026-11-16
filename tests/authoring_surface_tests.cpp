@@ -370,7 +370,7 @@ void gpu_packet_contract() {
             std::array<float, 4> value{};
             const unsigned op = unsigned(code[0]), dest = unsigned(slots[0]);
             if (op < 2)
-                value = packet.words[26 + i * 3];
+                value = packet.words[30 + i * 3];
             else if (op == 2 || op == 3) {
                 const auto &m = packet.material;
                 switch (unsigned(code[2])) {
