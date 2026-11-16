@@ -145,7 +145,15 @@ core::Result<void> StandardMaterial::validate() const {
         !std::isfinite(clearcoat_roughness) ||
         clearcoat_roughness < 0.0 || clearcoat_roughness > 1.0 ||
         !std::isfinite(alpha_cutoff) ||
-        alpha_cutoff < 0.0 || alpha_cutoff > 1.0) {
+        alpha_cutoff < 0.0 || alpha_cutoff > 1.0 ||
+        !std::isfinite(ior) || ior < 1.0 || ior > 4.0 ||
+        !std::isfinite(transmission) || transmission < 0.0 || transmission > 1.0 ||
+        !finite_nonnegative(thickness) || !finite_nonnegative(attenuation_distance) ||
+        !attenuation_color.finite() || attenuation_color.x < 0.0 || attenuation_color.x > 1.0 ||
+        attenuation_color.y < 0.0 || attenuation_color.y > 1.0 ||
+        attenuation_color.z < 0.0 || attenuation_color.z > 1.0 ||
+        !std::isfinite(anisotropy) || anisotropy < 0.0 || anisotropy > 1.0 ||
+        !std::isfinite(anisotropy_rotation) || std::abs(anisotropy_rotation) > 6.2831853071795862) {
         return core::Result<void>::failure(
             invalid("material scalar factors are outside their supported ranges"));
     }
@@ -163,7 +171,8 @@ core::Result<void> StandardMaterial::validate() const {
             "material alpha mode is unknown"));
     }
     for (const TextureRef* binding : {
-             &base_color, &metallic_roughness, &normal, &occlusion, &emissive}) {
+             &base_color, &metallic_roughness, &normal, &occlusion, &emissive,
+             &transmission_map, &thickness_map, &anisotropy_map}) {
         if (auto result = binding->validate(); !result) return result;
     }
     return core::Result<void>::success();

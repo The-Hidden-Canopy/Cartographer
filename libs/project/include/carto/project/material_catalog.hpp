@@ -78,6 +78,13 @@ struct MaterialVariantOverride {
     std::optional<double> dielectric_f0;
     std::optional<double> clearcoat;
     std::optional<double> clearcoat_roughness;
+    std::optional<double> ior;
+    std::optional<double> transmission;
+    std::optional<double> thickness;
+    std::optional<core::Vec3d> attenuation_color;
+    std::optional<double> attenuation_distance;
+    std::optional<double> anisotropy;
+    std::optional<double> anisotropy_rotation;
     std::optional<render::AlphaMode> alpha_mode;
     std::optional<double> alpha_cutoff;
     std::optional<render::TextureRef> base_color;
@@ -85,6 +92,9 @@ struct MaterialVariantOverride {
     std::optional<render::TextureRef> normal;
     std::optional<render::TextureRef> occlusion;
     std::optional<render::TextureRef> emissive;
+    std::optional<render::TextureRef> transmission_map;
+    std::optional<render::TextureRef> thickness_map;
+    std::optional<render::TextureRef> anisotropy_map;
 
     [[nodiscard]] bool empty() const noexcept;
     [[nodiscard]] core::Result<void> validate() const;
@@ -130,7 +140,9 @@ struct MaterialGraphBinding {
 // derived products and cannot replace this catalog.
 class MaterialCatalog final {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 4U;
+    // V5 adds transmission, IOR, thickness, attenuation and anisotropy (and
+    // their maps) in trailing MATERIAL_EXTENSIONS / VARIANT_EXTENSIONS sections.
+    static constexpr std::uint32_t kSchemaVersion = 5U;
     static constexpr std::size_t kMaxSerializedBytes = 32U * 1024U * 1024U;
     static constexpr std::size_t kMaxRecordsPerKind = 65'536U;
     static constexpr std::size_t kMaxVariantMeshScope = 65'536U;

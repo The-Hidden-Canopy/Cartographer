@@ -48,12 +48,12 @@ resolve_authoring_material(const project::MaterialCatalog &catalog,
         return Result::failure(
             current.error().with_context("authoring material graph"));
     const auto &outputs = graph.outputs;
-    if (outputs.normal || outputs.occlusion || outputs.transmission ||
-        outputs.subsurface || outputs.sheen || outputs.anisotropy ||
-        outputs.opacity || outputs.displacement)
+    // Transmission and anisotropy lower onto Material V5 factors. The rest
+    // still need per-pixel evaluation and are refused rather than dropped.
+    if (outputs.normal || outputs.occlusion || outputs.subsurface ||
+        outputs.sheen || outputs.opacity || outputs.displacement)
         return fail(
-            "normal, occlusion, transmission, subsurface, sheen, "
-            "anisotropy, opacity "
+            "normal, occlusion, subsurface, sheen, opacity "
             "and displacement outputs are not executable in this viewport");
     const auto order = graph.topological_order();
     if (!order)
@@ -95,6 +95,18 @@ resolve_authoring_material(const project::MaterialCatalog &catalog,
                 value[0] = source.clearcoat;
             else if (node.parameter_name == "clearcoat_roughness")
                 value[0] = source.clearcoat_roughness;
+            else if (node.parameter_name == "ior")
+                value[0] = source.ior;
+            else if (node.parameter_name == "transmission")
+                value[0] = source.transmission;
+            else if (node.parameter_name == "thickness")
+                value[0] = source.thickness;
+            else if (node.parameter_name == "attenuation_distance")
+                value[0] = source.attenuation_distance;
+            else if (node.parameter_name == "anisotropy")
+                value[0] = source.anisotropy;
+            else if (node.parameter_name == "anisotropy_rotation")
+                value[0] = source.anisotropy_rotation;
             else
                 return fail("unbound scalar parameter at node " +
                             std::to_string(id));
@@ -136,6 +148,10 @@ resolve_authoring_material(const project::MaterialCatalog &catalog,
         result.clearcoat = values.at(outputs.clearcoat)[0];
     if (outputs.clearcoat_roughness)
         result.clearcoat_roughness = values.at(outputs.clearcoat_roughness)[0];
+    if (outputs.transmission)
+        result.transmission = values.at(outputs.transmission)[0];
+    if (outputs.anisotropy)
+        result.anisotropy = values.at(outputs.anisotropy)[0];
     if (outputs.emissive) {
         const auto &emission = values.at(outputs.emissive);
         result.emissive_factor = {emission[0], emission[1], emission[2]};

@@ -426,6 +426,16 @@ struct GltfMaterialWriter::Impl {
                     return Result<GltfMaterialProjection>::failure(t.error());
                 info[i] = std::move(t.value());
             }
+        // Material V5 maps travel as linear data textures.
+        std::string transmission_info, thickness_info, anisotropy_info;
+        for (auto [ref, out] : {std::pair{&m.transmission_map, &transmission_info},
+                                std::pair{&m.thickness_map, &thickness_info},
+                                std::pair{&m.anisotropy_map, &anisotropy_info}}) {
+            if (!*ref) continue;
+            auto t = texture(*ref, assets::TextureSemantic::data, p);
+            if (!t) return Result<GltfMaterialProjection>::failure(t.error());
+            *out = std::move(t.value());
+        }
         std::ostringstream o;
         o.imbue(std::locale::classic());
         o << std::setprecision(17) << '{';
@@ -471,8 +481,28 @@ struct GltfMaterialWriter::Impl {
             report.warnings.push_back(
                 "BLEND alpha is exported as authored; the native authoring renderer "
                 "does not yet validate blended appearance");
-        const double root = std::sqrt(m.dielectric_f0), ior = (1 + root) / (1 - root);
-        const bool use_ior = m.dielectric_f0 != 0.04;
+        // Pre-V5 materials (IOR left at 1.5) keep the reflectance-derived IOR,
+        // so their export is unchanged. An authored IOR is exported as is, and
+        // KHR_materials_specular carries any reflectance that IOR does not imply.
+        const bool authored_ior = m.ior != 1.5;
+        const double root = std::sqrt(m.dielectric_f0);
+        const double ior = authored_ior ? m.ior : (1 + root) / (1 - root);
+        const bool use_ior = authored_ior || m.dielectric_f0 != 0.04;
+        double specular_factor = 1.0;
+        if (authored_ior) {
+            const double ior_f0 = std::pow((m.ior - 1.0) / (m.ior + 1.0), 2.0);
+            specular_factor = ior_f0 > 0.0 ? m.dielectric_f0 / ior_f0 : 1.0;
+            if (specular_factor > 1.0) {
+                report.warnings.push_back("Loss: dielectric reflectance exceeds what IOR " + std::to_string(m.ior) +
+                    " implies and KHR_materials_specular cannot raise it; exported reflectance is clamped.");
+                specular_factor = 1.0;
+            }
+        }
+        const bool use_specular = authored_ior && std::abs(specular_factor - 1.0) > 1e-9;
+        const bool use_transmission = m.transmission != 0.0 || !transmission_info.empty();
+        const bool use_volume = m.thickness != 0.0 || !thickness_info.empty() || m.attenuation_distance != 0.0 ||
+            m.attenuation_color.x != 1.0 || m.attenuation_color.y != 1.0 || m.attenuation_color.z != 1.0;
+        const bool use_anisotropy = m.anisotropy != 0.0 || !anisotropy_info.empty();
         const bool use_clearcoat = m.clearcoat != 0.0 || !clearcoat_info.empty();
         const bool zero_emission = m.emissive_factor.x == 0.0 && m.emissive_factor.y == 0.0 &&
                                    m.emissive_factor.z == 0.0;
@@ -480,7 +510,8 @@ struct GltfMaterialWriter::Impl {
         if ((!use_clearcoat && m.clearcoat_roughness != 0.0) ||
             (zero_emission && strength != 1.0))
             report.warnings.push_back("Inactive clearcoat roughness or zero-emission strength remains in the source material; the exported appearance is unchanged.");
-        if (use_ior || use_clearcoat || use_emission_strength) {
+        if (use_ior || use_clearcoat || use_emission_strength || use_specular || use_transmission ||
+            use_volume || use_anisotropy) {
             o << ",\"extensions\":{";
             bool first = true;
             const auto separator = [&] { if (!first) o << ','; first = false; };
@@ -502,9 +533,41 @@ struct GltfMaterialWriter::Impl {
                 extensions.insert("KHR_materials_emissive_strength");
                 o << "\"KHR_materials_emissive_strength\":{\"emissiveStrength\":" << strength << '}';
             }
+            if (use_specular) {
+                separator();
+                extensions.insert("KHR_materials_specular");
+                o << "\"KHR_materials_specular\":{\"specularFactor\":" << specular_factor << '}';
+            }
+            if (use_transmission) {
+                separator();
+                extensions.insert("KHR_materials_transmission");
+                o << "\"KHR_materials_transmission\":{\"transmissionFactor\":" << m.transmission;
+                if (!transmission_info.empty()) o << ",\"transmissionTexture\":{" << transmission_info << '}';
+                o << '}';
+            }
+            if (use_volume) {
+                separator();
+                extensions.insert("KHR_materials_volume");
+                o << "\"KHR_materials_volume\":{\"thicknessFactor\":" << m.thickness
+                  << ",\"attenuationColor\":[" << m.attenuation_color.x << ',' << m.attenuation_color.y << ','
+                  << m.attenuation_color.z << ']';
+                // glTF's default attenuation distance is infinity; Cartographer's 0 means none.
+                if (m.attenuation_distance > 0.0) o << ",\"attenuationDistance\":" << m.attenuation_distance;
+                if (!thickness_info.empty()) o << ",\"thicknessTexture\":{" << thickness_info << '}';
+                o << '}';
+            }
+            if (use_anisotropy) {
+                separator();
+                extensions.insert("KHR_materials_anisotropy");
+                o << "\"KHR_materials_anisotropy\":{\"anisotropyStrength\":" << m.anisotropy
+                  << ",\"anisotropyRotation\":" << m.anisotropy_rotation;
+                if (!anisotropy_info.empty()) o << ",\"anisotropyTexture\":{" << anisotropy_info << '}';
+                o << '}';
+            }
             o << '}';
         }
         o << ",\"extras\":{\"cartographer_material_id\":" << id;
+        if (authored_ior) o << ",\"cartographer_ior\":" << m.ior;
         if (p.uv)
             o << ",\"cartographer_uv_set\":" << quote(std::to_string(*p.uv));
         if (variant)
@@ -541,7 +604,9 @@ Result<void> GltfMaterialWriter::prepare_catalog() {
             m.base_color || m.metallic_roughness || m.normal || m.occlusion || m.emissive ||
             m.normal_scale != 1.0 || m.occlusion_strength != 1.0 || m.dielectric_f0 != 0.04 ||
             m.clearcoat != 0.0 || m.clearcoat_roughness != 0.1 ||
-            m.emissive_factor.x != 0.0 || m.emissive_factor.y != 0.0 || m.emissive_factor.z != 0.0)
+            m.emissive_factor.x != 0.0 || m.emissive_factor.y != 0.0 || m.emissive_factor.z != 0.0 ||
+            m.ior != 1.5 || m.transmission != 0.0 || m.thickness != 0.0 || m.attenuation_distance != 0.0 ||
+            m.anisotropy != 0.0 || m.transmission_map || m.thickness_map || m.anisotropy_map)
             return Result<void>::success();
     }
     for (const auto& [id, material] : catalog.materials()) {
