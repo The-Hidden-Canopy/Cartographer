@@ -1072,6 +1072,11 @@ if(CARTO_ENABLE_D3D12)
     add_test(NAME cartographer_d3d12_imgui_presentation_guard_tests COMMAND cartographer_d3d12_imgui_texture_retirement_tests presentation)
     add_test(NAME cartographer_d3d12_imgui_platform_shutdown_tests COMMAND cartographer_d3d12_imgui_texture_retirement_tests platform)
     set_tests_properties(cartographer_d3d12_imgui_window_wait_tests cartographer_d3d12_imgui_presentation_guard_tests cartographer_d3d12_imgui_platform_shutdown_tests PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(cartographer_authoring_two_sided_tests authoring_two_sided_tests.cpp)
+    target_link_libraries(cartographer_authoring_two_sided_tests PRIVATE carto_d3d12_viewport)
+    carto_target(cartographer_authoring_two_sided_tests)
+    add_test(NAME cartographer_authoring_two_sided_tests COMMAND cartographer_authoring_two_sided_tests)
+
     add_executable(cartographer_d3d12_readback_worker_tests
         d3d12_readback_worker_tests.cpp)
     target_link_libraries(cartographer_d3d12_readback_worker_tests PRIVATE carto_d3d12_viewport carto_ui)

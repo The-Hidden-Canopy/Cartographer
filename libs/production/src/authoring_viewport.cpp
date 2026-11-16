@@ -501,6 +501,11 @@ render_reference(const project::ProjectDocument &document, const AuthoringViewpo
                                 normal =
                                     (tangent * n.x + bitangent * n.y + normal * n.z).normalized();
                             }
+                            // Screen Y points down. A mirrored object reverses
+                            // its projected winding without changing which side
+                            // of the authored surface is the front.
+                            const bool mirrored = (t.scale.x < 0) ^ (t.scale.y < 0) ^ (t.scale.z < 0);
+                            if ((area > 0.0) != mirrored) normal = normal * -1.0;
                             render::PbrSurface surface;
                             surface.normal = normal;
                             surface.view_direction =
