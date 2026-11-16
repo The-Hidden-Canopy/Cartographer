@@ -1477,6 +1477,11 @@ if(TARGET carto_imgui)
     carto_target(cartographer_desktop_chrome_tests)
     add_test(NAME cartographer_desktop_chrome_tests COMMAND cartographer_desktop_chrome_tests)
 
+    add_executable(cartographer_desktop_rendered_preview_tests desktop_rendered_preview_tests.cpp)
+    target_link_libraries(cartographer_desktop_rendered_preview_tests PRIVATE carto_imgui)
+    carto_target(cartographer_desktop_rendered_preview_tests)
+    add_test(NAME cartographer_desktop_rendered_preview_tests COMMAND cartographer_desktop_rendered_preview_tests)
+
     add_executable(cartographer_desktop_browser_tests desktop_browser_tests.cpp)
     target_link_libraries(cartographer_desktop_browser_tests PRIVATE carto_imgui carto_ui)
     carto_target(cartographer_desktop_browser_tests)

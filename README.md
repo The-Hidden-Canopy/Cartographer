@@ -233,6 +233,26 @@ Configuration fails closed when the SDK or the required ImGui Win32/Vulkan
 backends are absent. A successful configure/build still does not establish
 GPU, DPI, input, or desktop workflow acceptance.
 
+On Windows, the `desktop-render-preview-release` preset builds the Vulkan
+desktop with the separate-device D3D12 rendered-preview worker:
+
+```powershell
+cmake --preset desktop-render-preview-release
+cmake --build --preset desktop-render-preview-release --parallel
+```
+
+This requires a Vulkan SDK, D3D12-capable device and an available DXC runtime.
+In the Model workspace, enable **Rendered viewport** to request the material
+preview. The preview is read-only. Turn it off to return to editing after the
+current live canvas is presented; if the project changes during the handoff,
+the desktop asks you to resume explicitly. That interlock avoids applying
+edits against a rendered image whose input
+projection has not been verified. Rendered materials use authored scene
+lighting; use **Environment** to import an HDR environment, or add an authored
+directional light, when the scene is unlit. The ordinary
+`desktop-vulkan-release` preset remains unchanged, and building this preset
+does not by itself prove rendering or editing parity on a particular machine.
+
 The headless Vulkan acceptance path uses the SDK-selected preset:
 
 ```powershell
