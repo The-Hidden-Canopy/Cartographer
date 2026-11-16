@@ -33,6 +33,12 @@ namespace carto::d3d12 {
 namespace {
 using Clock = std::chrono::steady_clock;
 using core::Vec3d;
+// Logical payload bound, excluding driver allocation alignment and staging.
+// A complete 4096-square RGBA8 chain needs about 85.4 MiB.
+constexpr std::uint64_t kMaterialResidentBudget = 96ULL * 1024ULL * 1024ULL;
+constexpr const char *kMaterialBudgetError =
+    "GPU material residency byte budget exceeded (96 MiB logical payload); "
+    "reduce texture resolution or texture count";
 template <class T> T need(core::Result<T> value) {
     if (!value)
         throw std::runtime_error(value.error().message);
@@ -917,6 +923,24 @@ struct AuthoringViewport::Impl {
     }
     void materials(const Prepared &scene, AuthoringGpuFrame &frame) {
         const auto started = Clock::now();
+        // Refuse an over-budget candidate before creating GPU material resources.
+        // Count shared texture artifacts and programs once, as in publication.
+        std::set<std::string> admitted_sets, admitted_maps;
+        std::uint64_t admitted_bytes = 0;
+        const auto admit_bytes = [&](std::uint64_t size) {
+            if (size > kMaterialResidentBudget - admitted_bytes)
+                throw std::runtime_error(kMaterialBudgetError);
+            admitted_bytes += size;
+        };
+        for (const auto &draw : scene.draws) {
+            if (!draw.surface || !admitted_sets.insert(draw.surface_key).second) continue;
+            if (admitted_sets.size() > 32)
+                throw std::runtime_error("GPU material residency exceeds 32 programs");
+            admit_bytes(draw.surface->words.size() * 16U);
+            for (const auto &map : draw.surface->maps)
+                if (map && admitted_maps.insert(map->artifact_digest.hex()).second)
+                    admit_bytes(map->resident_bytes());
+        }
         std::map<std::string, std::shared_ptr<MaterialTexture>> next_textures;
         std::map<std::string, std::shared_ptr<MaterialSet>> next_sets;
         std::unique_ptr<Resources> staging;
@@ -1019,8 +1043,8 @@ struct AuthoringViewport::Impl {
             static_cast<void>(key);
             frame.material_resident_bytes += set->size;
         }
-        if (frame.material_resident_bytes > 65U * 1024U * 1024U)
-            throw std::runtime_error("GPU material residency byte budget exceeded");
+        if (frame.material_resident_bytes > kMaterialResidentBudget)
+            throw std::runtime_error(kMaterialBudgetError);
         if (staging) {
             auto timing = staging->buffer(
                 {16, gpu::MemoryClass::readback, gpu::BufferUsage::transfer_destination});
