@@ -2438,3 +2438,14 @@ if(CARTO_ENABLE_D3D12)
     target_link_libraries(cartographer_authoring_gpu_viewport_benchmark PRIVATE carto_d3d12_viewport)
     carto_target(cartographer_authoring_gpu_viewport_benchmark)
 endif()
+
+add_executable(carto_sprint3_texture_coverage texture_coverage_sprint3_tests.cpp)
+target_link_libraries(carto_sprint3_texture_coverage PRIVATE carto_assets)
+carto_target(carto_sprint3_texture_coverage)
+add_test(NAME carto_sprint3_texture_coverage COMMAND carto_sprint3_texture_coverage)
+
+
+add_executable(carto_sprint3_registry_budget source_registry_budget_sprint3_tests.cpp)
+target_link_libraries(carto_sprint3_registry_budget PRIVATE carto_assets)
+carto_target(carto_sprint3_registry_budget)
+add_test(NAME carto_sprint3_registry_budget COMMAND carto_sprint3_registry_budget)
