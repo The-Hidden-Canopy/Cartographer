@@ -1575,6 +1575,7 @@ core::Result<ParsedAgentGoal> parse_agent_goal(std::string_view goal) {
     constexpr std::string_view kNamedScopePrefix = "on object";
     constexpr std::string_view kNearestScopePrefix = "on nearest object within";
     constexpr std::string_view kConditionTagScopePrefix = "on condition tag";
+    constexpr std::string_view kSelectedSubtreeScopePrefix = "on subtree of selected object";
     const auto ascii_lower = [](char value) {
         const auto byte = static_cast<unsigned char>(value);
         return byte >= 'A' && byte <= 'Z'
@@ -1604,6 +1605,32 @@ core::Result<ParsedAgentGoal> parse_agent_goal(std::string_view goal) {
     const bool condition_tag_scope = prefix_matches(kConditionTagScopePrefix) &&
         (goal.size() == prefix_begin + kConditionTagScopePrefix.size() ||
          goal[prefix_begin + kConditionTagScopePrefix.size()] == ' ');
+    const bool selected_subtree_scope =
+        prefix_matches(kSelectedSubtreeScopePrefix) &&
+        (goal.size() == prefix_begin + kSelectedSubtreeScopePrefix.size() ||
+         goal[prefix_begin + kSelectedSubtreeScopePrefix.size()] == ' ' ||
+         goal[prefix_begin + kSelectedSubtreeScopePrefix.size()] == ':');
+    if (selected_subtree_scope) {
+        std::size_t cursor = prefix_begin + kSelectedSubtreeScopePrefix.size();
+        const auto skip_spaces = [&goal](std::size_t& position) {
+            while (position < goal.size() && goal[position] == ' ') ++position;
+        };
+        skip_spaces(cursor);
+        if (cursor >= goal.size() || goal[cursor] != ':') {
+            return core::Result<ParsedAgentGoal>::failure(invalid(
+                "selected-subtree scope must end with a colon before its command"));
+        }
+        ++cursor;
+        skip_spaces(cursor);
+        if (cursor >= goal.size()) {
+            return core::Result<ParsedAgentGoal>::failure(invalid(
+                "selected-subtree scope must include a native command after the colon"));
+        }
+        ParsedAgentGoal parsed;
+        parsed.selected_object_subtree_scope = true;
+        parsed.commands = std::string(goal.substr(cursor));
+        return core::Result<ParsedAgentGoal>::success(std::move(parsed));
+    }
     if (!nearest_scope && !named_scope && !condition_tag_scope) {
         ParsedAgentGoal parsed;
         parsed.commands = std::string(goal);

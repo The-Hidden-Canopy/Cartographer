@@ -4080,6 +4080,54 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
     const bool named_target = parsed_goal.value().exact_object_name.has_value();
     const bool nearest_spatial_target = parsed_goal.value().nearest_object_scope.has_value();
     const bool condition_tag_target = parsed_goal.value().condition_tag_scope.has_value();
+    const bool selected_subtree_target =
+        parsed_goal.value().selected_object_subtree_scope;
+    std::vector<scene::ObjectId> selected_hierarchy_scope;
+    if (selected_subtree_target) {
+        if (authoring.value().selection_mode != editor::SelectionMode::object ||
+            authoring.value().objects.size() != 1U) {
+            return core::Result<void>::failure(invalid_state(
+                "selected-subtree scope requires exactly one selected root object"));
+        }
+        if (source_snapshot.objects.empty() || source_snapshot.objects.size() > 512U) {
+            return core::Result<void>::failure(invalid_state(
+                "selected-subtree resolution requires a project with 1 to 512 objects"));
+        }
+        const scene::ObjectId root = authoring.value().objects.front();
+        const auto root_object = std::find_if(source_snapshot.objects.begin(),
+            source_snapshot.objects.end(), [root](const auto& object) {
+                return object.object.id == root;
+            });
+        if (root_object == source_snapshot.objects.end()) {
+            return core::Result<void>::failure(stale(
+                "selected hierarchy root no longer exists in the source project"));
+        }
+        if (root_object->object.parent.has_value() || root_object->object.locked) {
+            return core::Result<void>::failure(invalid_state(
+                "selected-subtree scope requires one unlocked root object"));
+        }
+        selected_hierarchy_scope.push_back(root);
+        std::set<scene::ObjectId> visited{root};
+        for (std::size_t cursor = 0U; cursor < selected_hierarchy_scope.size(); ++cursor) {
+            for (const auto& object : source_snapshot.objects) {
+                if (object.object.parent != selected_hierarchy_scope[cursor]) continue;
+                if (!visited.insert(object.object.id).second) {
+                    return core::Result<void>::failure(validation(
+                        "source object hierarchy contains a cycle or duplicate descendant"));
+                }
+                if (object.object.locked) {
+                    return core::Result<void>::failure(invalid_state(
+                        "selected-subtree scope contains a locked descendant; no object was omitted"));
+                }
+                selected_hierarchy_scope.push_back(object.object.id);
+                if (selected_hierarchy_scope.size() > 512U) {
+                    return core::Result<void>::failure(invalid_state(
+                        "selected-subtree scope exceeds the 512-object resolution limit"));
+                }
+            }
+        }
+        std::sort(selected_hierarchy_scope.begin(), selected_hierarchy_scope.end());
+    }
     if (named_target) {
         constexpr std::size_t kMaxNamedTargetQueryScope = 512U;
         if (source_snapshot.objects.empty() ||
@@ -4514,6 +4562,11 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
                     "compiling target " + std::to_string(target_index + 1U) +
                     ", objective step " + std::to_string(command_index + 1U)));
             }
+            if (selected_subtree_target &&
+                proposal.value().preview_kind != editor::PreviewKind::object_translation_delta) {
+                return core::Result<void>::failure(invalid_state(
+                    "selected-subtree scope currently supports root-object translation commands only"));
+            }
             if (proposal.value().base_revision != source_snapshot.project_revision ||
                 proposal.value().context != target_authoring) {
                 return core::Result<void>::failure(stale(
@@ -4535,6 +4588,7 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
     std::vector<scene::ObjectId> objective_scope;
     objective_scope.reserve(targets.size());
     for (const auto& target : targets) objective_scope.push_back(target.object);
+    if (selected_subtree_target) objective_scope = selected_hierarchy_scope;
 
     const std::uint64_t task_sequence = next_agent_task_id_ ==
         std::numeric_limits<std::uint64_t>::max() ? 1U : next_agent_task_id_;

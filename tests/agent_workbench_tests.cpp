@@ -10047,6 +10047,192 @@ void ui_condition_tag_goal_rejects_missing_unknown_stale_unreviewed_and_protecte
     }
 }
 
+void ui_selected_hierarchy_subtree_is_scoped_reviewed_and_accepted_as_one_root_write() {
+    TempDirectory directory;
+    const auto base_path = directory.path() / "flat-source.carto";
+    const auto hierarchy_path = directory.path() / "hierarchy.carto";
+    carto::application::ApplicationSession saved_source;
+    const auto objects = create_boxes(saved_source, 4U);
+    auto child_transform = saved_source.snapshot().objects[1U].object.local_transform;
+    child_transform.translation = {2.0, 0.0, 0.0};
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        saved_source, carto::application::SetObjectTransformAction{
+            objects[1U], child_transform, std::nullopt}));
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        saved_source, carto::application::SaveProjectAction{base_path}));
+
+    std::ifstream input(base_path, std::ios::binary);
+    REQUIRE(input.good());
+    std::string serialized(
+        (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    const std::string old_child_prefix = "OBJECT " +
+        std::to_string(objects[1U].value) + " 0 \"Box 2\"";
+    const auto child_record = serialized.find(old_child_prefix);
+    REQUIRE(child_record != std::string::npos);
+    const std::string new_child_prefix = "OBJECT " +
+        std::to_string(objects[1U].value) + " " +
+        std::to_string(objects[0U].value) + " \"Box 2\"";
+    serialized.replace(child_record, old_child_prefix.size(), new_child_prefix);
+    const std::string grandchild_prefix = "OBJECT " + std::to_string(objects[3U].value) + " 0 \"Box 4\"";
+    const auto grandchild_record = serialized.find(grandchild_prefix);
+    REQUIRE(grandchild_record != std::string::npos);
+    serialized.replace(grandchild_record, grandchild_prefix.size(),
+        "OBJECT " + std::to_string(objects[3U].value) + " " + std::to_string(objects[1U].value) + " \"Box 4\"");
+    const auto validated_document = carto::project::ProjectDocument::deserialize(serialized);
+    REQUIRE(validated_document);
+    REQUIRE(validated_document.value().scene().find(objects[1U])->parent == objects[0U]);
+    std::ofstream output(hierarchy_path, std::ios::binary | std::ios::trunc);
+    REQUIRE(output.good());
+    output << serialized;
+    output.close();
+    REQUIRE(output.good());
+
+    carto::application::ApplicationSession source;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        source, carto::application::OpenProjectAction{hierarchy_path}));
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    const std::string goal =
+        R"(on subtree of selected object: translate object by 0.1 0 0)";
+    const auto parsed = carto::agent::parse_agent_goal(goal);
+    REQUIRE(parsed && parsed.value().selected_object_subtree_scope);
+    const auto revision = source.snapshot().project_revision;
+    const auto history_before = source.snapshot().undo_count;
+    const auto child_local_before = source.snapshot().objects[1U].object.local_transform;
+    REQUIRE(!carto::agent::parse_agent_goal("on subtree of selected object translate object by 0.1 0 0"));
+    REQUIRE(!carto::agent::parse_agent_goal("on subtree of selected object:"));
+    const auto uppercase = carto::agent::parse_agent_goal("ON SUBTREE OF SELECTED OBJECT: translate object by 0.1 0 0");
+    REQUIRE(uppercase && uppercase.value().selected_object_subtree_scope);
+    const auto missing_selection = ui.compile_agent_goal_sequence(goal);
+    REQUIRE(!missing_selection);
+    REQUIRE(missing_selection.error().message.find("exactly one selected root") !=
+        std::string::npos);
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{objects[1U]}));
+    const auto nested_selection = ui.compile_agent_goal_sequence(goal);
+    REQUIRE(!nested_selection);
+    REQUIRE(nested_selection.error().message.find("unlocked root object") !=
+        std::string::npos);
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{objects[0U]}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{objects[2U], carto::editor::SelectionOperation::add}));
+    REQUIRE(!ui.compile_agent_goal_sequence(goal));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{objects[0U]}));
+    const auto unsupported = ui.compile_agent_goal_sequence(
+        R"(on subtree of selected object: inset face 0.1)");
+    REQUIRE(!unsupported);
+    REQUIRE(!unsupported.error().message.empty());
+    const auto wrong_effect = ui.compile_agent_goal_sequence(
+        "on subtree of selected object: assign material 1 to region 7");
+    REQUIRE(!wrong_effect);
+    REQUIRE(wrong_effect.error().message.find("root-object translation") != std::string::npos);
+    REQUIRE(ui.snapshot().agent_plan_draft.empty());
+
+    REQUIRE(ui.compile_agent_goal_sequence(goal));
+    const auto draft = ui.snapshot();
+    REQUIRE(draft.agent_plan_draft.size() == 1U);
+    REQUIRE(draft.agent_plan_draft.front().target.object == objects[0U]);
+    REQUIRE(draft.agent_clarifications_draft.empty());
+    REQUIRE(source.snapshot().project_revision == revision);
+
+    REQUIRE(!ui.prepare_agent_plan(goal, translation_envelope({objects[0U]}, 0.25)));
+    REQUIRE(source.snapshot().project_revision == revision);
+    const auto prepared = ui.prepare_agent_plan(
+        goal, translation_envelope({objects[0U], objects[1U], objects[3U]}, 0.25));
+    REQUIRE(prepared && prepared.value().scope_objects ==
+        (std::vector<carto::scene::ObjectId>{objects[0U], objects[1U], objects[3U]}));
+    const auto review = ui.run_prepared_agent_plan();
+    REQUIRE(review && review.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(review.value().can_accept);
+    REQUIRE(source.snapshot().project_revision == revision);
+    const auto checkpoint_path = directory.path() / "subtree.carto-agent-task";
+    REQUIRE(ui.save_agent_checkpoint(checkpoint_path));
+    carto::ui::UiController replay_ui(source);
+    REQUIRE(replay_ui.load_agent_checkpoint(checkpoint_path));
+    const auto replay = replay_ui.resume_agent_checkpoint();
+    REQUIRE(replay && replay.value().can_accept);
+    REQUIRE(replay.value().scope_objects == prepared.value().scope_objects);
+    REQUIRE(source.snapshot().project_revision == revision);
+    REQUIRE(ui.accept_agent_plan());
+    REQUIRE(!ui.accept_agent_plan());
+    REQUIRE(!replay_ui.accept_agent_plan());
+    const auto accepted = source.snapshot();
+    REQUIRE(accepted.viewport.scene.find(objects[0U])->world_transform.translation.x == 0.1);
+    REQUIRE(accepted.viewport.scene.find(objects[1U])->world_transform.translation.x == 2.1);
+    REQUIRE(accepted.viewport.scene.find(objects[2U])->world_transform.translation.x == 0.0);
+    REQUIRE(accepted.viewport.scene.find(objects[3U])->world_transform.translation.x == 2.1);
+
+    REQUIRE(accepted.undo_count == history_before + 1U);
+    REQUIRE(accepted.objects[1U].object.local_transform.translation.x == child_local_before.translation.x);
+    REQUIRE(accepted.objects[1U].object.local_transform.translation.y == child_local_before.translation.y);
+    REQUIRE(accepted.objects[1U].object.local_transform.translation.z == child_local_before.translation.z);
+    REQUIRE(accepted.objects[1U].object.local_transform.rotation.x == child_local_before.rotation.x);
+    REQUIRE(accepted.objects[1U].object.local_transform.rotation.y == child_local_before.rotation.y);
+    REQUIRE(accepted.objects[1U].object.local_transform.rotation.z == child_local_before.rotation.z);
+    REQUIRE(accepted.objects[1U].object.local_transform.rotation.w == child_local_before.rotation.w);
+    REQUIRE(accepted.objects[1U].object.local_transform.scale.x == child_local_before.scale.x);
+    REQUIRE(accepted.objects[1U].object.local_transform.scale.y == child_local_before.scale.y);
+    REQUIRE(accepted.objects[1U].object.local_transform.scale.z == child_local_before.scale.z);
+    REQUIRE(ui.dispatch(carto::application::UndoAction{}));
+    REQUIRE(source.snapshot().viewport.scene.find(objects[0U])->world_transform.translation.x == 0.0);
+    REQUIRE(source.snapshot().viewport.scene.find(objects[1U])->world_transform.translation.x == 2.0);
+    REQUIRE(ui.dispatch(carto::application::RedoAction{}));
+    REQUIRE(source.snapshot().viewport.scene.find(objects[1U])->world_transform.translation.x == 2.1);
+
+    // Keep the independent budget fixture on its own journal path. The live
+    // authoring session still owns the hierarchy project's recovery journal.
+    const auto budget_path = directory.path() / "budget-hierarchy.carto";
+    REQUIRE(validated_document.value().save_atomic(budget_path));
+    carto::application::ApplicationSession budget_source;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(budget_source,
+        carto::application::OpenProjectAction{budget_path}));
+    carto::ui::UiController budget_ui(budget_source);
+    REQUIRE(budget_ui.dispatch(carto::application::SelectObjectAction{objects[0U]}));
+    REQUIRE(budget_ui.compile_agent_goal_sequence(goal));
+    auto tiny = translation_envelope({objects[0U], objects[1U], objects[3U]}, 0.25);
+    tiny.max_objects_touched = 1U;
+    const auto tiny_prepared = budget_ui.prepare_agent_plan(goal, tiny);
+    REQUIRE(tiny_prepared);
+    const auto blocked = budget_ui.run_prepared_agent_plan();
+    REQUIRE(blocked && !blocked.value().can_accept);
+    REQUIRE(blocked.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(blocked.value().steps.front().diagnostic.has_value());
+    REQUIRE(blocked.value().steps.front().diagnostic->message.find("object-touch budget") != std::string::npos);
+    REQUIRE(budget_source.snapshot().project_revision == revision);
+    REQUIRE(budget_source.snapshot().viewport.scene.find(objects[1U])->world_transform.translation.x == 2.0);
+
+    std::string locked_serialized = serialized;
+    const auto locked_record_begin = locked_serialized.find(new_child_prefix);
+    REQUIRE(locked_record_begin != std::string::npos);
+    const auto locked_record_end = locked_serialized.find('\n', locked_record_begin);
+    REQUIRE(locked_record_end != std::string::npos);
+    const auto lock_fields = locked_serialized.rfind(" 1 0 ", locked_record_end);
+    REQUIRE(lock_fields != std::string::npos && lock_fields > locked_record_begin);
+    locked_serialized.replace(lock_fields + 3U, 1U, "1");
+    const auto locked_document =
+        carto::project::ProjectDocument::deserialize(locked_serialized);
+    REQUIRE(locked_document);
+    REQUIRE(locked_document.value().scene().find(objects[1U])->locked);
+    const auto locked_path = directory.path() / "locked-hierarchy.carto";
+    std::ofstream locked_output(locked_path, std::ios::binary | std::ios::trunc);
+    REQUIRE(locked_output.good());
+    locked_output << locked_serialized;
+    locked_output.close();
+    REQUIRE(locked_output.good());
+    carto::application::ApplicationSession locked_source;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        locked_source, carto::application::OpenProjectAction{locked_path}));
+    carto::ui::UiController locked_ui(locked_source);
+    REQUIRE(locked_ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(locked_ui.dispatch(carto::application::SelectObjectAction{objects[0U]}));
+    const auto locked_rejection = locked_ui.compile_agent_goal_sequence(goal);
+    REQUIRE(!locked_rejection);
+    REQUIRE(locked_rejection.error().message.find("locked descendant") !=
+        std::string::npos);
+    REQUIRE(locked_ui.snapshot().agent_plan_draft.empty());
+}
+
+
 void ui_spatial_goal_resolves_unique_nearest_root_without_selection_fallback() {
     carto::application::ApplicationSession source;
     carto::ui::UiController ui(source);
@@ -10697,6 +10883,7 @@ int main() {
         agent_goal_scope_parser_rejects_malformed_prefixes_and_decodes_only_safe_escapes();
         ui_condition_tag_goal_compiles_and_accepts_only_current_reviewed_unprotected_targets();
         ui_condition_tag_goal_rejects_missing_unknown_stale_unreviewed_and_protected_evidence();
+        ui_selected_hierarchy_subtree_is_scoped_reviewed_and_accepted_as_one_root_write();
         ui_spatial_goal_resolves_unique_nearest_root_without_selection_fallback();
         ui_spatial_goal_rejects_tied_nearest_candidates_atomically();
         ui_spatial_goal_rejects_duplicate_named_anchors();

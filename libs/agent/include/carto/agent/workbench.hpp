@@ -63,6 +63,7 @@ struct HardConstraint {
 struct ParsedAgentGoal {
     std::optional<std::string> exact_object_name;
     std::optional<std::string> condition_tag_scope;
+    bool selected_object_subtree_scope = false;
     std::string commands;
     struct NearestObjectScope {
         std::string anchor_name;
@@ -73,7 +74,8 @@ struct ParsedAgentGoal {
 
 // Parses an exact-name scope prefix, the explicit nearest-object scope
 // `on nearest object within <radius> world units of "Anchor Name":`, or the
-// exact CONDITION tag scope `on CONDITION tag "tag-name":`.
+// exact CONDITION tag scope `on CONDITION tag "tag-name":`, or
+// `on subtree of selected object:` for bounded root translation.
 // The returned commands preserve the goal text and never infer a target.
 [[nodiscard]] core::Result<ParsedAgentGoal> parse_agent_goal(std::string_view goal);
 
