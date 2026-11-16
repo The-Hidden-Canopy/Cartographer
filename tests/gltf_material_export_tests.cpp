@@ -364,6 +364,33 @@ void material_v5_round_trips_through_gltf(const std::filesystem::path &root) {
                   with_texture.value().losses.front().find("clearcoat textures") != std::string::npos,
               "a clearcoat texture is reported as a loss rather than silently dropped");
     }
+    {
+        application::ApplicationSession session;
+        take(application::testing::dispatch(session, application::SaveProjectAction{root / "loss-report.carto"}));
+        const auto snap = session.snapshot();
+        std::vector<std::uint8_t> source(foreign.begin(), foreign.end());
+        const auto receipt = take(application::testing::dispatch(session,
+            application::ImportGltfMaterialLibraryAction{snap.project_generation, snap.project_revision, source, true}));
+        check(std::any_of(receipt.warnings.begin(), receipt.warnings.end(), [](const auto& warning) {
+            return warning.message.find("clearcoat textures") != std::string::npos;
+        }), "material-library import surfaces clearcoat loss in its receipt");
+        const auto scene = take(io::import_gltf_scene(foreign_bytes));
+        check(std::any_of(scene.warnings.begin(), scene.warnings.end(), [](const auto& warning) {
+            return warning.find("clearcoat textures") != std::string::npos;
+        }), "scene import propagates material losses into its warnings");
+        const auto scene_path = root / "loss-scene.gltf";
+        std::ofstream output(scene_path, std::ios::binary);
+        output.write(foreign.data(), static_cast<std::streamsize>(foreign.size()));
+        output.close();
+        check(static_cast<bool>(output), "lossy scene fixture is saved");
+        application::ApplicationSession scene_session;
+        take(application::testing::dispatch(scene_session,
+            application::SaveProjectAction{root / "loss-scene.carto"}));
+        const auto scene_receipt = take(carto::testing::import_gltf_scene_file(scene_session, scene_path, true));
+        check(std::any_of(scene_receipt.warnings.begin(), scene_receipt.warnings.end(), [](const auto& warning) {
+            return warning.message.find("clearcoat textures") != std::string::npos;
+        }), "scene application receipt surfaces clearcoat loss");
+    }
 }
 
 int main(int argc, char **argv) {

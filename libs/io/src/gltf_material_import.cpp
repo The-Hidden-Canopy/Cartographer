@@ -727,6 +727,8 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
             throw std::runtime_error("unsupported scene extension (including punctual lights)");
         ImportedGltfScene result;
         result.materials = need(import_gltf_materials(bytes, false));
+        result.warnings.insert(result.warnings.end(), result.materials.losses.begin(),
+                               result.materials.losses.end());
         const auto data = buffers(root, contents);
         const auto views = array(get(root, "bufferViews", "[]"), 4096),
                    accessors = array(get(root, "accessors", "[]"), 4096);
