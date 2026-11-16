@@ -151,6 +151,40 @@ void stale_and_unsupported_sources_fail_closed() {
             "unsafe material source identity is rejected");
 }
 
+void unrepresented_optical_fields_fail_closed() {
+    using namespace carto::production;
+    const auto check = [](const carto::render::MaterialAsset& material) {
+        const auto compiled = compile_material_artifact(
+            "project/public-fixture/material/71", material);
+        require(!compiled && compiled.error().code == carto::core::ErrorCode::unsupported,
+                "native material artifact must explicitly reject unrepresented optics");
+    };
+    auto material = material_fixture();
+    material.definition.ior = 1.4; check(material);
+    material = material_fixture(); material.definition.transmission = 0.5; check(material);
+    material = material_fixture(); material.definition.thickness = 0.1; check(material);
+    material = material_fixture(); material.definition.attenuation_color = {0.8, 1.0, 1.0}; check(material);
+    material = material_fixture(); material.definition.attenuation_distance = 0.5; check(material);
+    material = material_fixture(); material.definition.anisotropy = 0.5; check(material);
+    material = material_fixture(); material.definition.anisotropy_rotation = 0.5; check(material);
+    material = material_fixture(); material.definition.transmission_map.asset = 1101U; check(material);
+    material = material_fixture(); material.definition.thickness_map.asset = 1102U; check(material);
+    material = material_fixture(); material.definition.anisotropy_map.asset = 1103U; check(material);
+
+    // Simulate an old artifact that digested V5 source while dropping optics.
+    auto legacy = compile_material_artifact("project/public-fixture/material/71", material_fixture());
+    require(static_cast<bool>(legacy), "legacy artifact fixture compiles");
+    material = material_fixture(); material.definition.transmission = 0.5;
+    const auto source_digest = material_source_digest(material);
+    require(static_cast<bool>(source_digest), "optical source remains valid project data");
+    legacy.value().source_digest = source_digest.value();
+    require(static_cast<bool>(legacy.value().refresh_digest()), "legacy artifact remains internally valid");
+    const auto revalidated = validate_material_artifact_source(
+        legacy.value(), "project/public-fixture/material/71", material);
+    require(!revalidated && revalidated.error().code == carto::core::ErrorCode::unsupported,
+            "legacy artifact cannot validate against omitted optical data");
+}
+
 // Imported glTF bindings: an explicit catalog sampler with default parameters
 // and an OpenGL tag on non-normal slots. Only provably default samplers pack;
 // identity stays bound to the authored material and normal maps stay strict.
@@ -198,6 +232,7 @@ int main() {
     supported_material_compiles_deterministically();
     material_artifact_round_trip_and_tamper_rejection();
     stale_and_unsupported_sources_fail_closed();
+    unrepresented_optical_fields_fail_closed();
     imported_default_sampler_bindings_pack_without_changing_identity();
     std::cout << "material artifact tests passed\n";
     return EXIT_SUCCESS;

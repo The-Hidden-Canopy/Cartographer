@@ -383,6 +383,10 @@ core::Result<void> validate_material_artifact_source(
     if (auto result = artifact.validate(); !result) return result;
     const auto digest = material_source_digest(current_material);
     if (!digest) return core::Result<void>::failure(digest.error());
+    // Previously compiled V1 artifacts may have bound the V5 source digest
+    // while silently omitting its optical data from their native constants.
+    if (auto result = render::validate_native_material_optics(current_material.definition);
+        !result) return result;
     if (current_source_identity != artifact.source_identity ||
         current_material.id != artifact.material_id ||
         current_material.revision != artifact.source_revision ||

@@ -2,6 +2,7 @@
 #include <carto/attributes/layer.hpp>
 #include <carto/attributes/set.hpp>
 #include <carto/attributes/uv.hpp>
+#include <carto/core/filesystem.hpp>
 #include <carto/geometry/mesh.hpp>
 #include <carto/journal/journal.hpp>
 #include <carto/production/material_artifact.hpp>
@@ -34,6 +35,13 @@ void require(bool condition, const char* message) {
         std::cerr << "FAIL: " << message << '\n';
         std::exit(EXIT_FAILURE);
     }
+}
+
+std::filesystem::path native_test_path(const std::filesystem::path& path) {
+    std::error_code error;
+    auto native = carto::core::native_io_path(path, error);
+    require(!error, "fixture path resolves for native file IO");
+    return native;
 }
 
 carto::assets::Sha256Digest digest(std::string_view value) {
@@ -710,7 +718,7 @@ void world_position_product_composes_and_publishes_for_exact_instance() {
             [&product_identity](const auto& value) { return value.identity == product_identity; });
         require(reopened_product != reopened.value()->envelope.products.end(),
             "published manifest retains each instance world-position reference");
-        std::ifstream stream(reopened.value()->revision_path / reopened_product->relative_path,
+        std::ifstream stream(native_test_path(reopened.value()->revision_path / reopened_product->relative_path),
             std::ios::binary);
         require(static_cast<bool>(stream),
             "published world-position bytes are addressable by their manifest reference");
@@ -728,7 +736,7 @@ void world_position_product_composes_and_publishes_for_exact_instance() {
     require(reopened_id_product != reopened.value()->envelope.products.end(),
         "published manifest retains the material/surface ID product reference");
     std::ifstream id_stream(
-        reopened.value()->revision_path / reopened_id_product->relative_path, std::ios::binary);
+        native_test_path(reopened.value()->revision_path / reopened_id_product->relative_path), std::ios::binary);
     require(static_cast<bool>(id_stream),
         "published material/surface ID bytes are addressable by the manifest reference");
     const std::vector<std::uint8_t> published_id_bytes{
