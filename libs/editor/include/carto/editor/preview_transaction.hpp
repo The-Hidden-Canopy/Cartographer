@@ -28,6 +28,7 @@ enum class PreviewKind {
     generate_unique_lightmap_uv,
     slide_vertex,
     split_edge,
+    bevel_edge,
 };
 
 struct PreviewParameters {
@@ -65,6 +66,7 @@ struct PreviewParameters {
     std::optional<std::uint32_t> lightmap_padding_texels;
     std::optional<std::uint32_t> lightmap_maximum_udim_tiles;
 
+    std::optional<std::uint32_t> segments;
     std::optional<double> factor;
     std::optional<geometry::EdgeId> support_edge;
 

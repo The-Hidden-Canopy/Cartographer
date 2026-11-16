@@ -1,4 +1,5 @@
 #include <carto/agent/workbench.hpp>
+#include "checkpoint_targets.hpp"
 
 #include <carto/project/project.hpp>
 
@@ -879,6 +880,19 @@ core::Result<void> AgentTaskCheckpoint::validate() const {
         return core::Result<void>::failure(malformed(
             "checkpoint source project is invalid or has a different revision"));
     }
+    for (const auto& step : plan.steps) {
+        const auto edges = detail::checkpoint_edges(step);
+        if (!edges) return core::Result<void>::failure(edges.error());
+        for (const auto edge : edges.value()) {
+            const auto* object = source.value().scene().find(step.target.object);
+            if (!object || !object->mesh_asset) return core::Result<void>::failure(malformed(
+                "checkpoint edge target has no source mesh"));
+            const auto mesh = source.value().meshes().find(*object->mesh_asset);
+            if (mesh == source.value().meshes().end() || !mesh->second.find_edge(edge)) {
+                return core::Result<void>::failure(malformed("checkpoint edge target is absent from the source mesh"));
+            }
+        }
+    }
     const auto speculative = project::ProjectDocument::deserialize(speculative_project);
     if (!speculative) {
         return core::Result<void>::failure(speculative.error().with_context(
@@ -1313,6 +1327,14 @@ core::Result<AgentTaskCheckpoint> AgentTaskCheckpoint::deserialize(std::string_v
     checkpoint.source_project = reader.field(kMaxProjectBytes);
     checkpoint.speculative_project = reader.field(kMaxProjectBytes);
     checkpoint.plan = read_plan(reader, version);
+    if (version < 14U) {
+        for (const auto& step : checkpoint.plan.steps) {
+            const auto edges = detail::checkpoint_edges(step);
+            if (!edges) return core::Result<AgentTaskCheckpoint>::failure(edges.error());
+            if (!edges.value().empty()) return core::Result<AgentTaskCheckpoint>::failure(malformed(
+                "legacy edge checkpoint lacks canonical endpoint identity evidence; capture a new plan"));
+        }
+    }
     checkpoint.envelope = read_envelope(reader, version);
     checkpoint.query_budget.max_queries = checkpoint.envelope.max_scene_queries;
     checkpoint.query_budget.max_objects_examined = checkpoint.envelope.max_objects_examined;

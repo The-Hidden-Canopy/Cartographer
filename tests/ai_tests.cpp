@@ -112,7 +112,7 @@ void ontology_is_derived_from_native_tools() {
     REQUIRE(dissolve_edge != context.operations.end() && !dissolve_edge->preview_supported);
     REQUIRE(tri_to_quad != context.operations.end() && !tri_to_quad->preview_supported);
     REQUIRE(slide_vertex != context.operations.end() && slide_vertex->preview_supported);
-    REQUIRE(bevel_edge != context.operations.end() && !bevel_edge->preview_supported);
+    REQUIRE(bevel_edge != context.operations.end() && bevel_edge->preview_supported);
     REQUIRE(bevel_vertex != context.operations.end() && !bevel_vertex->preview_supported);
     REQUIRE(loop_cut != context.operations.end());
     REQUIRE(loop_cut->kernel_operation == "unclassified");
@@ -178,7 +178,7 @@ void ontology_is_derived_from_native_tools() {
                 !operation.writes.empty() && !operation.validators.empty();
         }));
     REQUIRE(std::count_if(context.operations.begin(), context.operations.end(),
-        [](const auto& operation) { return operation.provider_requestable; }) == 9);
+        [](const auto& operation) { return operation.provider_requestable; }) == 10);
     REQUIRE(inset->parameter_schema.size() == 1U);
     REQUIRE(inset->parameter_schema.front().type == carto::ai::ParameterType::length);
     REQUIRE(inset->parameter_schema.front().unit == carto::ai::ParameterUnit::world_length);
@@ -299,7 +299,7 @@ void ontology_fails_closed_on_tool_kernel_contract_drift() {
     const auto projected = carto::ai::project_capabilities(ontology,
         carto::ai::effect_mask(carto::ai::CapabilityEffect::geometry) |
         carto::ai::effect_mask(carto::ai::CapabilityEffect::topology));
-    REQUIRE(projected.size() == 5U);
+    REQUIRE(projected.size() == 6U);
     REQUIRE(std::none_of(projected.begin(), projected.end(), [](const auto& capability) {
         return capability.id == "mesh.extrude-face";
     }));
@@ -783,12 +783,54 @@ void edge_split_proposals_are_typed_bounded_and_review_only() {
     REQUIRE(!proposal.value().validate(stale));
 }
 
+void edge_bevel_proposals_are_single_segment_and_review_only() {
+    using namespace carto;
+    application::ApplicationSession session;
+    REQUIRE(application::HumanApplicationAccess::dispatch(session,
+        application::CreateBoxAction{"Bevel", {1.0, 1.0, 1.0}}));
+    REQUIRE(application::HumanApplicationAccess::dispatch(session,
+        application::SetSelectionModeAction{editor::SelectionMode::edge}));
+    REQUIRE(application::HumanApplicationAccess::dispatch(session,
+        application::SelectEdgeAction{scene::ObjectId{1U}, geometry::EdgeId{1U}}));
+    const auto context = context_for(session);
+    ai::NativePlanner planner;
+    const auto proposal = planner.propose("bevel edge 0.1", context);
+    REQUIRE(proposal);
+    REQUIRE(proposal.value().preview_kind == editor::PreviewKind::bevel_edge);
+    REQUIRE(proposal.value().parameters.distance == 0.1);
+    REQUIRE(proposal.value().parameters.segments == 1U);
+    REQUIRE(!proposal.value().validate_auto_approval(context));
+    REQUIRE(planner.propose("bevel-edge 0.1 segments 1", context));
+    for (const auto* intent : {"bevel edge 0", "bevel edge -0.1", "bevel edge nan",
+        "bevel edge 0.1 segments 0", "bevel edge 0.1 segments 2", "bevel edge 0.1 segments 1.0",
+        "bevel edge 0.1 extra", "bevel vertex 0.1", "bevel edge 0.1 segments 1 extra"}) {
+        REQUIRE(!planner.propose(intent, context));
+    }
+    auto parameters = proposal.value().parameters;
+    parameters.factor = 0.5;
+    REQUIRE(!parameters.validate(editor::PreviewKind::bevel_edge));
+    parameters.factor.reset();
+    parameters.segments.reset();
+    REQUIRE(!parameters.validate(editor::PreviewKind::bevel_edge));
+    parameters.segments = 2U;
+    REQUIRE(!parameters.validate(editor::PreviewKind::bevel_edge));
+    parameters.segments = 1U;
+    parameters.distance = std::numeric_limits<double>::infinity();
+    REQUIRE(!parameters.validate(editor::PreviewKind::bevel_edge));
+    parameters.distance = 0.1;
+    REQUIRE(!parameters.validate(editor::PreviewKind::inset_face));
+    auto stale = context;
+    stale.project_revision = context.project_revision.next();
+    REQUIRE(!proposal.value().validate(stale));
+}
+
 } // namespace
 
 int main() {
     try {
         vertex_slide_proposals_are_typed_bounded_and_review_only();
         edge_split_proposals_are_typed_bounded_and_review_only();
+        edge_bevel_proposals_are_single_segment_and_review_only();
         ontology_is_derived_from_native_tools();
         ontology_json_preserves_kernel_and_approval_contract();
         capability_projection_filters_by_preview_and_work_envelope();

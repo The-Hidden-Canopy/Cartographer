@@ -1,4 +1,5 @@
 #include <carto/agent/workbench.hpp>
+#include "checkpoint_targets.hpp"
 #include <carto/assets/blob_store.hpp>
 
 #include <algorithm>
@@ -215,6 +216,36 @@ assets::Sha256Digest clarification_answer_digest(const ClarificationQuestion& qu
     append_number(canonical, question.freeform_answer.has_value() ? 1U : 0U);
     if (question.freeform_answer.has_value()) append_field(canonical, *question.freeform_answer);
     return digest_text(canonical);
+}
+
+// Edge numbers are live mesh identities, not serialized project identities.
+// Checkpoint replay must not silently bind one number to different endpoints.
+core::Result<void> validate_checkpoint_edge_bindings(const AgentPlan& plan,
+    const project::ProjectDocument& original, const project::ProjectDocument& replay) {
+    using Endpoints = std::pair<geometry::VertexId, geometry::VertexId>;
+    const auto endpoints = [](const project::ProjectDocument& document,
+        scene::ObjectId object_id, geometry::EdgeId edge_id) -> std::optional<Endpoints> {
+        const auto* object = document.scene().find(object_id);
+        if (!object || !object->mesh_asset) return std::nullopt;
+        const auto mesh = document.meshes().find(*object->mesh_asset);
+        if (mesh == document.meshes().end()) return std::nullopt;
+        const auto* edge = mesh->second.find_edge(edge_id);
+        if (!edge) return std::nullopt;
+        return Endpoints{std::min(edge->first, edge->second), std::max(edge->first, edge->second)};
+    };
+    for (const auto& step : plan.steps) {
+        const auto edges = detail::checkpoint_edges(step);
+        if (!edges) return core::Result<void>::failure(edges.error());
+        for (const auto edge : edges.value()) {
+            const auto before = endpoints(original, step.target.object, edge);
+            const auto after = endpoints(replay, step.target.object, edge);
+            if (!before || !after || before != after) {
+                return core::Result<void>::failure(stale(
+                    "checkpoint edge target changes endpoint identity across source reconstruction; reopen the source and capture a new plan"));
+            }
+        }
+    }
+    return core::Result<void>::success();
 }
 
 assets::Sha256Digest clarification_plan_context_digest(const AgentPlan& plan) {
@@ -7874,6 +7905,11 @@ core::Result<void> AgentTask::save_checkpoint(
     checkpoint.source_revision = base_document_.revision();
     checkpoint.plan_context_digest = plan_context.value();
     checkpoint.source_project = base_document_.serialize();
+    const auto reconstructed = project::ProjectDocument::deserialize(checkpoint.source_project);
+    if (!reconstructed) return core::Result<void>::failure(reconstructed.error());
+    if (auto binding = validate_checkpoint_edge_bindings(plan_, base_document_, reconstructed.value()); !binding) {
+        return binding;
+    }
     checkpoint.speculative_project = speculative_->document_.serialize();
     checkpoint.source_digest = digest_text(checkpoint.source_project);
     checkpoint.speculative_digest = digest_text(checkpoint.speculative_project);
@@ -8022,6 +8058,12 @@ core::Result<AgentTask> AgentTask::resume_checkpoint(
             "resume objective is bound to a different source revision"));
     }
 
+    const auto reconstructed = project::ProjectDocument::deserialize(checkpoint.source_project);
+    if (!reconstructed) return core::Result<AgentTask>::failure(reconstructed.error());
+    if (auto binding = validate_checkpoint_edge_bindings(
+            reauthorized_plan, reconstructed.value(), source.document_); !binding) {
+        return core::Result<AgentTask>::failure(binding.error());
+    }
     auto resumed = begin(source, std::move(reauthorized_plan), checkpoint.envelope);
     if (!resumed) return resumed;
     copy_query_budget_usage(resumed.value().query_budget_, checkpoint.query_budget);
@@ -8060,6 +8102,9 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
     }
     const auto& base = base_result.value();
     const auto& current = source.document_;
+    if (auto binding = validate_checkpoint_edge_bindings(checkpoint.plan, base, current); !binding) {
+        return core::Result<AgentRebaseAnalysis>::failure(binding.error());
+    }
     AgentRebaseAnalysis analysis;
     analysis.checkpoint_revision = checkpoint.source_revision;
     analysis.current_revision = current.revision();

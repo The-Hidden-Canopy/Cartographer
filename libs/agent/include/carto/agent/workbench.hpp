@@ -1819,7 +1819,7 @@ struct AgentDemonstrationRecipe {
 // resumed task can run. Project bytes remain artifacts owned by this record;
 // they are never applied to the live source by loading a checkpoint.
 struct AgentTaskCheckpoint {
-    static constexpr std::uint32_t kFormatVersion = 13U;
+    static constexpr std::uint32_t kFormatVersion = 14U;
 
     TaskStatus status = TaskStatus::prepared;
     AgentPlan plan;

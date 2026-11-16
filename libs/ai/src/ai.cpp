@@ -146,6 +146,7 @@ std::string preview_name(editor::PreviewKind kind) {
     case editor::PreviewKind::set_vertex_position: return "set_vertex_position";
     case editor::PreviewKind::slide_vertex: return "slide_vertex";
     case editor::PreviewKind::split_edge: return "split_edge";
+    case editor::PreviewKind::bevel_edge: return "bevel_edge";
     case editor::PreviewKind::poke_face: return "poke_face";
     case editor::PreviewKind::set_material_region_assignment:
         return "set_material_region_assignment";
@@ -684,7 +685,8 @@ core::Result<void> Proposal::validate(const Context& expected) const {
             return core::Result<void>::failure(invalid_state(
                 "face proposal requires exactly one object-bound selected face"));
         }
-    } else if (preview_kind == editor::PreviewKind::split_edge) {
+    } else if (preview_kind == editor::PreviewKind::split_edge ||
+        preview_kind == editor::PreviewKind::bevel_edge) {
         if (expected.authoring.selection_mode != editor::SelectionMode::edge ||
             expected.authoring.edges.size() != 1U ||
             !expected.authoring.component_object.has_value()) {
@@ -808,7 +810,9 @@ std::vector<OperationDescriptor> build_operation_ontology(
             descriptor.kernel_operation = "geometry.EditableMesh.bevel_edge";
             descriptor.parameters = {"distance", "segments"};
             descriptor.precondition =
-                "exactly one object-bound internal manifold edge selected; finite positive width; strictly convex planar incident faces; segments must equal one; operation requires a future preview contract";
+                "exactly one object-bound internal manifold edge selected; finite positive width; strictly convex planar incident faces; segments must equal one; native shared-mesh restrictions apply";
+            descriptor.preview_supported = true;
+            descriptor.preview_kind = editor::PreviewKind::bevel_edge;
         } else if (matches(
                        "mesh.bevel-vertex",
                        editor::ToolKernelKind::editable_mesh_bevel_vertex)) {
@@ -1125,6 +1129,9 @@ std::string proposal_json(const Proposal& proposal) {
         "\",\"preview_kind\":\"" + preview_name(proposal.preview_kind) +
         "\",\"intent\":\"" + json_escape(proposal.intent) +
         "\",\"rationale\":\"" + json_escape(proposal.rationale) + "\"";
+    if (proposal.parameters.segments.has_value()) {
+        result += ",\"segments\":" + std::to_string(*proposal.parameters.segments);
+    }
     if (proposal.parameters.factor.has_value()) {
         result += ",\"factor\":" + std::to_string(*proposal.parameters.factor);
     }
@@ -1295,6 +1302,29 @@ core::Result<Proposal> NativePlanner::propose(
                 parsed_numbers.value()[2]});
     }
 
+    if (words.front() == "bevel" || words.front() == "bevel-edge") {
+        const std::size_t width_index = words.front() == "bevel-edge" ? 1U : 2U;
+        const bool prefix = words.front() == "bevel-edge" ||
+            (words.size() > 1U && words[1] == "edge");
+        const bool explicit_segments = words.size() == width_index + 3U &&
+            words[width_index + 1U] == "segments" && words[width_index + 2U] == "1";
+        if (!prefix || (words.size() != width_index + 1U && !explicit_segments)) {
+            return core::Result<Proposal>::failure(invalid(
+                "bevel intent must be `bevel edge <distance>` or `bevel-edge <distance>`, optionally followed by `segments 1`"));
+        }
+        const auto width = parse_number(words[width_index]);
+        if (!width) return core::Result<Proposal>::failure(width.error());
+        editor::PreviewParameters parameters;
+        parameters.distance = width.value();
+        parameters.segments = 1U;
+        Proposal proposal{request_id, context.project_revision, context.authoring,
+            editor::PreviewKind::bevel_edge, parameters, "mesh.bevel-edge", std::string(intent),
+            "Bevel one selected internal manifold edge with one segment using the native kernel; explicit review required."};
+        if (auto valid = proposal.validate(context); !valid) {
+            return core::Result<Proposal>::failure(valid.error());
+        }
+        return core::Result<Proposal>::success(std::move(proposal));
+    }
     if (words.front() == "split" || words.front() == "split-edge") {
         const std::size_t factor_index = words.front() == "split-edge" ? 1U : 2U;
         const bool prefix = words.front() == "split-edge" ||
@@ -1409,7 +1439,7 @@ core::Result<Proposal> NativePlanner::propose(
         return core::Result<Proposal>::success(std::move(proposal));
     }
     return core::Result<Proposal>::failure(invalid(
-        "native planner supports translate object, extrude, inset, poke face, move vertex, slide vertex, split edge, "
+        "native planner supports translate object, extrude, inset, poke face, move vertex, slide vertex, split edge, bevel edge, "
         "material assignment, and lightmap UV generation intents"));
 }
 

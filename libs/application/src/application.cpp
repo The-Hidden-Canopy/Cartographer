@@ -4421,6 +4421,16 @@ core::Result<ApplicationAction> ApplicationSession::preview_action(
             "mesh.inset-face", editor::ToolArguments{
                 *parameters.distance, {}, true, 0.5, std::nullopt}});
     }
+    if (preview.kind() == editor::PreviewKind::bevel_edge) {
+        if (auto valid = parameters.validate(preview.kind()); !valid) {
+            return core::Result<ApplicationAction>::failure(valid.error());
+        }
+        editor::ToolArguments arguments;
+        arguments.distance = *parameters.distance;
+        arguments.segments = *parameters.segments;
+        return core::Result<ApplicationAction>::success(InvokeToolAction{
+            "mesh.bevel-edge", arguments});
+    }
     if (preview.kind() == editor::PreviewKind::split_edge) {
         if (auto valid = parameters.validate(preview.kind()); !valid) {
             return core::Result<ApplicationAction>::failure(valid.error());
@@ -4507,7 +4517,8 @@ core::Result<DispatchReceipt> ApplicationSession::commit_preview(
     OperationSource source,
     std::string_view provenance_id) {
     if ((preview.kind() == editor::PreviewKind::slide_vertex ||
-         preview.kind() == editor::PreviewKind::split_edge) &&
+         preview.kind() == editor::PreviewKind::split_edge ||
+         preview.kind() == editor::PreviewKind::bevel_edge) &&
         (preview.session_owner_ != this || preview.project_generation_ != project_generation_)) {
         return failure(core::Diagnostic(core::ErrorCode::stale_data,
             "mesh preview belongs to another project generation or session"));

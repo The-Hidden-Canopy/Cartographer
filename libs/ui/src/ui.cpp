@@ -672,10 +672,11 @@ ai::Context make_ai_context(
         ai::effect_mask(ai::CapabilityEffect::geometry) |
         ai::effect_mask(ai::CapabilityEffect::topology)) {
     auto ontology = ai::build_operation_ontology(snapshot.tools);
-    // Slide and edge split are exposed only in the bounded workbench, with ghost review,
+    // Slide, edge split, and edge bevel require the bounded workbench ghost review,
     // shared-instance scope, effect budgets and project-generation fencing.
     std::erase_if(ontology, [](const auto& operation) {
-        return operation.id == "mesh.slide-vertex" || operation.id == "mesh.split-edge";
+        return operation.id == "mesh.slide-vertex" || operation.id == "mesh.split-edge" ||
+            operation.id == "mesh.bevel-edge";
     });
     return ai::Context{
         snapshot.project_revision,
@@ -693,7 +694,8 @@ bool same_ai_preview(
     }
     const auto& expected = proposal.parameters;
     const auto& actual = preview.parameters();
-    if (expected.distance != actual.distance || expected.factor != actual.factor ||
+    if (expected.segments != actual.segments ||
+        expected.distance != actual.distance || expected.factor != actual.factor ||
         expected.support_edge != actual.support_edge) return false;
     if (expected.position.has_value() != actual.position.has_value()) return false;
     if (expected.position.has_value()) {

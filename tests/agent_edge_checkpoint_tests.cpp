@@ -86,7 +86,7 @@ std::string rewrite_version(std::string_view encoding, std::string version) {
     auto outer = fields(encoding.substr(magic.size()));
     REQUIRE(outer.size() == 2U);
     auto body_fields = fields(outer[0]);
-    REQUIRE(body_fields.front() == "13");
+    REQUIRE(body_fields.front() == std::to_string(agent::AgentTaskCheckpoint::kFormatVersion));
     body_fields.front() = std::move(version);
     std::string body;
     for (const auto& value : body_fields) body += field(value);
@@ -120,28 +120,46 @@ void prepared_targets_preserve_identity_and_version_boundaries() {
         REQUIRE(changed.context_digest().value() != digest.value());
         auto task = agent::AgentTask::begin(source, plan, envelope_for(object));
         REQUIRE(task);
-        auto checkpoint = saved_checkpoint(task.value(), directory.path() /
-            (std::to_string(identity) + ".carto-agent-task"));
-        REQUIRE(checkpoint.status == agent::TaskStatus::prepared);
-        REQUIRE(checkpoint.plan_context_digest == digest.value());
-        REQUIRE(std::get<geometry::EdgeId>(checkpoint.plan.steps.front().target.component).value == identity);
-        const auto encoding = checkpoint.serialize();
-        REQUIRE(encoding);
-        const auto decoded = agent::AgentTaskCheckpoint::deserialize(encoding.value());
-        REQUIRE(decoded);
-        REQUIRE(decoded.value().plan_context_digest == digest.value());
-        REQUIRE(std::get<geometry::EdgeId>(decoded.value().plan.steps.front().target.component).value == identity);
-        const auto downgraded = agent::AgentTaskCheckpoint::deserialize(
-            rewrite_version(encoding.value(), "12"));
-        REQUIRE(!downgraded);
-        REQUIRE(downgraded.error().message.find("target kind is unknown") != std::string::npos);
-        auto forged = checkpoint;
-        forged.plan.steps.front().target.component = geometry::EdgeId{identity - 1U};
-        REQUIRE(!forged.validate());
+        // Numeric identities remain exact in the plan/digest, but an absent
+        // edge must never become a persistable executable checkpoint.
+        const auto path = directory.path() / (std::to_string(identity) + ".carto-agent-task");
+        REQUIRE(!task.value().save_checkpoint(path));
+        REQUIRE(!std::filesystem::exists(path));
     }
     auto invalid = plan_for(source, object, geometry::EdgeId{0U});
     REQUIRE(!invalid.steps.front().target.validate());
     REQUIRE(!agent::AgentTask::begin(source, invalid, envelope_for(object)));
+
+    const auto canonical_plan = plan_for(source, object, geometry::EdgeId{1U});
+    auto canonical_task = agent::AgentTask::begin(source, canonical_plan, envelope_for(object));
+    REQUIRE(canonical_task);
+    const auto checkpoint = saved_checkpoint(canonical_task.value(), directory.path() / "canonical.carto-agent-task");
+    const auto encoded = checkpoint.serialize();
+    REQUIRE(encoded);
+    REQUIRE(agent::AgentTaskCheckpoint::deserialize(encoded.value()));
+    const auto v12 = agent::AgentTaskCheckpoint::deserialize(rewrite_version(encoded.value(), "12"));
+    REQUIRE(!v12);
+    REQUIRE(v12.error().message.find("target kind is unknown") != std::string::npos);
+    const auto v13 = agent::AgentTaskCheckpoint::deserialize(rewrite_version(encoded.value(), "13"));
+    REQUIRE(!v13);
+    REQUIRE(v13.error().message.find("lacks canonical endpoint identity evidence") != std::string::npos);
+    auto forged = checkpoint;
+    forged.plan.steps.front().target.component = geometry::EdgeId{2U};
+    REQUIRE(!forged.validate());
+
+    auto slide_plan = canonical_plan;
+    slide_plan.steps.front().target.component = geometry::VertexId{1U};
+    slide_plan.steps.front().intent = "slide-vertex 0.25 along edge 1";
+    auto slide_task = agent::AgentTask::begin(source, slide_plan, envelope_for(object));
+    REQUIRE(slide_task);
+    const auto slide_checkpoint = saved_checkpoint(slide_task.value(), directory.path() / "slide.carto-agent-task");
+    const auto slide_bytes = slide_checkpoint.serialize();
+    REQUIRE(slide_bytes);
+    for (const auto version : {"12", "13"}) {
+        const auto legacy_slide = agent::AgentTaskCheckpoint::deserialize(rewrite_version(slide_bytes.value(), version));
+        REQUIRE(!legacy_slide);
+        REQUIRE(legacy_slide.error().message.find("lacks canonical endpoint identity evidence") != std::string::npos);
+    }
 
     // v12 face targets retain the same encoding and digest after adding edges.
     auto legacy_plan = plan_for(source, object, geometry::EdgeId{1U});
