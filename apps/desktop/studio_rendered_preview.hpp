@@ -3,6 +3,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <optional>
@@ -10,6 +11,38 @@
 #include <utility>
 
 namespace carto::studio {
+
+struct PreviewRenderExtent {
+    std::uint32_t width = 0, height = 0;
+    bool capped = false;
+};
+
+// Two samples per canvas axis retain thin silhouette detail that misses a
+// single pixel-center sample. Temporal reprojection alone adds no samples.
+// Keep the existing renderer's pixel and dimension budgets authoritative.
+inline std::optional<PreviewRenderExtent> preview_render_extent(
+        double width, double height, int scale_index,
+        std::uint64_t max_pixels, std::uint32_t max_dimension) {
+    constexpr std::array scales{2.0, 1.0, .5, .25};
+    if (!std::isfinite(width) || !std::isfinite(height) || width <= 0 || height <= 0 ||
+        !std::isfinite(width / height) || width / height <= 0 || scale_index < 0 ||
+        static_cast<std::size_t>(scale_index) >= scales.size() || !max_pixels || !max_dimension)
+        return std::nullopt;
+    const double scale = scales[static_cast<std::size_t>(scale_index)];
+    const double budget = static_cast<double>(max_pixels);
+    const double requested_width = std::clamp(width * scale, 1.0, budget);
+    const double requested_height = std::clamp(height * scale, 1.0, budget);
+    const double limit = std::min(1.0,
+        std::min(std::sqrt(budget / (requested_width * requested_height)),
+            double(max_dimension) / std::max(requested_width, requested_height)));
+    PreviewRenderExtent result;
+    result.width = static_cast<std::uint32_t>(std::max(1.0, std::floor(requested_width * limit)));
+    result.height = static_cast<std::uint32_t>(std::max(1.0, std::floor(requested_height * limit)));
+    if (std::uint64_t(result.width) * result.height > max_pixels)
+        result.width = static_cast<std::uint32_t>(max_pixels / result.height);
+    result.capped = limit < 1.0 || width * scale > budget || height * scale > budget;
+    return result;
+}
 
 // A single, unwrapped row keeps the viewport extent stable while an
 // asynchronous result moves between preparing, ready and error states.

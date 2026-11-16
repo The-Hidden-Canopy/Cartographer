@@ -12009,7 +12009,7 @@ struct DesktopState {
         if (ImGui::CollapsingHeader("Display & shading")) {
             if (material_viewport_enabled) {
                 ImGui::SetNextItemWidth(72.0F);
-                ImGui::Combo("Render scale", &material_viewport_scale, "100%\0 50%\0 25%\0");
+                ImGui::Combo("Render scale", &material_viewport_scale, "200% (fine detail)\0 100%\0 50%\0 25%\0");
             }
             const bool geometry_visible = viewport_projected_geometry_last_frame;
             int selected_spatial = static_cast<int>(viewport_view.spatial);
@@ -12453,7 +12453,6 @@ struct DesktopState {
             request.temporal.enabled = !material_viewport_cpu_reference;
             request.temporal.session = snapshot.project_generation;
 #endif
-            const double scale = std::array{1.0, 0.5, 0.25}[static_cast<std::size_t>(material_viewport_scale)];
             std::uint64_t max_pixels = carto::production::kAuthoringCpuMaxPixels;
 #if defined(CARTO_DESKTOP_ASYNC_READBACK) || defined(CARTO_DESKTOP_RESIDENT_WORKER)
             max_pixels = carto::production::kAuthoringNativeMaxPixels;
@@ -12462,23 +12461,16 @@ struct DesktopState {
             max_pixels = material_viewport_cpu_reference ? carto::production::kAuthoringCpuMaxPixels
                 : carto::production::kAuthoringNativeMaxPixels;
 #endif
-            const double max_readback_pixels = static_cast<double>(max_pixels);
-            // Clamp both dimensions before multiplication/conversion, then
-            // scale proportionally and retain the canvas aspect in the view.
-            const double requested_width = std::clamp(static_cast<double>(extent.x) * scale,
-                1.0, max_readback_pixels);
-            const double requested_height = std::clamp(static_cast<double>(extent.y) * scale,
-                1.0, max_readback_pixels);
-            const double limit_scale = std::min(1.0,
-                std::min(std::sqrt(max_readback_pixels / (requested_width * requested_height)),
-                    double(carto::production::kAuthoringNativeMaxDimension) / std::max(requested_width, requested_height)));
-            request.width = static_cast<std::uint32_t>(std::max(1.0, std::floor(requested_width * limit_scale)));
-            request.height = static_cast<std::uint32_t>(std::max(1.0, std::floor(requested_height * limit_scale)));
-            if (std::uint64_t(request.width) * request.height > max_pixels)
-                request.width = static_cast<std::uint32_t>(max_pixels / request.height);
-            const bool render_extent_capped = limit_scale < 1.0 ||
-                static_cast<double>(extent.x) * scale > max_readback_pixels ||
-                static_cast<double>(extent.y) * scale > max_readback_pixels;
+            auto render_extent = carto::studio::preview_render_extent(extent.x, extent.y,
+                material_viewport_scale, max_pixels, carto::production::kAuthoringNativeMaxDimension);
+            if (!render_extent) {
+                material_viewport_scale = 0;
+                render_extent = carto::studio::preview_render_extent(extent.x, extent.y,
+                    material_viewport_scale, max_pixels, carto::production::kAuthoringNativeMaxDimension);
+            }
+            request.width = render_extent ? render_extent->width : 0;
+            request.height = render_extent ? render_extent->height : 0;
+            const bool render_extent_capped = render_extent && render_extent->capped;
             if (navigation_view) request.view = *navigation_view;
             // Authored cameras also retain the exact canvas aspect when the
             // render target is downscaled, capped or rounded to whole pixels.
