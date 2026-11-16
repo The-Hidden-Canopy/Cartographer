@@ -27,7 +27,13 @@ void graphics_table_limits(d3d12::D3D12Device &device) {
     desc.push_constant_bytes = 216;
     for (unsigned i = 0; i < 9; ++i)
         desc.descriptor_bindings.push_back({0, i, gpu::ShaderStage::fragment});
-    const auto pipeline = take(device.create_pipeline(desc));
+    auto candidate = device.create_pipeline(desc);
+    if (!candidate) {
+        std::cerr << "D3D12 adapter: " << device.identity().adapter_name << '\n';
+        for (const auto &message : device.debug_receipts())
+            std::cerr << message << '\n';
+    }
+    const auto pipeline = take(std::move(candidate));
     device_ir::DeviceCommandStream forbidden_graphics;
     forbidden_graphics.append(device_ir::CmdBindPipeline{pipeline});
     const auto compute_draw=device.submit(forbidden_graphics,gpu::QueueType::compute);
@@ -92,10 +98,13 @@ void compare(const production::AuthoringViewportImage &cpu,
         check(cpu.faces[p] == gpu.faces[p], "GPU identity resolves authored faces");
         const auto a = cpu.linear_hdr[p], b = gpu.linear_hdr[p];
         for (auto [expected, actual] :
-             {std::pair{a.x, b.x}, std::pair{a.y, b.y}, std::pair{a.z, b.z}})
-            check(std::isfinite(actual) &&
-                      std::abs(expected - actual) < 2e-4 + std::abs(expected) * 1e-3,
-                  "GPU/CPU HDR BRDF parity");
+             {std::pair{a.x, b.x}, std::pair{a.y, b.y}, std::pair{a.z, b.z}}) {
+            if (!std::isfinite(actual) ||
+                std::abs(expected - actual) >= 2e-4 + std::abs(expected) * 1e-3)
+                throw std::runtime_error("GPU/CPU HDR BRDF parity at pixel " +
+                    std::to_string(p) + ": CPU=" + std::to_string(expected) +
+                    " GPU=" + std::to_string(actual));
+        }
         check(std::abs(cpu.depth[p] - gpu.depth[p]) < 0.003,
               "GPU depth reconstructs camera distance");
         for (std::size_t c = 0; c < 3; ++c)

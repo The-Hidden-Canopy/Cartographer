@@ -2413,6 +2413,25 @@ if(CARTO_ENABLE_D3D12)
     carto_target(cartographer_authoring_shader_compile_tests)
     add_test(NAME cartographer_authoring_shader_compile_tests COMMAND cartographer_authoring_shader_compile_tests)
     set_tests_properties(cartographer_authoring_shader_compile_tests PROPERTIES TIMEOUT 120)
+    # Exercise an explicitly selected compiler without its paired validator.
+    # The runtime is optional; register the negative test only when the SDK
+    # matching the discovered DXC headers supplies the compiler DLL.
+    if(CARTO_DXC_INCLUDE_DIR)
+        get_filename_component(CARTO_DXC_TEST_VERSION_DIR "${CARTO_DXC_INCLUDE_DIR}" DIRECTORY)
+        get_filename_component(CARTO_DXC_TEST_VERSION "${CARTO_DXC_TEST_VERSION_DIR}" NAME)
+        get_filename_component(CARTO_DXC_TEST_INCLUDE_DIR "${CARTO_DXC_TEST_VERSION_DIR}" DIRECTORY)
+        get_filename_component(CARTO_DXC_TEST_SDK_ROOT "${CARTO_DXC_TEST_INCLUDE_DIR}" DIRECTORY)
+        set(CARTO_DXC_TEST_COMPILER "${CARTO_DXC_TEST_SDK_ROOT}/bin/${CARTO_DXC_TEST_VERSION}/x64/dxcompiler.dll")
+        if(EXISTS "${CARTO_DXC_TEST_COMPILER}")
+            add_test(NAME cartographer_dxc_missing_validator_tests
+                COMMAND ${CMAKE_COMMAND}
+                    "-DCARTO_DXC_TEST_COMPILER=${CARTO_DXC_TEST_COMPILER}"
+                    "-DCARTO_DXC_TEST_EXECUTABLE=$<TARGET_FILE:cartographer_authoring_shader_compile_tests>"
+                    "-DCARTO_DXC_TEST_DIRECTORY=${CARTO_TEST_TEMP_ROOT}/dxc-without-validator"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/run_dxc_missing_validator_test.cmake")
+            set_tests_properties(cartographer_dxc_missing_validator_tests PROPERTIES TIMEOUT 120)
+        endif()
+    endif()
     add_executable(cartographer_builtin_shader_cache_tests builtin_shader_cache_tests.cpp)
     target_link_libraries(cartographer_builtin_shader_cache_tests PRIVATE carto_d3d12)
     target_include_directories(cartographer_builtin_shader_cache_tests PRIVATE "${PROJECT_BINARY_DIR}/libs/d3d12/generated")
@@ -2485,3 +2504,11 @@ add_executable(cartographer_authoring_viewport_budget_tests authoring_viewport_b
 target_link_libraries(cartographer_authoring_viewport_budget_tests PRIVATE carto_production)
 carto_target(cartographer_authoring_viewport_budget_tests)
 add_test(NAME cartographer_authoring_viewport_budget_tests COMMAND cartographer_authoring_viewport_budget_tests)
+
+if(CARTO_ENABLE_D3D12)
+    add_executable(cartographer_authoring_native_4k_tests authoring_native_4k_tests.cpp)
+    target_link_libraries(cartographer_authoring_native_4k_tests PRIVATE carto_d3d12_viewport)
+    carto_target(cartographer_authoring_native_4k_tests)
+    add_test(NAME cartographer_authoring_native_4k_tests COMMAND cartographer_authoring_native_4k_tests)
+    set_tests_properties(cartographer_authoring_native_4k_tests PROPERTIES TIMEOUT 120 LABELS "GPU")
+endif()

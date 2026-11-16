@@ -49,12 +49,14 @@ float4 sample_map(uint slot, float2 uv, float2 dx, float2 dy, inout bool valid) 
     const float2 ax=dx*metadata.xy, ay=dy*metadata.xy;
     const float lx=length(ax), ly=length(ay);
     float rho=max(lx,ly);
-    const float minor=max(min(lx,ly),1e-6);
-    const uint taps=uint(clamp(ceil(rho/minor),1.0,8.0));
-    const float2 major_uv=(lx>=ly ? dx : dy);
     bool finite=all(isfinite(uv)) && all(isfinite(dx)) && all(isfinite(dy)) && isfinite(rho) && all(abs(uv)<=1e6);
     valid=valid && finite;
     if(!finite) return 0;
+    const float minor=max(min(lx,ly),1e-6);
+    // Magnification must use the authored magnification filter without
+    // averaging an anisotropic footprint smaller than a texel.
+    const uint taps=rho>1.0 ? uint(clamp(ceil(rho/minor),1.0,8.0)) : 1;
+    const float2 major_uv=(lx>=ly ? dx : dy);
     float lod=clamp(log2(max(1.0,rho/float(taps))),0.0,metadata.z-1);
     uint lo=uint(floor(lod));uint flags=uint(metadata.w);
     float4 value=0;

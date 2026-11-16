@@ -1,11 +1,23 @@
 #include "authoring_shader.hpp"
 #include <carto/d3d12/device.hpp>
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
+#include <string_view>
 
 // Deliberately CPU-only: DXC emits DXIL, but no device, queue or window exists.
-int main() {
+int main(int argc, char **argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--expect-missing-validator") {
+            const auto shader = carto::d3d12::compile_hlsl(
+                {"validator.boundary", carto::gpu::ShaderStage::vertex, "VSMain", "boundary.hlsl",
+                 "float4 VSMain(uint i:SV_VertexID):SV_POSITION{return float4(0,0,0,1);}",
+                 true, false});
+            if (shader || shader.error().message.find("DXC validator") == std::string::npos)
+                throw std::runtime_error("missing paired DXC validator must fail explicitly");
+            std::cout << "missing paired DXC validator rejected\n";
+            return 0;
+        }
         for (unsigned mode = 0; mode < 3; ++mode) {
             const auto code =
                 (mode ? std::string("#define CARTO_FUSED_IDENTITY 1\n") : std::string{}) +
@@ -21,6 +33,16 @@ int main() {
                     {"authoring.cpu-compile", stage, entry, "authoring.hlsl", code, true, false});
                 if (!shader)
                     throw std::runtime_error(shader.error().message);
+                if (mode == 0 && stage == carto::gpu::ShaderStage::vertex) {
+                    if (!carto::d3d12::validate_dxil(shader.value().bytes))
+                        throw std::runtime_error("signed shader rejected by cache validation");
+                    auto unsigned_bytes = shader.value().bytes;
+                    if (unsigned_bytes.size() < 20U)
+                        throw std::runtime_error("DXIL container is too short");
+                    std::fill(unsigned_bytes.begin() + 4, unsigned_bytes.begin() + 20, 0U);
+                    if (carto::d3d12::validate_dxil(unsigned_bytes))
+                        throw std::runtime_error("unsigned DXIL was accepted for cache reuse");
+                }
                 std::cout << "mode " << mode << ' ' << entry << " DXIL compiled\n";
             }
         }
