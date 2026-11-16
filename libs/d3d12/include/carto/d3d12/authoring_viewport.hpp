@@ -137,10 +137,13 @@ public:
 private:
     std::atomic<bool> requested_{false};
 };
+// Native-resolution authoring budget: a 3840x2160 canvas (about 200 MB of
+// GPU targets at 24 bytes per pixel). Larger canvases render scaled.
+inline constexpr std::uint64_t kAuthoringViewportMaxPixels = 3840ULL * 2160ULL;
 [[nodiscard]] constexpr bool valid_readback_rgba(std::uint32_t width, std::uint32_t height,
                                                    std::size_t bytes) noexcept {
     const auto pixels = std::uint64_t(width) * height;
-    return pixels != 0U && pixels <= 1'048'576U && bytes == pixels * 4U;
+    return pixels != 0U && pixels <= kAuthoringViewportMaxPixels && bytes == pixels * 4U;
 }
 // UI-thread-only admission bookkeeping. Retire only after the native thread
 // and its device ownership have been confirmed complete.

@@ -195,9 +195,13 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID) : SV_TARGET
     const float dielectric_f0 = saturate(emissive_radiance_and_f0.w);
 #ifdef CARTO_AUTHORING_SURFACE
     const float clearcoat=material.coat,clearcoat_roughness=material.coat_roughness;
+    const float transmission=material.transmission*(1-metallic);
+    const float anisotropy=material.anisotropy;
 #else
     const float clearcoat = saturate(clearcoat_factors.x);
     const float clearcoat_roughness = saturate(clearcoat_factors.y);
+    const float transmission = 0.0;
+    const float anisotropy = 0.0;
 #endif
     const float3 f0 = lerp(
         float3(dielectric_f0, dielectric_f0, dielectric_f0), base_color, metallic);
@@ -209,12 +213,32 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID) : SV_TARGET
     const float3 fresnel = fresnel_schlick(v_dot_h, f0);
     const float clearcoat_fresnel = 0.04 + 0.96 * pow(1.0 - v_dot_h, 5.0);
     const float base_attenuation = saturate(1.0 - clearcoat * clearcoat_fresnel);
-    const float distribution = distribution_ggx(n_dot_h, roughness);
+    float distribution = distribution_ggx(n_dot_h, roughness);
+    float3 specular_normal = normal;
+#ifdef CARTO_AUTHORING_SURFACE
+    if(anisotropy>0) {
+        // glTF KHR_materials_anisotropy: alpha_t = mix(alpha, 1, s^2), alpha_b = alpha,
+        // along the mesh tangent rotated by the authored angle.
+        float3 t0=normalize(input.world_tangent-normal*dot(normal,input.world_tangent));
+        float3 b0=cross(normal,t0)*input.tangent_sign;
+        const float c=cos(material.anisotropy_rotation),s=sin(material.anisotropy_rotation);
+        const float3 t=normalize(t0*c+b0*s),b=normalize(cross(normal,t));
+        const float alpha=max(roughness*roughness,1e-3);
+        const float at=lerp(alpha,1.0,anisotropy*anisotropy),ab=alpha;
+        const float3 h=float3(dot(half_vector,t),dot(half_vector,b),n_dot_h);
+        const float d=h.x*h.x/(at*at)+h.y*h.y/(ab*ab)+h.z*h.z;
+        distribution=1.0/(3.14159265*at*ab*d*d);
+        // Bent reflection normal for the environment (stretched highlight).
+        const float3 anisotropic_tangent=cross(b,view);
+        const float3 anisotropic_normal=cross(anisotropic_tangent,b);
+        specular_normal=normalize(lerp(normal,anisotropic_normal,anisotropy*saturate(1.0-roughness*0.5)));
+    }
+#endif
     const float geometry = geometry_schlick_ggx(n_dot_l, roughness) *
         geometry_schlick_ggx(n_dot_v, roughness);
     const float3 specular = fresnel * distribution * geometry * base_attenuation /
         max(4.0 * n_dot_l * n_dot_v, 1e-12);
-    const float3 diffuse_weight = (1.0 - fresnel) * (1.0 - metallic);
+    const float3 diffuse_weight = (1.0 - fresnel) * (1.0 - metallic) * (1.0 - transmission);
     const float3 diffuse = diffuse_weight * base_color * base_attenuation / 3.14159265;
     const float clearcoat_distribution = distribution_ggx(
         n_dot_h, clearcoat_roughness);
@@ -259,8 +283,27 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID) : SV_TARGET
 #else
     const float environment_ao=1;
 #endif
-    hdr+=environment_evaluate(normal,view,base_color,f0,roughness,metallic,clearcoat,
+    hdr+=environment_evaluate(specular_normal,view,base_color*(1.0-transmission),f0,roughness,metallic,clearcoat,
         clearcoat_roughness,environment_ao,light_word(7));
+#ifdef CARTO_AUTHORING_SURFACE
+    if(transmission>0) {
+        // Glass preview: the refracted environment, tinted by base colour and
+        // by Beer-Lambert absorption over the authored wall thickness, behind
+        // the dielectric Fresnel. Scene geometry behind the glass is not
+        // refracted in this raster preview.
+        const float eta=1.0/material.ior;
+        float3 refracted=refract(-view,normal,eta);
+        if(dot(refracted,refracted)<1e-8) refracted=reflect(-view,normal);
+        const float cos_t=max(abs(dot(refracted,normal)),0.2);
+        const float path=material.thickness/cos_t;
+        const float3 absorption=material.attenuation_distance>0
+            ? pow(max(material.attenuation_color,1e-4),path/material.attenuation_distance) : 1.0;
+        const float r0=pow((material.ior-1.0)/(material.ior+1.0),2.0);
+        const float dielectric=r0+(1-r0)*pow(1-saturate(dot(normal,view)),5.0);
+        hdr+=environment_direction(refracted,roughness,light_word(7))*base_color*absorption*
+            (transmission*(1.0-dielectric)*environment_ao);
+    }
+#endif
 #endif
 #ifdef CARTO_AUTHORING_SURFACE
     if(!all(isfinite(hdr))) return float4(0,0,0,-((abs(camera_position_and_view.w)-1)*65536+primitive+1));

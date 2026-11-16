@@ -32,13 +32,14 @@ core::Diagnostic invalid(std::string message) {
 } // namespace
 assets::TextureSourceLimits authoring_texture_limits() {
     assets::TextureSourceLimits l;
-    l.max_source_bytes = 32U * 1024U * 1024U;
-    l.max_dimension = 2048;
-    l.max_pixels = 4'194'304;
+    // Budgeted 4K: one 4096x4096 map is 64 MB decoded and about 85 MB with mips.
+    l.max_source_bytes = 96U * 1024U * 1024U;
+    l.max_dimension = 4096;
+    l.max_pixels = 16'777'216;
     return l;
 }
 namespace {
-constexpr std::uint64_t kDecodedBudget = 64U * 1024U * 1024U, kMipBudget = 64U * 1024U * 1024U;
+constexpr std::uint64_t kDecodedBudget = 256U * 1024U * 1024U, kMipBudget = 352U * 1024U * 1024U;
 struct BoundTexture {
     render::TextureRef binding;
     project::SamplerIntent sampler;
@@ -339,13 +340,16 @@ core::Result<AuthoringMaterialGpuPacket> AuthoringMaterialProgram::gpu_packet() 
         const auto count = impl_ ? impl_->instructions.size() : 0U;
         packet.material =
             impl_ ? (count ? impl_->source : impl_->base) : render::StandardMaterial{};
-        packet.words.resize(((24 + count * 3 + 31) / 32) * 32);
+        // Packet ABI v2: words 24..27 carry Material V5 (transmission, volume,
+        // anisotropy); executable instructions start at word 28.
+        constexpr std::size_t kInstructionBase = 28;
+        packet.words.resize(((kInstructionBase + count * 3 + 31) / 32) * 32);
         const auto f = [](double v) {
             if (!std::isfinite(v) || std::abs(v) > std::numeric_limits<float>::max())
                 throw std::runtime_error("GPU packet value exceeds finite float32");
             return static_cast<float>(v);
         };
-        packet.words[0] = {1, f(double(count)),
+        packet.words[0] = {2, f(double(count)),
                            f(impl_ ? unsigned(impl_->base_explicit_texture) +
                                          2U * unsigned(impl_->emission_explicit_texture)
                                    : 0),
@@ -353,6 +357,11 @@ core::Result<AuthoringMaterialGpuPacket> AuthoringMaterialProgram::gpu_packet() 
         packet.words[1] = packet.words[2] = {-1, -1, -1, -1};
         packet.words[3] = {f(packet.material.clearcoat), f(packet.material.clearcoat_roughness), 0,
                            0};
+        const auto &v5 = packet.material;
+        packet.words[24] = {f(v5.transmission), f(v5.ior), f(v5.thickness), f(v5.attenuation_distance)};
+        packet.words[25] = {f(v5.attenuation_color.x), f(v5.attenuation_color.y), f(v5.attenuation_color.z),
+                            f(v5.anisotropy)};
+        packet.words[26] = {f(v5.anisotropy_rotation), 0, 0, 0};
         std::vector<std::uint8_t> identity;
         const auto append_identity = [&](auto value) {
             const auto *bytes = reinterpret_cast<const std::uint8_t *>(&value);
@@ -412,7 +421,7 @@ core::Result<AuthoringMaterialGpuPacket> AuthoringMaterialProgram::gpu_packet() 
             unsigned high = 0;
             for (unsigned i = 0; i < count; ++i) {
                 const auto &n = impl_->instructions[i];
-                auto &inputs = packet.words[25 + i * 3];
+                auto &inputs = packet.words[kInstructionBase + 1 + i * 3];
                 for (unsigned j = 0; j < arity(n.kind); ++j) {
                     const auto source = n.inputs[j];
                     inputs[1 + j] = f(registers[source]);
@@ -434,10 +443,10 @@ core::Result<AuthoringMaterialGpuPacket> AuthoringMaterialProgram::gpu_packet() 
                             physical_map = slot;
                             break;
                         }
-                packet.words[24 + i * 3] = {f(unsigned(n.kind)), f(unsigned(n.type)),
+                packet.words[kInstructionBase + i * 3] = {f(unsigned(n.kind)), f(unsigned(n.type)),
                                             f(unsigned(n.parameter)), f(physical_map)};
                 for (unsigned c = 0; c < 4; ++c)
-                    packet.words[26 + i * 3][c] = f(n.value[c]);
+                    packet.words[kInstructionBase + 2 + i * 3][c] = f(n.value[c]);
             }
             packet.words[0][3] = f(high);
             for (unsigned i = 0; i < outputs.size(); ++i)

@@ -12391,7 +12391,8 @@ struct DesktopState {
             request.temporal.session = snapshot.project_generation;
 #endif
             const double scale = std::array{1.0, 0.5, 0.25}[static_cast<std::size_t>(material_viewport_scale)];
-            constexpr double max_readback_pixels = 1'048'576.0;
+            constexpr double max_readback_pixels =
+                static_cast<double>(carto::d3d12::kAuthoringViewportMaxPixels);
             // Clamp both dimensions before multiplication/conversion, then
             // scale proportionally and retain the canvas aspect in the view.
             const double requested_width = std::clamp(static_cast<double>(extent.x) * scale,
@@ -12402,8 +12403,8 @@ struct DesktopState {
                 std::sqrt(max_readback_pixels / (requested_width * requested_height)));
             request.width = static_cast<std::uint32_t>(std::max(1.0, std::floor(requested_width * limit_scale)));
             request.height = static_cast<std::uint32_t>(std::max(1.0, std::floor(requested_height * limit_scale)));
-            if (std::uint64_t(request.width) * request.height > 1'048'576ULL)
-                request.width = static_cast<std::uint32_t>(1'048'576ULL / request.height);
+            if (std::uint64_t(request.width) * request.height > carto::d3d12::kAuthoringViewportMaxPixels)
+                request.width = static_cast<std::uint32_t>(carto::d3d12::kAuthoringViewportMaxPixels / request.height);
             const bool render_extent_capped = limit_scale < 1.0 ||
                 static_cast<double>(extent.x) * scale > max_readback_pixels ||
                 static_cast<double>(extent.y) * scale > max_readback_pixels;
@@ -18801,6 +18802,53 @@ struct DesktopState {
                 if (ImGui::SliderFloat("Clearcoat", &clearcoat, 0.0F, 1.0F, "%.3f")) {
                     material_draft.clearcoat = clearcoat;
                     material_draft_dirty = true;
+                }
+                float clearcoat_roughness = static_cast<float>(material_draft.clearcoat_roughness);
+                if (ImGui::SliderFloat("Clearcoat roughness", &clearcoat_roughness, 0.0F, 1.0F, "%.3f")) {
+                    material_draft.clearcoat_roughness = clearcoat_roughness;
+                    material_draft_dirty = true;
+                }
+                if (ImGui::CollapsingHeader("Transmission and volume", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    float ior = static_cast<float>(material_draft.ior);
+                    if (ImGui::SliderFloat("IOR", &ior, 1.0F, 2.5F, "%.3f")) {
+                        material_draft.ior = ior;
+                        material_draft_dirty = true;
+                    }
+                    float transmission = static_cast<float>(material_draft.transmission);
+                    if (ImGui::SliderFloat("Transmission", &transmission, 0.0F, 1.0F, "%.3f")) {
+                        material_draft.transmission = transmission;
+                        material_draft_dirty = true;
+                    }
+                    float thickness_mm = static_cast<float>(material_draft.thickness * 1000.0);
+                    if (ImGui::DragFloat("Thickness · mm", &thickness_mm, 0.05F, 0.0F, 200.0F, "%.2f")) {
+                        material_draft.thickness = std::max(0.0F, thickness_mm) / 1000.0;
+                        material_draft_dirty = true;
+                    }
+                    float attenuation[3]{static_cast<float>(material_draft.attenuation_color.x),
+                        static_cast<float>(material_draft.attenuation_color.y),
+                        static_cast<float>(material_draft.attenuation_color.z)};
+                    if (ImGui::ColorEdit3("Absorption colour · linear", attenuation, ImGuiColorEditFlags_Float)) {
+                        material_draft.attenuation_color = {attenuation[0], attenuation[1], attenuation[2]};
+                        material_draft_dirty = true;
+                    }
+                    float attenuation_mm = static_cast<float>(material_draft.attenuation_distance * 1000.0);
+                    if (ImGui::DragFloat("Absorption distance · mm", &attenuation_mm, 0.1F, 0.0F, 1000.0F, "%.1f")) {
+                        material_draft.attenuation_distance = std::max(0.0F, attenuation_mm) / 1000.0;
+                        material_draft_dirty = true;
+                    }
+                    ImGui::TextDisabled("Absorption: the colour light reaches after that distance inside the material; 0 = clear.");
+                }
+                if (ImGui::CollapsingHeader("Anisotropy", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    float anisotropy = static_cast<float>(material_draft.anisotropy);
+                    if (ImGui::SliderFloat("Anisotropy", &anisotropy, 0.0F, 1.0F, "%.3f")) {
+                        material_draft.anisotropy = anisotropy;
+                        material_draft_dirty = true;
+                    }
+                    float rotation_degrees = static_cast<float>(material_draft.anisotropy_rotation * 57.29577951308232);
+                    if (ImGui::SliderFloat("Anisotropy rotation · °", &rotation_degrees, -180.0F, 180.0F, "%.1f")) {
+                        material_draft.anisotropy_rotation = rotation_degrees / 57.29577951308232;
+                        material_draft_dirty = true;
+                    }
                 }
                 float emissive_factor[3]{
                     static_cast<float>(material_draft.emissive_factor.x),
