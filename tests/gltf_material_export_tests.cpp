@@ -504,6 +504,21 @@ int main(int argc, char **argv) {
             check(static_cast<bool>(imported) && !imported.value().losses.empty() &&
                       imported.value().losses.front().find("disables mipmapping") != std::string::npos,
                   "a non-mipmapped sampler imports with an explicit loss instead of failing");
+            application::ApplicationSession session;
+            take(application::testing::dispatch(session,
+                application::SaveProjectAction{root / "non-mip-loss.carto"}));
+            const auto snap = session.snapshot();
+            const std::vector<std::uint8_t> source(no_mips.begin(), no_mips.end());
+            const auto receipt = take(application::testing::dispatch(session,
+                application::ImportGltfMaterialLibraryAction{snap.project_generation, snap.project_revision, source, true}));
+            check(std::any_of(receipt.warnings.begin(), receipt.warnings.end(), [](const auto& warning) {
+                return warning.message.find("disables mipmapping") != std::string::npos;
+            }), "non-mip sampler substitution is visible in the application receipt");
+            const auto scene = take(io::import_gltf_scene(
+                {reinterpret_cast<const std::uint8_t*>(no_mips.data()), no_mips.size()}));
+            check(std::any_of(scene.warnings.begin(), scene.warnings.end(), [](const auto& warning) {
+                return warning.find("disables mipmapping") != std::string::npos;
+            }), "non-mip sampler substitution is visible in scene import warnings");
         }
         for(const auto& file:{root/"material.gltf",root/"material.glb"}) {
             const auto encoded=read(file);const auto bytes=std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()),encoded.size());

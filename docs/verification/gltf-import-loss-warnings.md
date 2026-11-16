@@ -11,8 +11,12 @@ This changes diagnostics, not the set of material features the importer can
 represent. For example, clearcoat texture maps may be omitted while clearcoat
 factors are retained; the receipt names that loss. Warnings are displayed as
 part of the import result and are not a persistent per-material loss record.
+Non-mipmapped glTF samplers are admitted as a nearest-mip approximation with a
+named warning; minified appearance can change and exact sampler parity is not
+claimed.
 The regression imports an actual glTF document with a clearcoat texture and
 checks the decoder, material-library receipt, scene warning list and scene
-application receipt. Existing lossless imports and undo remain covered by the
-same test suite. The desktop build checks the UI code, but an interactive UI
-session was not exercised by this test.
+application receipt. It also checks that the non-mip sampler warning reaches
+both material-library and scene import results. Existing lossless imports and
+undo remain covered by the same test suite. The desktop build checks the UI
+code, but an interactive UI session was not exercised by this test.
