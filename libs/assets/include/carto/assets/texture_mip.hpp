@@ -14,6 +14,8 @@ namespace carto::assets {
 inline constexpr std::uint32_t kRgba8MipArtifactVersion = 1U;
 inline constexpr std::string_view kRgba8MipAlgorithm =
     "carto.rgba8-mip.area-box.v1";
+inline constexpr std::string_view kRgba8MaskedColorMipAlgorithm =
+    "carto.rgba8-mip.masked-color-box.v1";
 inline constexpr std::uint64_t kMaxRgba8MipArtifactBytes =
     1024ULL * 1024ULL * 1024ULL;
 
@@ -44,6 +46,10 @@ struct Rgba8MipOptions {
     ColorSpace color_space = ColorSpace::linear;
     bool preserve_alpha_coverage = false;
     std::uint8_t alpha_cutoff = 128U;
+    // Masked base-color only: exclude rejected texels from filtered RGB and
+    // filter first-level alpha as authored pass/fail coverage. Level zero
+    // remains the exact source. Requires explicit coverage preservation.
+    bool filter_masked_color = false;
 };
 
 // Produces a complete deterministic mip chain. sRGB RGB channels are filtered

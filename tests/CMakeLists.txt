@@ -142,6 +142,10 @@ add_test(NAME cartographer_authoring_material_tests COMMAND cartographer_authori
 
 add_executable(cartographer_authoring_surface_tests authoring_surface_tests.cpp)
 target_link_libraries(cartographer_authoring_surface_tests PRIVATE carto_production carto_ui)
+if(TARGET carto_d3d12_viewport)
+    target_link_libraries(cartographer_authoring_surface_tests PRIVATE carto_d3d12_viewport)
+    target_compile_definitions(cartographer_authoring_surface_tests PRIVATE CARTO_AUTHORING_MASKED_FUR_GPU=1)
+endif()
 carto_target(cartographer_authoring_surface_tests)
 add_test(NAME cartographer_authoring_surface_tests COMMAND cartographer_authoring_surface_tests)
 add_executable(cartographer_authoring_texture_snapshot_tests authoring_texture_snapshot_tests.cpp)

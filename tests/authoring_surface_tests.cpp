@@ -2,6 +2,9 @@
 #include <algorithm>
 #include <carto/attributes/uv.hpp>
 #include <carto/ui/ui.hpp>
+#ifdef CARTO_AUTHORING_MASKED_FUR_GPU
+#include <carto/d3d12/authoring_viewport.hpp>
+#endif
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -73,6 +76,129 @@ void sampling_and_failure_atomicity() {
     check(!program.evaluate({{std::numeric_limits<double>::infinity(), 0}, {}, {}}),
           "nonfinite UV rejected");
     check(!program.evaluate({{1e7, 0}, {}, {}}), "coordinate bound enforced");
+}
+void masked_fur_mips_retain_coverage_and_exclude_matte_color() {
+    // One red fiber over invisible white pixels. An ordinary box filter
+    // makes the fiber disappear and leaks the hidden white into its color.
+    auto p = pixels(101, 4, 1, {{255,0,0,255}, {255,255,255,0},
+                               {255,255,255,0}, {255,255,255,0}});
+    production::AuthoringTextureLibrary library;
+    okay(library.admit(p.record,p.encoded));
+    auto catalog = mapped_catalog(p);
+    const auto opaque = compile(catalog,library);
+    const auto original = take(opaque.gpu_packet()).maps[0];
+    const auto original_digest = original->artifact_digest;
+    auto material = catalog.materials().at(1).definition;
+    material.alpha_mode = render::AlphaMode::masked;
+    material.alpha_cutoff = .63;
+    replace(catalog,material);
+    const auto encoded_catalog = catalog.serialize();
+    const auto masked = compile(catalog,library);
+    check(catalog.serialize() == encoded_catalog,"masked mip compilation mutated the catalog");
+    const auto sample = at(masked,.25,.5,{1,0}).material;
+    check(sample.base_color_factor.w >= material.alpha_cutoff,
+        "minified masked fur lost all coverage");
+    near(sample.base_color_factor.x,1);
+    near(sample.base_color_factor.y,0);
+    near(sample.base_color_factor.z,0);
+    const auto masked_chain = take(masked.gpu_packet()).maps[0];
+    check(masked_chain->algorithm == assets::kRgba8MaskedColorMipAlgorithm,
+        "masked products did not declare their actual filter algorithm");
+    const auto restored = take(assets::deserialize_rgba8_mip_chain(
+        take(assets::serialize_rgba8_mip_chain(*masked_chain))));
+    check(restored.artifact_digest == masked_chain->artifact_digest &&
+        restored.levels.back().pixels == masked_chain->levels.back().pixels,
+        "masked derived mip pixels/provenance did not round-trip");
+    check(masked_chain->source.digest == p.record.content_digest &&
+        masked_chain->levels[0].pixels == original->levels[0].pixels,
+        "mask preparation changed level-zero source pixels or provenance");
+    check(masked_chain->artifact_digest != original_digest &&
+        original->artifact_digest == original_digest,
+        "masked and opaque derivations aliased a cache product");
+    check(at(opaque,.25,.5,{1,0}).material.base_color_factor.y > .7,
+        "masked preparation changed an existing opaque program");
+#ifdef CARTO_AUTHORING_MASKED_FUR_GPU
+    auto f = fixture();
+    mutate(f.document,[&](auto& tx){okay(tx.replace_mesh(f.front_mesh,uv_triangle(9)));});
+    auto native_catalog = catalog;
+    auto native_material = material;
+    // Isolate matte color from the BRDF's otherwise white specular lobe.
+    native_material.dielectric_f0 = 0;
+    native_material.base_color.uv_set = 9;
+    native_material.base_color.transform.scale = {256,256};
+    replace(native_catalog,native_material);
+    auto native_opaque_catalog = native_catalog;
+    auto native_opaque_material = native_material;
+    native_opaque_material.alpha_mode = render::AlphaMode::opaque;
+    replace(native_opaque_catalog,native_opaque_material);
+    set_materials(f.document,native_opaque_catalog);
+    auto view = request(f);
+    view.textures = take(library.snapshot());
+    auto gpu = take(d3d12::AuthoringViewport::create());
+    const auto native_opaque = take(gpu->render(f.document,view)).image;
+    set_materials(f.document,native_catalog);
+    const auto cpu = take(production::render_authoring_viewport(f.document,view));
+    const auto native = take(gpu->render(f.document,view)).image;
+    const auto pixel = center(cpu);
+    check(cpu.objects[pixel] == f.front && native.objects[pixel] == f.front,
+        "minified fiber coverage/depth identity differs on CPU/native GPU");
+    check(cpu.linear_hdr[pixel].x > 5*cpu.linear_hdr[pixel].y &&
+        native.linear_hdr[pixel].x > 5*native.linear_hdr[pixel].y,
+        "invisible white matte contaminated the minified native fiber color");
+    for (std::size_t channel=0;channel<3;++channel)
+        check(std::abs(int(cpu.display_rgba8[pixel*4+channel])-
+                       int(native.display_rgba8[pixel*4+channel])) <= 2,
+            "CPU/native GPU masked-fiber shading disagree");
+    set_materials(f.document,std::move(native_opaque_catalog));
+    const auto native_opaque_again = take(gpu->render(f.document,view)).image;
+    check(native_opaque_again.display_rgba8 == native_opaque.display_rgba8,
+        "masked preparation polluted native texture-cache reuse by an opaque material");
+#endif
+    material.alpha_cutoff=.25;
+    replace(catalog,material);
+    const auto lower = take(compile(catalog,library).gpu_packet()).maps[0];
+    check(lower->artifact_digest != masked_chain->artifact_digest,
+        "different alpha cutoffs reused the wrong mip derivation");
+    material.alpha_cutoff=0;
+    replace(catalog,material);
+    check(take(compile(catalog,library).gpu_packet()).maps[0]->artifact_digest == original_digest,
+        "zero cutoff must preserve the unmasked source path");
+    material.alpha_cutoff=.63;
+    material.base_color_factor.w=.5;
+    replace(catalog,material);
+    check(at(compile(catalog,library),.25,.5,{1,0}).material.base_color_factor.w < .63,
+        "mip preparation invented coverage for an entirely rejected material");
+    material.alpha_cutoff=.25;
+    replace(catalog,material);
+    check(at(compile(catalog,library),.25,.5,{1,0}).material.base_color_factor.w >= .25,
+        "coverage derivation ignored the material alpha factor");
+    check(catalog.serialize() != encoded_catalog,
+        "test did not exercise authored alpha-factor changes");
+    const auto graph = authoring_graph_fixture();
+    okay(catalog.insert_material_graph(graph));
+    okay(catalog.bind_material_graph(1,graph.identity));
+    check(take(compile(catalog,library).gpu_packet()).maps[0]->artifact_digest == original_digest,
+        "a graph-bound alpha path was silently reclassified as a direct mask");
+    const auto transparent = pixels(102,2,1,{{255,255,255,100},{255,0,255,0}});
+    okay(library.admit(transparent.record,transparent.encoded));
+    auto invisible_catalog = mapped_catalog(transparent);
+    auto invisible_material = invisible_catalog.materials().at(1).definition;
+    invisible_material.alpha_mode = render::AlphaMode::masked;
+    invisible_material.alpha_cutoff = .63;
+    replace(invisible_catalog,invisible_material);
+    const auto invisible = at(compile(invisible_catalog,library),.5,.5,{1,0}).material;
+    near(invisible.base_color_factor.w,0);
+    const auto decoded = take(assets::decode_texture_rgba8(p.encoded));
+    check(!assets::generate_rgba8_mips(decoded,
+        {assets::TextureSemantic::base_color,assets::ColorSpace::srgb,false,161,true}),
+        "masked color filtering without declared coverage was admitted");
+    check(!assets::generate_rgba8_mips(decoded,
+        {assets::TextureSemantic::normal,assets::ColorSpace::linear,true,161,true}),
+        "masked color filtering was allowed to corrupt normal-map vectors");
+    check(!library.prepare(p.record,assets::TextureSemantic::base_color,assets::ColorSpace::srgb,std::uint8_t{0}),
+        "invalid zero coverage cutoff was cached");
+    check(original->artifact_digest == original_digest,
+        "failed mask preparation changed an existing immutable product");
 }
 void sampler_identity_transform_and_data() {
     auto p = pixels(2, 2, 1, {{128, 64, 32, 255}, {255, 128, 64, 255}});
@@ -569,6 +695,7 @@ void unsupported_v5_texture_maps_are_rejected() {
 int main() {
     try {
         sampling_and_failure_atomicity();
+        masked_fur_mips_retain_coverage_and_exclude_matte_color();
         sampler_identity_transform_and_data();
         executable_uv_graphs();
         masked_raster_normal_and_reopen();

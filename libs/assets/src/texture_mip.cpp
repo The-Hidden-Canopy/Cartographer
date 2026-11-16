@@ -5,6 +5,7 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -130,7 +131,9 @@ void preserve_coverage(
 Rgba8MipLevel downsample(
     const Rgba8MipLevel& source,
     TextureSemantic semantic,
-    ColorSpace color_space) {
+    ColorSpace color_space,
+    bool masked_color = false,
+    std::optional<std::uint8_t> source_cutoff = std::nullopt) {
     Rgba8MipLevel output;
     output.width = std::max(1U, source.width / 2U);
     output.height = std::max(1U, source.height / 2U);
@@ -157,6 +160,9 @@ Rgba8MipLevel downsample(
                      ++source_x) {
                     const std::size_t offset =
                         (static_cast<std::size_t>(source_y) * source.width + source_x) * 4U;
+                    const double alpha = source_cutoff
+                        ? (source.pixels[offset + 3U] >= *source_cutoff ? 1.0 : 0.0)
+                        : source.pixels[offset + 3U] / 255.0;
                     if (semantic == TextureSemantic::normal) {
                         sum[0U] += source.pixels[offset] / 127.5 - 1.0;
                         sum[1U] += source.pixels[offset + 1U] / 127.5 - 1.0;
@@ -164,12 +170,13 @@ Rgba8MipLevel downsample(
                     } else {
                         for (std::size_t channel = 0U; channel < 3U; ++channel) {
                             const double encoded = source.pixels[offset + channel] / 255.0;
-                            sum[channel] += color_space == ColorSpace::srgb
+                            const double linear = color_space == ColorSpace::srgb
                                 ? srgb_to_linear(encoded)
                                 : encoded;
+                            sum[channel] += linear * (masked_color ? alpha : 1.0);
                         }
                     }
-                    sum[3U] += source.pixels[offset + 3U] / 255.0;
+                    sum[3U] += alpha;
                     ++samples;
                 }
             }
@@ -188,7 +195,8 @@ Rgba8MipLevel downsample(
                 }
             } else {
                 for (std::size_t channel = 0U; channel < 3U; ++channel) {
-                    const double averaged = sum[channel] / samples;
+                    const double weight = masked_color ? sum[3U] : samples;
+                    const double averaged = weight > 0.0 ? sum[channel] / weight : 0.0;
                     output.pixels[destination + channel] = quantize(
                         color_space == ColorSpace::srgb
                             ? linear_to_srgb(averaged)
@@ -206,7 +214,9 @@ core::Result<void> validate_structure(
     const TextureSourceLimits& limits) {
     if (auto result = limits.validate(); !result) return result;
     if (chain.artifact_version != kRgba8MipArtifactVersion ||
-        chain.algorithm != kRgba8MipAlgorithm ||
+        (chain.algorithm != kRgba8MipAlgorithm && chain.algorithm != kRgba8MaskedColorMipAlgorithm) ||
+        (chain.algorithm == kRgba8MaskedColorMipAlgorithm &&
+            chain.semantic != TextureSemantic::base_color && chain.semantic != TextureSemantic::data) ||
         !safe_text(chain.algorithm, 64U) ||
         chain.source.bytes == 0U || chain.source.bytes > limits.max_source_bytes ||
         chain.source.digest.is_zero() || !safe_text(chain.source.media_type, 127U) ||
@@ -335,8 +345,14 @@ core::Result<Rgba8MipChain> generate_rgba8_mips(
         return core::Result<Rgba8MipChain>::failure(invalid(
             "alpha-coverage preservation requires a non-zero cutoff"));
     }
+    if (options.filter_masked_color && (!options.preserve_alpha_coverage ||
+        (options.semantic != TextureSemantic::base_color && options.semantic != TextureSemantic::data))) {
+        return core::Result<Rgba8MipChain>::failure(invalid(
+            "masked-color filtering requires base-color/data semantics and explicit alpha coverage"));
+    }
 
     Rgba8MipChain result;
+    if (options.filter_masked_color) result.algorithm = kRgba8MaskedColorMipAlgorithm;
     result.source = decoded.admission.source;
     result.semantic = options.semantic;
     result.color_space = options.color_space;
@@ -356,7 +372,10 @@ core::Result<Rgba8MipChain> generate_rgba8_mips(
                 "complete RGBA8 mip chain exceeds the configured level bound"));
         }
         Rgba8MipLevel level = downsample(
-            result.levels.back(), options.semantic, options.color_space);
+            result.levels.back(), options.semantic, options.color_space,
+            options.filter_masked_color,
+            options.filter_masked_color && result.levels.size() == 1U
+                ? std::optional{options.alpha_cutoff} : std::nullopt);
         if (options.preserve_alpha_coverage) {
             preserve_coverage(
                 level, source_covered, source_pixels, options.alpha_cutoff);
