@@ -12391,8 +12391,13 @@ struct DesktopState {
             request.temporal.session = snapshot.project_generation;
 #endif
             const double scale = std::array{1.0, 0.5, 0.25}[static_cast<std::size_t>(material_viewport_scale)];
-            constexpr double max_readback_pixels =
-                static_cast<double>(carto::d3d12::kAuthoringViewportMaxPixels);
+#if defined(CARTO_DESKTOP_D3D12_VIEWPORT) || defined(CARTO_DESKTOP_ASYNC_READBACK) || defined(CARTO_DESKTOP_RESIDENT_WORKER)
+            constexpr std::uint64_t max_viewport_pixels = carto::d3d12::kAuthoringViewportMaxPixels;
+#else
+            // The CPU reference renderer has a separate one-megapixel budget.
+            constexpr std::uint64_t max_viewport_pixels = 1'048'576ULL;
+#endif
+            constexpr double max_readback_pixels = static_cast<double>(max_viewport_pixels);
             // Clamp both dimensions before multiplication/conversion, then
             // scale proportionally and retain the canvas aspect in the view.
             const double requested_width = std::clamp(static_cast<double>(extent.x) * scale,
@@ -12403,8 +12408,8 @@ struct DesktopState {
                 std::sqrt(max_readback_pixels / (requested_width * requested_height)));
             request.width = static_cast<std::uint32_t>(std::max(1.0, std::floor(requested_width * limit_scale)));
             request.height = static_cast<std::uint32_t>(std::max(1.0, std::floor(requested_height * limit_scale)));
-            if (std::uint64_t(request.width) * request.height > carto::d3d12::kAuthoringViewportMaxPixels)
-                request.width = static_cast<std::uint32_t>(carto::d3d12::kAuthoringViewportMaxPixels / request.height);
+            if (std::uint64_t(request.width) * request.height > max_viewport_pixels)
+                request.width = static_cast<std::uint32_t>(max_viewport_pixels / request.height);
             const bool render_extent_capped = limit_scale < 1.0 ||
                 static_cast<double>(extent.x) * scale > max_readback_pixels ||
                 static_cast<double>(extent.y) * scale > max_readback_pixels;
