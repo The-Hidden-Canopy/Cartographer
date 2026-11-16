@@ -1,3 +1,4 @@
+#include <cmath>
 #include "gltf_test_payload.hpp"
 #include "scene_import_test_support.hpp"
 #include <carto/io/generated_mesh.hpp>
@@ -299,6 +300,71 @@ project::MaterialGraph constant_graph() {
     return g;
 }
 } // namespace
+// Material V5 through glTF: amber glass and brushed steel export with
+// KHR_materials_ior/_transmission/_volume/_anisotropy and reimport exactly;
+// a foreign clearcoat texture imports with an explicit loss, not a refusal.
+void material_v5_round_trips_through_gltf(const std::filesystem::path &root) {
+    project::MaterialCatalog c;
+    render::StandardMaterial glass;
+    glass.base_color_factor = {1, 1, 1, 1};
+    glass.metallic = 0;
+    glass.roughness = .04;
+    glass.ior = 1.52;
+    glass.dielectric_f0 = std::pow((1.52 - 1) / (1.52 + 1), 2);
+    glass.transmission = 1;
+    glass.thickness = .003;
+    glass.attenuation_color = {.55, .25, .05};
+    glass.attenuation_distance = .004;
+    okay(c.insert_material({31, "Amber bottle glass", glass, {}}));
+    render::StandardMaterial steel;
+    steel.base_color_factor = {.92, .92, .9, 1};
+    steel.metallic = 1;
+    steel.roughness = .3;
+    steel.anisotropy = .7;
+    steel.anisotropy_rotation = 1.5707963267948966;
+    okay(c.insert_material({32, "Brushed fork steel", steel, {}}));
+    okay(c.insert_assignment({{1, 1}, 31, {}}));
+    okay(c.insert_assignment({{1, 2}, 32, {}}));
+    auto d = material_scene(c, root / "v5.carto");
+    take(io::export_gltf(d, root / "v5.gltf", {}));
+    const auto text = read(root / "v5.gltf");
+    for (const char *extension : {"KHR_materials_ior", "KHR_materials_transmission", "KHR_materials_volume",
+                                  "KHR_materials_anisotropy"})
+        check(text.find(extension) != std::string::npos, "V5 glTF names its material extensions");
+    const auto bytes = std::span(reinterpret_cast<const std::uint8_t *>(text.data()), text.size());
+    const auto imported = take(io::import_gltf_materials(bytes));
+    check(imported.losses.empty(), "a Cartographer V5 export reimports without loss");
+    const render::StandardMaterial *glass_back = nullptr, *steel_back = nullptr;
+    for (const auto &[id, asset] : imported.catalog.materials()) {
+        static_cast<void>(id);
+        if (asset.definition.transmission > 0) glass_back = &asset.definition;
+        if (asset.definition.anisotropy > 0) steel_back = &asset.definition;
+    }
+    check(glass_back && steel_back, "glass and steel both reimport");
+    near(glass_back->ior, 1.52, "glass IOR round trip");
+    near(glass_back->transmission, 1, "glass transmission round trip");
+    near(glass_back->thickness, .003, "glass thickness round trip");
+    near(glass_back->attenuation_color.y, .25, "glass attenuation colour round trip");
+    near(glass_back->attenuation_distance, .004, "glass attenuation distance round trip");
+    near(glass_back->dielectric_f0, glass.dielectric_f0, "glass reflectance round trip");
+    near(steel_back->anisotropy, .7, "steel anisotropy round trip");
+    near(steel_back->anisotropy_rotation, 1.5707963267948966, "steel anisotropy rotation round trip");
+    near(steel_back->ior, 1.5, "unauthored IOR stays at the default");
+
+    auto foreign = text;
+    const auto marker = foreign.find("\"KHR_materials_transmission\"");
+    check(marker != std::string::npos, "foreign mutation target exists");
+    foreign.insert(marker, "\"KHR_materials_clearcoat\":{\"clearcoatFactor\":0.5,\"clearcoatTexture\":{\"index\":0}},");
+    const auto foreign_bytes = std::span(reinterpret_cast<const std::uint8_t *>(foreign.data()), foreign.size());
+    auto with_texture = io::import_gltf_materials(foreign_bytes);
+    check(static_cast<bool>(with_texture), "a foreign clearcoat texture no longer fails the whole import");
+    {
+        check(!with_texture.value().losses.empty() &&
+                  with_texture.value().losses.front().find("clearcoat textures") != std::string::npos,
+              "a clearcoat texture is reported as a loss rather than silently dropped");
+    }
+}
+
 int main(int argc, char **argv) {
     try {
         auto root = std::filesystem::temp_directory_path() /
@@ -341,6 +407,7 @@ int main(int argc, char **argv) {
         Payload gltf(root / "material.gltf"), glb(root / "material.glb");
         inspect(gltf, decoded.pixels);
         inspect(glb, decoded.pixels);
+        material_v5_round_trips_through_gltf(root);
         {
             auto invalid = read(root / "material.gltf");
             const auto begin = invalid.find("\"emissiveFactor\":[");

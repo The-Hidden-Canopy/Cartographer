@@ -115,6 +115,22 @@ struct StandardMaterial {
     double dielectric_f0 = 0.04;
     double clearcoat = 0.0;
     double clearcoat_roughness = 0.1;
+    // Material V5 transmission and volume, with glTF KHR_materials_ior,
+    // _transmission and _volume meaning. ior drives refraction (dielectric_f0
+    // still sets reflectance); transmission is the dielectric share that
+    // refracts; thickness is the authored wall thickness in metres for thin
+    // render geometry (0 = thin-walled); attenuation is interior absorption:
+    // the colour reached after attenuation_distance metres (0 = none).
+    double ior = 1.5;
+    double transmission = 0.0;
+    double thickness = 0.0;
+    core::Vec3d attenuation_color{1.0, 1.0, 1.0};
+    double attenuation_distance = 0.0;
+    // Anisotropic GGX (glTF KHR_materials_anisotropy): strength stretches the
+    // highlight along the tangent rotated by anisotropy_rotation radians;
+    // brushed metal and cutlery need it.
+    double anisotropy = 0.0;
+    double anisotropy_rotation = 0.0;
     AlphaMode alpha_mode = AlphaMode::opaque;
     double alpha_cutoff = 0.5;
     TextureRef base_color;
@@ -122,6 +138,9 @@ struct StandardMaterial {
     TextureRef normal;
     TextureRef occlusion;
     TextureRef emissive;
+    TextureRef transmission_map;   // R scales transmission (glTF transmissionTexture)
+    TextureRef thickness_map;      // G scales thickness (glTF thicknessTexture)
+    TextureRef anisotropy_map;     // RG direction, B strength (glTF anisotropyTexture)
 
     [[nodiscard]] core::Result<void> validate() const;
 };

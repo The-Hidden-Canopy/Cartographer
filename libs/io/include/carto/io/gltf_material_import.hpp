@@ -9,6 +9,9 @@ struct ImportedGltfMaterials {
     // and admits these verified PNG/JPEGs to its own content-addressed source store.
     std::vector<std::vector<std::uint8_t>> encoded_images;
     assets::Sha256Digest artifact_digest;
+    // Appearance the source carried that Cartographer could not represent
+    // and therefore did not import. Empty means a faithful import.
+    std::vector<std::string> losses;
 };
 // Materials-only reimport of Cartographer's bounded embedded GLTF/GLB profile.
 // The scene adapter can disable the profile requirement for the same strictly

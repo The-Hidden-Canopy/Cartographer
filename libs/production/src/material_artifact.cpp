@@ -178,6 +178,24 @@ std::vector<std::uint8_t> canonical_material_source(
              &value.emissive}) {
         append_texture_ref(output, *binding);
     }
+    // Material V5 transmission/volume enters the source identity only when
+    // used, so every pre-V5 material keeps its exact artifact digest.
+    const bool volume_authored = value.ior != 1.5 || value.transmission != 0.0 || value.thickness != 0.0 ||
+        value.attenuation_color.x != 1.0 || value.attenuation_color.y != 1.0 || value.attenuation_color.z != 1.0 ||
+        value.attenuation_distance != 0.0 || value.transmission_map || value.thickness_map ||
+        value.anisotropy != 0.0 || value.anisotropy_rotation != 0.0 || value.anisotropy_map;
+    if (volume_authored) {
+        static constexpr std::string_view kVolumeDomain = "carto.material.v5.extensions";
+        output.insert(output.end(), kVolumeDomain.begin(), kVolumeDomain.end());
+        for (const double component : {value.ior, value.transmission, value.thickness,
+                 value.attenuation_color.x, value.attenuation_color.y, value.attenuation_color.z,
+                 value.attenuation_distance, value.anisotropy, value.anisotropy_rotation}) {
+            append_f64(output, component);
+        }
+        append_texture_ref(output, value.transmission_map);
+        append_texture_ref(output, value.thickness_map);
+        append_texture_ref(output, value.anisotropy_map);
+    }
     return output;
 }
 

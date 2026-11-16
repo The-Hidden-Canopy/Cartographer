@@ -419,6 +419,75 @@ void apply_overrides(
     if (source.normal) target.normal = *source.normal;
     if (source.occlusion) target.occlusion = *source.occlusion;
     if (source.emissive) target.emissive = *source.emissive;
+    if (source.ior) target.ior = *source.ior;
+    if (source.transmission) target.transmission = *source.transmission;
+    if (source.thickness) target.thickness = *source.thickness;
+    if (source.attenuation_color) target.attenuation_color = *source.attenuation_color;
+    if (source.attenuation_distance) target.attenuation_distance = *source.attenuation_distance;
+    if (source.transmission_map) target.transmission_map = *source.transmission_map;
+    if (source.thickness_map) target.thickness_map = *source.thickness_map;
+    if (source.anisotropy) target.anisotropy = *source.anisotropy;
+    if (source.anisotropy_rotation) target.anisotropy_rotation = *source.anisotropy_rotation;
+    if (source.anisotropy_map) target.anisotropy_map = *source.anisotropy_map;
+}
+
+// ---- Material V5: transmission and volume ---------------------------------
+// Pre-V5 material and variant records are unchanged; V5 data (transmission,
+// volume, anisotropy) travels in two trailing sections listing only users.
+bool volume_authored(const render::StandardMaterial& value) {
+    return value.ior != 1.5 || value.transmission != 0.0 || value.thickness != 0.0 ||
+        value.attenuation_color.x != 1.0 || value.attenuation_color.y != 1.0 ||
+        value.attenuation_color.z != 1.0 || value.attenuation_distance != 0.0 ||
+        static_cast<bool>(value.transmission_map) || static_cast<bool>(value.thickness_map) ||
+        value.anisotropy != 0.0 || value.anisotropy_rotation != 0.0 || static_cast<bool>(value.anisotropy_map);
+}
+
+bool volume_overridden(const MaterialVariantOverride& value) {
+    return value.ior || value.transmission || value.thickness || value.attenuation_color ||
+        value.attenuation_distance || value.transmission_map || value.thickness_map ||
+        value.anisotropy || value.anisotropy_rotation || value.anisotropy_map;
+}
+
+void write_volume(std::ostream& output, const render::StandardMaterial& value) {
+    output << value.ior << ' ' << value.transmission << ' ' << value.thickness << ' '
+           << value.attenuation_color.x << ' ' << value.attenuation_color.y << ' '
+           << value.attenuation_color.z << ' ' << value.attenuation_distance << ' '
+           << value.anisotropy << ' ' << value.anisotropy_rotation << ' ';
+    write_texture_ref(output, value.transmission_map);
+    output << ' ';
+    write_texture_ref(output, value.thickness_map);
+    output << ' ';
+    write_texture_ref(output, value.anisotropy_map);
+}
+
+bool read_volume(std::istream& input, render::StandardMaterial& value) {
+    return static_cast<bool>(input >> value.ior >> value.transmission >> value.thickness >>
+               value.attenuation_color.x >> value.attenuation_color.y >> value.attenuation_color.z >>
+               value.attenuation_distance >> value.anisotropy >> value.anisotropy_rotation) &&
+        read_texture_ref(input, value.transmission_map) && read_texture_ref(input, value.thickness_map) &&
+        read_texture_ref(input, value.anisotropy_map);
+}
+
+void write_volume_overrides(std::ostream& output, const MaterialVariantOverride& value) {
+    write_optional_scalar(output, value.ior);
+    write_optional_scalar(output, value.transmission);
+    write_optional_scalar(output, value.thickness);
+    write_optional_vec3(output, value.attenuation_color);
+    write_optional_scalar(output, value.attenuation_distance);
+    write_optional_scalar(output, value.anisotropy);
+    write_optional_scalar(output, value.anisotropy_rotation);
+    write_optional_texture(output, value.transmission_map);
+    write_optional_texture(output, value.thickness_map);
+    write_optional_texture(output, value.anisotropy_map);
+}
+
+bool read_volume_overrides(std::istream& input, MaterialVariantOverride& value) {
+    return read_optional_scalar(input, value.ior) && read_optional_scalar(input, value.transmission) &&
+        read_optional_scalar(input, value.thickness) && read_optional_vec3(input, value.attenuation_color) &&
+        read_optional_scalar(input, value.attenuation_distance) &&
+        read_optional_scalar(input, value.anisotropy) && read_optional_scalar(input, value.anisotropy_rotation) &&
+        read_optional_texture(input, value.transmission_map) && read_optional_texture(input, value.thickness_map) &&
+        read_optional_texture(input, value.anisotropy_map);
 }
 
 template <typename Callback>
@@ -430,7 +499,10 @@ core::Result<void> for_each_texture_binding(
              &material.metallic_roughness,
              &material.normal,
              &material.occlusion,
-             &material.emissive}) {
+             &material.emissive,
+             &material.transmission_map,
+             &material.thickness_map,
+             &material.anisotropy_map}) {
         if (!binding->asset) continue;
         if (auto result = callback(*binding); !result) return result;
     }
@@ -469,7 +541,9 @@ bool MaterialVariantOverride::empty() const noexcept {
         !occlusion_strength && !emissive_factor && !emissive_strength &&
         !dielectric_f0 && !clearcoat && !clearcoat_roughness && !alpha_mode &&
         !alpha_cutoff && !base_color && !metallic_roughness && !normal &&
-        !occlusion && !emissive;
+        !occlusion && !emissive && !ior && !transmission && !thickness &&
+        !attenuation_color && !attenuation_distance && !transmission_map && !thickness_map &&
+        !anisotropy && !anisotropy_rotation && !anisotropy_map;
 }
 
 core::Result<void> MaterialVariantOverride::validate() const {
@@ -969,6 +1043,24 @@ std::string MaterialCatalog::serialize() const {
             output << '\n';
         }
     }
+    const auto volume_materials = std::count_if(materials_.begin(), materials_.end(),
+        [](const auto& entry) { return volume_authored(entry.second.definition); });
+    output << "MATERIAL_EXTENSIONS " << volume_materials << '\n';
+    for (const auto& [id, material] : materials_) {
+        if (!volume_authored(material.definition)) continue;
+        output << "MATERIAL_EXTENSION " << id << ' ';
+        write_volume(output, material.definition);
+        output << '\n';
+    }
+    const auto volume_variants = std::count_if(variants_.begin(), variants_.end(),
+        [](const auto& entry) { return volume_overridden(entry.second.overrides); });
+    output << "VARIANT_EXTENSIONS " << volume_variants << '\n';
+    for (const auto& [id, variant] : variants_) {
+        if (!volume_overridden(variant.overrides)) continue;
+        output << "VARIANT_EXTENSION " << id << ' ';
+        write_volume_overrides(output, variant.overrides);
+        output << '\n';
+    }
     output << "END\n";
     return output.str();
 }
@@ -995,7 +1087,7 @@ core::Result<MaterialCatalog> MaterialCatalog::deserialize(std::string_view text
         return core::Result<MaterialCatalog>::failure(parse_error(
             "material catalog header is invalid"));
     }
-    if (version != 1U && version != 2U && version != 3U && version != kSchemaVersion) {
+    if (version != 1U && version != 2U && version != 3U && version != 4U && version != kSchemaVersion) {
         return core::Result<MaterialCatalog>::failure(core::Diagnostic(
             core::ErrorCode::version_mismatch,
             "material catalog schema version is unsupported"));
@@ -1233,6 +1325,38 @@ core::Result<MaterialCatalog> MaterialCatalog::deserialize(std::string_view text
                 }
                 binding.inputs = std::move(graph_inputs);
             }
+        }
+    }
+    if (version >= 5U) {
+        if (!require_token(input, "MATERIAL_EXTENSIONS") || !read_count(input, kMaxRecordsPerKind, count)) {
+            return core::Result<MaterialCatalog>::failure(parse_error("material volume count is invalid"));
+        }
+        for (std::size_t index = 0U; index < count; ++index) {
+            render::MaterialId id = 0U;
+            if (!require_token(input, "MATERIAL_EXTENSION") || !read_unsigned(input, id) ||
+                !catalog.materials_.contains(id)) {
+                return core::Result<MaterialCatalog>::failure(parse_error("material volume record is invalid"));
+            }
+            auto& definition = catalog.materials_.at(id).definition;
+            if (!read_volume(input, definition) || !volume_authored(definition)) {
+                return core::Result<MaterialCatalog>::failure(parse_error("material volume payload is invalid"));
+            }
+            if (auto valid = definition.validate(); !valid) return core::Result<MaterialCatalog>::failure(valid.error());
+        }
+        if (!require_token(input, "VARIANT_EXTENSIONS") || !read_count(input, kMaxRecordsPerKind, count)) {
+            return core::Result<MaterialCatalog>::failure(parse_error("material variant volume count is invalid"));
+        }
+        for (std::size_t index = 0U; index < count; ++index) {
+            MaterialVariantId id = 0U;
+            if (!require_token(input, "VARIANT_EXTENSION") || !read_unsigned(input, id) ||
+                !catalog.variants_.contains(id)) {
+                return core::Result<MaterialCatalog>::failure(parse_error("material variant volume record is invalid"));
+            }
+            auto& overrides = catalog.variants_.at(id).overrides;
+            if (!read_volume_overrides(input, overrides) || !volume_overridden(overrides)) {
+                return core::Result<MaterialCatalog>::failure(parse_error("material variant volume payload is invalid"));
+            }
+            if (auto valid = overrides.validate(); !valid) return core::Result<MaterialCatalog>::failure(valid.error());
         }
     }
     if (!require_token(input, "END")) {

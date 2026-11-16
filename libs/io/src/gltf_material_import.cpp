@@ -326,7 +326,9 @@ core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::u
         for (auto e : array(get(root, "extensionsRequired", "[]"), 16)) {
             const auto name = text(e);
             if (name != "KHR_texture_transform" && name != "KHR_materials_ior" &&
-                name != "KHR_materials_clearcoat" && name != "KHR_materials_emissive_strength")
+                name != "KHR_materials_clearcoat" && name != "KHR_materials_emissive_strength" &&
+                name != "KHR_materials_transmission" && name != "KHR_materials_volume" &&
+                name != "KHR_materials_anisotropy" && name != "KHR_materials_specular")
                 throw std::runtime_error("unsupported required material extension: " + name);
         }
         ImportedGltfMaterials result;
@@ -536,20 +538,75 @@ core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::u
             v.alpha_cutoff = number(get(material, "alphaCutoff", "0.5"));
             const auto ext = object(get(material, "extensions", "{}"));
             fields(ext, {"KHR_materials_ior", "KHR_materials_clearcoat",
-                         "KHR_materials_emissive_strength"});
+                         "KHR_materials_emissive_strength", "KHR_materials_specular",
+                         "KHR_materials_transmission", "KHR_materials_volume",
+                         "KHR_materials_anisotropy"});
+            const auto loss = [&](std::string what) {
+                result.losses.push_back(m.name + ": " + std::move(what));
+            };
+            double ior = 1.5;
             if (auto value = get(ext, "KHR_materials_ior"); !value.empty()) {
                 const auto e = object(value);
                 fields(e, {"ior"});
-                const auto ior = number(get(e, "ior", "1.5"));
+                ior = number(get(e, "ior", "1.5"));
                 if (ior < 1)
                     throw std::runtime_error("IOR below one is unsupported");
-                v.dielectric_f0 = std::pow((ior - 1) / (ior + 1), 2);
             }
+            double specular = 1.0;
+            if (auto value = get(ext, "KHR_materials_specular"); !value.empty()) {
+                const auto e = object(value);
+                fields(e, {"specularFactor", "specularColorFactor", "specularTexture",
+                           "specularColorTexture"});
+                specular = number(get(e, "specularFactor", "1"));
+                const auto tint = vector(get(e, "specularColorFactor", "[1,1,1]"), 3);
+                if (tint[0] != 1 || tint[1] != 1 || tint[2] != 1)
+                    loss("specular colour tint has no Cartographer field (scalar reflectance kept)");
+                if (!get(e, "specularTexture").empty() || !get(e, "specularColorTexture").empty())
+                    loss("specular textures have no Cartographer slot (factor kept)");
+            }
+            v.dielectric_f0 = std::pow((ior - 1) / (ior + 1), 2) * specular;
+            // A Cartographer export records whether IOR was authored; any other
+            // source's KHR_materials_ior is a real refractive index.
+            if (auto authored = get(extras, "cartographer_ior"); !authored.empty())
+                v.ior = number(authored);
+            else if (!get(extras, "cartographer_material_id").empty())
+                v.ior = 1.5;
+            else
+                v.ior = ior;
             if (auto value = get(ext, "KHR_materials_clearcoat"); !value.empty()) {
                 const auto e = object(value);
-                fields(e, {"clearcoatFactor", "clearcoatRoughnessFactor"});
+                fields(e, {"clearcoatFactor", "clearcoatRoughnessFactor", "clearcoatTexture",
+                           "clearcoatRoughnessTexture", "clearcoatNormalTexture"});
                 v.clearcoat = number(get(e, "clearcoatFactor", "0"));
                 v.clearcoat_roughness = number(get(e, "clearcoatRoughnessFactor", "0"));
+                if (!get(e, "clearcoatTexture").empty() || !get(e, "clearcoatRoughnessTexture").empty() ||
+                    !get(e, "clearcoatNormalTexture").empty())
+                    loss("clearcoat textures have no Cartographer slot (clearcoat factors kept, "
+                         "textures dropped; a baked clearcoat varies only by its factor after reimport)");
+            }
+            if (auto value = get(ext, "KHR_materials_transmission"); !value.empty()) {
+                const auto e = object(value);
+                fields(e, {"transmissionFactor", "transmissionTexture"});
+                v.transmission = number(get(e, "transmissionFactor", "0"));
+                put(e, "transmissionTexture", v.transmission_map);
+            }
+            if (auto value = get(ext, "KHR_materials_volume"); !value.empty()) {
+                const auto e = object(value);
+                fields(e, {"thicknessFactor", "thicknessTexture", "attenuationDistance",
+                           "attenuationColor"});
+                v.thickness = number(get(e, "thicknessFactor", "0"));
+                const auto color = vector(get(e, "attenuationColor", "[1,1,1]"), 3);
+                v.attenuation_color = {color[0], color[1], color[2]};
+                // glTF's default (absent) distance is infinity: no absorption.
+                v.attenuation_distance = number(get(e, "attenuationDistance", "0"));
+                put(e, "thicknessTexture", v.thickness_map);
+            }
+            if (auto value = get(ext, "KHR_materials_anisotropy"); !value.empty()) {
+                const auto e = object(value);
+                fields(e, {"anisotropyStrength", "anisotropyRotation", "anisotropyTexture"});
+                v.anisotropy = number(get(e, "anisotropyStrength", "0"));
+                v.anisotropy_rotation = number(get(e, "anisotropyRotation", "0"));
+                put(e, "anisotropyTexture", v.anisotropy_map);
             }
             if (auto value = get(ext, "KHR_materials_emissive_strength"); !value.empty()) {
                 const auto e = object(value);
