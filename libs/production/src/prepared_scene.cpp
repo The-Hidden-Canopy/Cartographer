@@ -270,6 +270,7 @@ std::string texture_extension(assets::TextureSourceFormat format) {
     case assets::TextureSourceFormat::tga: return "tga";
     case assets::TextureSourceFormat::dds: return "dds";
     case assets::TextureSourceFormat::exr: return "exr";
+    case assets::TextureSourceFormat::pfm: return "pfm";
     }
     return "bin";
 }

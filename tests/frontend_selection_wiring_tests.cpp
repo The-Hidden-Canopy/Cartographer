@@ -77,7 +77,7 @@ struct Truth {
 
 class Fixture {
 public:
-    Fixture() : ui(session) {
+    explicit Fixture(carto::geometry::EditableMesh mesh = quad()) : ui(session) {
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
         directory = std::filesystem::current_path() /
             ("cartographer-frontend-selection-" + std::to_string(stamp));
@@ -85,7 +85,7 @@ public:
         path = directory / "selection.carto";
         REQUIRE(ui.dispatch(carto::application::NewProjectAction{"Selection wiring", false}));
         REQUIRE(ui.dispatch(carto::application::CreateMeshObjectAction{
-            "Quad", quad(), std::nullopt, std::nullopt}));
+            "Quad", std::move(mesh), std::nullopt, std::nullopt}));
         REQUIRE(ui.dispatch(carto::application::SaveProjectAction{path}));
         source = session.snapshot().objects.front().object.id;
     }
@@ -176,6 +176,31 @@ void shared_selection_commands_convert_and_expand_without_authoring() {
     fixture.unchanged(before);
 }
 
+void weighted_path_command_selects_length_not_hops() {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    const auto a = mesh.add_vertex({0, 0, 0});
+    const auto b = mesh.add_vertex({1, -0.1, 0});
+    const auto c = mesh.add_vertex({2, -0.1, 0});
+    const auto d = mesh.add_vertex({3, 0, 0});
+    const auto e = mesh.add_vertex({1.5, 10, 0});
+    REQUIRE(a && b && c && d && e);
+    REQUIRE(mesh.add_face({a.value(), b.value(), c.value(), d.value(), e.value()}));
+    Fixture fixture(std::move(mesh));
+    fixture.select_vertex(a.value().value);
+    auto before = fixture.truth();
+    REQUIRE(fixture.run(ui::selection_commands::shortest_path, d.value()));
+    REQUIRE((fixture.session.snapshot().selection.component_groups.front().vertex_selection_order ==
+        std::vector<geometry::VertexId>{a.value(), e.value(), d.value()}));
+    fixture.unchanged(before);
+    fixture.select_vertex(a.value().value);
+    before = fixture.truth();
+    REQUIRE(fixture.run(ui::selection_commands::shortest_path_length, d.value()));
+    REQUIRE((fixture.session.snapshot().selection.component_groups.front().vertex_selection_order ==
+        std::vector<geometry::VertexId>{a.value(), b.value(), c.value(), d.value()}));
+    fixture.unchanged(before);
+}
+
 void shared_shortest_path_keeps_backend_ties_and_refuses_bad_context() {
     using namespace carto;
     Fixture fixture;
@@ -205,6 +230,13 @@ void shared_shortest_path_keeps_backend_ties_and_refuses_bad_context() {
     REQUIRE((path.vertex_selection_order ==
         std::vector<geometry::VertexId>{{1U}, {2U}, {3U}}));
     fixture.unchanged(before);
+    fixture.select_vertex(1U);
+    const auto weighted_before = fixture.truth();
+    REQUIRE(fixture.run(ui::selection_commands::shortest_path_length, geometry::VertexId{3U}));
+    const auto weighted = fixture.session.snapshot().selection.component_groups.front();
+    REQUIRE((weighted.vertex_selection_order ==
+        std::vector<geometry::VertexId>{{1U}, {2U}, {3U}}));
+    fixture.unchanged(weighted_before);
 
     const auto captured = fixture.session.snapshot();
     REQUIRE(fixture.ui.dispatch(application::CreateBoxAction{"Later edit", {1.0, 1.0, 1.0}}));
@@ -604,8 +636,8 @@ void multi_vertex_bevel_controls_use_atomic_project_history() {
 void multi_object_vertex_merge_controls_match_per_object_cardinality() {
     using namespace carto;
     for (const bool by_distance : {false, true}) {
-        for (const auto mode : {geometry::VertexMergeMode::target, geometry::VertexMergeMode::center}) {
-            if (by_distance && mode == geometry::VertexMergeMode::center) continue;
+        for (const auto mode : {geometry::VertexMergeMode::target, geometry::VertexMergeMode::center, geometry::VertexMergeMode::last_selected}) {
+            if (by_distance && mode != geometry::VertexMergeMode::target) continue;
             Fixture fixture;
             REQUIRE(fixture.ui.dispatch(application::CreateMeshObjectAction{"Second quad", quad()}));
             const auto objects = fixture.session.snapshot().objects;
@@ -642,8 +674,18 @@ void multi_object_vertex_merge_controls_match_per_object_cardinality() {
             availability = studio::vertex_tool_availability(fixture.session.snapshot().selection);
             REQUIRE(availability.selected_vertices == 4U && availability.merge_pair && availability.merge_by_distance);
             before = fixture.truth();
-            const auto merged = fixture.ui.dispatch(application::InvokeToolAction{command, arguments});
+            if (mode == geometry::VertexMergeMode::last_selected) REQUIRE(availability.merge_last_selected);
+            const auto merged = mode == geometry::VertexMergeMode::last_selected
+                ? fixture.ui.dispatch(studio::merge_at_last_selected_action())
+                : fixture.ui.dispatch(application::InvokeToolAction{command, arguments});
             REQUIRE(merged && merged.value().affected.objects.size() == 2U);
+            if (mode == geometry::VertexMergeMode::last_selected) {
+                for (const auto asset : {*first.mesh_asset, *second.mesh_asset}) {
+                    const auto& mesh = fixture.session.document_.meshes().at(asset);
+                    REQUIRE(mesh.find_vertex(geometry::VertexId{1U}) == nullptr);
+                    REQUIRE(mesh.find_vertex(geometry::VertexId{2U}) != nullptr);
+                }
+            }
             REQUIRE(fixture.session.snapshot().undo_count == before.snapshot.undo_count + 1U);
             REQUIRE(fixture.session.document_.meshes().at(*first.mesh_asset).vertex_count() == 3U);
             REQUIRE(fixture.session.document_.meshes().at(*second.mesh_asset).vertex_count() == 3U);
@@ -674,6 +716,16 @@ void multi_object_vertex_merge_controls_match_per_object_cardinality() {
     availability = studio::vertex_tool_availability(selection);
     REQUIRE(!availability.merge_pair && !availability.merge_by_distance);
     selection.component_groups[1].vertices.resize(2U);
+    REQUIRE(!studio::vertex_tool_availability(selection).merge_last_selected);
+    selection.component_groups[0].vertices = {geometry::VertexId{1U}, geometry::VertexId{2U}};
+    selection.component_groups[1].vertices = {geometry::VertexId{3U}, geometry::VertexId{4U}};
+    selection.component_groups[0].vertex_selection_order = {geometry::VertexId{2U}, geometry::VertexId{1U}};
+    selection.component_groups[1].vertex_selection_order = {geometry::VertexId{3U}, geometry::VertexId{4U}};
+    REQUIRE(studio::vertex_tool_availability(selection).merge_last_selected);
+    selection.component_groups[1].vertex_selection_order = {geometry::VertexId{3U}, geometry::VertexId{3U}};
+    REQUIRE(!studio::vertex_tool_availability(selection).merge_last_selected);
+    selection.component_groups[1].vertex_selection_order = {geometry::VertexId{3U}, geometry::VertexId{9U}};
+    REQUIRE(!studio::vertex_tool_availability(selection).merge_last_selected);
     selection.mode = editor::SelectionMode::face;
     availability = studio::vertex_tool_availability(selection);
     REQUIRE(!availability.merge_pair && !availability.merge_by_distance);
@@ -684,6 +736,7 @@ void multi_object_vertex_merge_controls_match_per_object_cardinality() {
 int main() {
     try {
         shared_selection_commands_convert_and_expand_without_authoring();
+        weighted_path_command_selects_length_not_hops();
         shared_shortest_path_keeps_backend_ties_and_refuses_bad_context();
         shared_batch_duplicate_is_bounded_journaled_and_undoable();
         batch_availability_matches_refusal_for_ineligible_authored_sources();

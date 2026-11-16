@@ -37,6 +37,16 @@ target_include_directories(carto_project
         $<INSTALL_INTERFACE:include>
 )
 
+set(CARTO_PROJECT_TEXT_LIMIT_BYTES "134217728" CACHE STRING
+    "Maximum serialized project bytes, between 128 and 512 MiB")
+if(NOT CARTO_PROJECT_TEXT_LIMIT_BYTES MATCHES "^[0-9]+$" OR
+   CARTO_PROJECT_TEXT_LIMIT_BYTES LESS 134217728 OR
+   CARTO_PROJECT_TEXT_LIMIT_BYTES GREATER 536870912)
+    message(FATAL_ERROR "CARTO_PROJECT_TEXT_LIMIT_BYTES must be between 134217728 and 536870912")
+endif()
+target_compile_definitions(carto_project PUBLIC
+    CARTOGRAPHER_PROJECT_TEXT_LIMIT_BYTES=${CARTO_PROJECT_TEXT_LIMIT_BYTES}ULL)
+
 target_link_libraries(carto_project
     PUBLIC
         carto_core carto_scene carto_geometry carto_assets carto_connection carto_surface_core

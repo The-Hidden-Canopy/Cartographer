@@ -732,10 +732,10 @@ bool jpeg_huffman_symbol(JpegEntropyReader& bits, const JpegHuffmanTable& table,
     return false;
 }
 
-bool jpeg_baseline_block(JpegEntropyReader& bits, const JpegHuffmanTable& dc,
-                         const JpegHuffmanTable& ac) {
+bool jpeg_sequential_block(JpegEntropyReader& bits, const JpegHuffmanTable& dc,
+                           const JpegHuffmanTable& ac, unsigned max_dc, unsigned max_ac) {
     std::uint8_t symbol = 0U;
-    if (!jpeg_huffman_symbol(bits, dc, symbol) || symbol > 11U || !bits.skip(symbol)) return false;
+    if (!jpeg_huffman_symbol(bits, dc, symbol) || symbol > max_dc || !bits.skip(symbol)) return false;
     unsigned coefficient = 1U;
     while (coefficient < 64U) {
         if (!jpeg_huffman_symbol(bits, ac, symbol)) return false;
@@ -746,7 +746,7 @@ bool jpeg_baseline_block(JpegEntropyReader& bits, const JpegHuffmanTable& dc,
             if (run != 15U || coefficient + 16U > 64U) return false;
             coefficient += 16U;
         } else {
-            if (size > 10U || coefficient + run >= 64U || !bits.skip(size)) return false;
+            if (size > max_ac || coefficient + run >= 64U || !bits.skip(size)) return false;
             coefficient += run + 1U;
         }
     }
@@ -755,7 +755,7 @@ bool jpeg_baseline_block(JpegEntropyReader& bits, const JpegHuffmanTable& dc,
 
 bool jpeg_progressive_ac_block(JpegEntropyReader& bits, const JpegHuffmanTable& ac,
                                std::uint64_t& nonzero, unsigned start, unsigned end,
-                               bool refinement, std::uint32_t& eob_run) {
+                               bool refinement, unsigned max_ac, std::uint32_t& eob_run) {
     auto refine_remaining = [&](unsigned from) {
         for (unsigned k = from; k <= end; ++k) {
             if ((nonzero & (std::uint64_t{1U} << k)) != 0U && !bits.skip(1U)) return false;
@@ -784,7 +784,7 @@ bool jpeg_progressive_ac_block(JpegEntropyReader& bits, const JpegHuffmanTable& 
                 if (run != 15U || k + 16U > end + 1U) return false;
                 k += 16U;
             } else {
-                if (size > 10U || k + run > end || !bits.skip(size)) return false;
+                if (size > max_ac || k + run > end || !bits.skip(size)) return false;
                 k += run;
                 nonzero |= std::uint64_t{1U} << k++;
             }
@@ -815,8 +815,10 @@ bool jpeg_progressive_ac_block(JpegEntropyReader& bits, const JpegHuffmanTable& 
     return true;
 }
 
-core::Result<void> validate_jpeg_huffman_entropy(std::span<const std::uint8_t> bytes) {
-    using Result = core::Result<void>;
+enum class JpegEntropyCoverage { checked_dct_huffman_syntax, unchecked_process_or_precision };
+
+core::Result<JpegEntropyCoverage> validate_jpeg_huffman_entropy(std::span<const std::uint8_t> bytes) {
+    using Result = core::Result<JpegEntropyCoverage>;
     const auto fail = [] { return Result::failure(decode_error(
         "JPEG Huffman entropy or scan progression is invalid or truncated")); };
     struct Component {
@@ -830,7 +832,8 @@ core::Result<void> validate_jpeg_huffman_entropy(std::span<const std::uint8_t> b
     std::array<JpegHuffmanTable, 4U> dc{}, ac{};
     unsigned component_count = 0U, max_h = 0U, max_v = 0U, restart_interval = 0U;
     unsigned width = 0U, height = 0U;
-    bool baseline = false, progressive = false;
+    unsigned max_dc = 11U, max_ac = 10U;
+    bool sequential = false, progressive = false;
     const auto ceil_div = [](std::uint64_t n, std::uint64_t d) { return (n + d - 1U) / d; };
     std::size_t cursor = 2U;
     while (cursor < bytes.size()) {
@@ -839,28 +842,32 @@ core::Result<void> validate_jpeg_huffman_entropy(std::span<const std::uint8_t> b
         if (cursor >= bytes.size()) return fail();
         const auto marker = bytes[cursor++];
         if (marker == 0xd9U) {
-            if (!baseline && !progressive) return Result::success();
+            if (!sequential && !progressive) return Result::success(JpegEntropyCoverage::unchecked_process_or_precision);
             for (unsigned i = 0U; i < component_count; ++i) {
-                if ((baseline && !components[i].scanned) ||
+                if ((sequential && !components[i].scanned) ||
                     (progressive && components[i].approximation[0U] < 0)) return fail();
             }
-            return Result::success();
+            return Result::success(JpegEntropyCoverage::checked_dct_huffman_syntax);
         }
         // Other frame processes retain their existing WIC behavior.
-        if (marker == 0xc1U || marker == 0xc3U ||
+        if (marker == 0xc3U ||
             (marker >= 0xc5U && marker <= 0xc7U) ||
             (marker >= 0xc9U && marker <= 0xcbU) ||
-            (marker >= 0xcdU && marker <= 0xcfU)) return Result::success();
+            (marker >= 0xcdU && marker <= 0xcfU)) return Result::success(JpegEntropyCoverage::unchecked_process_or_precision);
         if (bytes.size() - cursor < 2U) return fail();
         const unsigned length = (static_cast<unsigned>(bytes[cursor]) << 8U) | bytes[cursor + 1U];
         if (length < 2U || length > bytes.size() - cursor) return fail();
         const std::size_t end = cursor + length;
-        if (marker == 0xc0U || marker == 0xc2U) {
+        if (marker == 0xc0U || marker == 0xc1U || marker == 0xc2U) {
             if (length < 11U) return fail();
-            // SOF2 permits other precision; preserve the previous WIC route
-            // rather than applying the eight-bit Huffman limits to it.
-            if (marker == 0xc2U && bytes[cursor + 2U] != 8U) return Result::success();
-            if (bytes[cursor + 2U] != 8U) return fail();
+            const unsigned precision = bytes[cursor + 2U];
+            if (marker == 0xc0U && precision != 8U) return fail();
+            // Preserve the prior codec route for precision outside the defined
+            // eight- and twelve-bit DCT Huffman validation contract.
+            if (precision != 8U && precision != 12U)
+                return Result::success(JpegEntropyCoverage::unchecked_process_or_precision);
+            max_dc = precision == 8U ? 11U : 15U;
+            max_ac = precision == 8U ? 10U : 14U;
             height = (static_cast<unsigned>(bytes[cursor + 3U]) << 8U) | bytes[cursor + 4U];
             width = (static_cast<unsigned>(bytes[cursor + 5U]) << 8U) | bytes[cursor + 6U];
             component_count = bytes[cursor + 7U];
@@ -875,7 +882,7 @@ core::Result<void> validate_jpeg_huffman_entropy(std::span<const std::uint8_t> b
                 max_h = std::max(max_h, static_cast<unsigned>(c.h));
                 max_v = std::max(max_v, static_cast<unsigned>(c.v));
             }
-            baseline = marker == 0xc0U;
+            sequential = marker == 0xc0U || marker == 0xc1U;
             progressive = marker == 0xc2U;
             for (unsigned i = 0U; i < component_count; ++i) {
                 components[i].stride = ceil_div(width, 8U * max_h) * components[i].h;
@@ -904,12 +911,12 @@ core::Result<void> validate_jpeg_huffman_entropy(std::span<const std::uint8_t> b
             if (length != 4U) return fail();
             restart_interval = (static_cast<unsigned>(bytes[cursor + 2U]) << 8U) | bytes[cursor + 3U];
         } else if (marker == 0xdaU) {
-            if (!baseline && !progressive) return Result::success();
+            if (!sequential && !progressive) return Result::success(JpegEntropyCoverage::unchecked_process_or_precision);
             const unsigned count = bytes[cursor + 2U];
             if (count == 0U || count > component_count || length != 6U + 2U * count) return fail();
             const unsigned start = bytes[end - 3U], finish = bytes[end - 2U];
             const unsigned high = bytes[end - 1U] >> 4U, low = bytes[end - 1U] & 15U;
-            if (baseline && (start != 0U || finish != 63U || high != 0U || low != 0U)) return fail();
+            if (sequential && (start != 0U || finish != 63U || high != 0U || low != 0U)) return fail();
             if (progressive && (start > finish || finish > 63U || low > 13U || high > 13U ||
                 (high != 0U && high != low + 1U) ||
                 (start == 0U && finish != 0U) || (start != 0U && count != 1U))) return fail();
@@ -919,8 +926,8 @@ core::Result<void> validate_jpeg_huffman_entropy(std::span<const std::uint8_t> b
                 const auto id = bytes[cursor + 3U + 2U * i];
                 unsigned j = 0U;
                 while (j < component_count && components[j].id != id) ++j;
-                if (j == component_count || (baseline && components[j].scanned)) return fail();
-                if (baseline) components[j].scanned = true;
+                if (j == component_count || (sequential && components[j].scanned)) return fail();
+                if (sequential) components[j].scanned = true;
                 selected[i] = j;
                 const auto tables = bytes[cursor + 4U + 2U * i];
                 dc_ids[i] = tables >> 4U; ac_ids[i] = tables & 15U;
@@ -962,22 +969,22 @@ core::Result<void> validate_jpeg_huffman_entropy(std::span<const std::uint8_t> b
                     auto& c = components[selected[i]];
                     const unsigned blocks = count == 1U ? 1U : c.h * c.v;
                     for (unsigned block = 0U; block < blocks; ++block) {
-                        if (baseline) {
-                            if (!jpeg_baseline_block(bits, dc[dc_ids[i]], ac[ac_ids[i]])) return fail();
+                        if (sequential) {
+                            if (!jpeg_sequential_block(bits, dc[dc_ids[i]], ac[ac_ids[i]], max_dc, max_ac)) return fail();
                         } else if (start == 0U) {
                             if (high != 0U) {
                                 if (!bits.skip(1U)) return fail();
                             } else {
                                 std::uint8_t symbol = 0U;
                                 if (!jpeg_huffman_symbol(bits, dc[dc_ids[i]], symbol) ||
-                                    symbol > 11U || !bits.skip(symbol)) return fail();
+                                    symbol > max_dc || !bits.skip(symbol)) return fail();
                             }
                         } else {
                             const std::uint64_t index = (mcu / columns) * c.stride + (mcu % columns);
                             if (index >= c.nonzero.size() ||
                                 !jpeg_progressive_ac_block(bits, ac[ac_ids[i]],
                                     c.nonzero[static_cast<std::size_t>(index)], start, finish,
-                                    high != 0U, eob_run)) return fail();
+                                    high != 0U, max_ac, eob_run)) return fail();
                         }
                     }
                 }
@@ -1058,6 +1065,8 @@ static core::Result<DecodedRgba8Texture> decode_texture_image_wic(
             return core::Result<DecodedRgba8Texture>::failure(
                 entropy.error().with_context("JPEG Huffman entropy admission"));
         }
+        // unchecked_process_or_precision preserves the existing WIC path; it is
+        // deliberately not represented as a successful entropy validation.
     }
 
     ComApartment apartment;
@@ -1179,6 +1188,7 @@ core::Result<DecodedRgba8Texture> decode_texture_image_rgba8(
             return decode_texture_image_wic(std::move(encoded_source), limits);
         case TextureSourceFormat::dds:
         case TextureSourceFormat::exr:
+        case TextureSourceFormat::pfm:
             return core::Result<DecodedRgba8Texture>::failure(decode_error(
                 "texture-image pixel decoding currently supports PNG, JPEG, and TGA"));
         }

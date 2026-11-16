@@ -3,6 +3,7 @@
 #include "scene_import_test_support.hpp"
 #include <carto/io/generated_mesh.hpp>
 #include <carto/production/authoring_material.hpp>
+#include <carto/production/sculpt_stack.hpp>
 #include <carto/production/authoring_material_bake.hpp>
 #include <carto/io/gltf_material_import.hpp>
 #include <carto/io/gltf_scene_import.hpp>
@@ -370,7 +371,8 @@ int main(int argc, char **argv) {
         auto root = std::filesystem::temp_directory_path() /
                     ("gltf-material-" +
                      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-        if (argc == 3 && (std::string_view(argv[1]) == "--fixture" || std::string_view(argv[1]) == "--bake-fixture"))
+        if (argc == 3 && (std::string_view(argv[1]) == "--fixture" || std::string_view(argv[1]) == "--bake-fixture" ||
+            std::string_view(argv[1]) == "--output"))
             root = argv[2];
         std::filesystem::create_directories(root);
         auto tga = source_tga();
@@ -403,6 +405,37 @@ int main(int argc, char **argv) {
             take(store.put(tga, "image/x-tga"));
             std::cout << "material fixture ready\n";
             return 0;
+        }
+        {
+            auto sculpt_doc = material_scene(c, root / "sculpt-material.carto");
+            auto stack = take(production::make_sculpt_stack(sculpt_doc, 1));
+            auto stack_digest = take(stack.digest());
+            journal::Journal sculpt_journal((root / "sculpt-material.carto").string() + ".journal");
+            auto sculpt_tx = take(project::ProjectTransaction::begin(sculpt_doc, sculpt_journal, "sculpt.material.test"));
+            okay(production::stage_sculpt_stack(sculpt_tx, stack));
+            static_cast<void>(take(sculpt_tx.commit()));
+            auto identity = sculpt_doc.serialize();
+            auto digest = assets::sha256({reinterpret_cast<const std::uint8_t*>(identity.data()), identity.size()});
+            const auto& source_mesh = sculpt_doc.meshes().at(1);
+            geometry::MeshPatch patch; patch.expected_revision = source_mesh.revision();
+            for (const auto& v : source_mesh.vertices_sorted()) {
+                auto translated = v.position; translated.z += .25;
+                patch.vertex_changes.push_back({v.id, v.position, translated});
+            }
+            auto sculpt_options = options;
+            sculpt_options.evaluated_sculpt.emplace(1, io::GltfEvaluatedSculpt{digest, stack_digest, patch});
+            for (const auto* suffix : {".gltf", ".glb"}) {
+                auto out = root / (std::string("sculpt-material") + suffix);
+                auto report = std::string_view(suffix) == ".gltf" ? take(io::export_gltf(sculpt_doc, out, sculpt_options)) : take(io::export_glb(sculpt_doc, out, sculpt_options));
+                check(report.materials == 2 && report.textures >= 4 && report.images >= 4, "sculpt preserves multi-material accounting");
+                auto raw = read(out);
+                auto imported = take(io::import_gltf_scene({reinterpret_cast<const std::uint8_t*>(raw.data()), raw.size()}));
+                check(imported.materials.catalog.materials().size() == 2, "sculpt preserves imported materials");
+                check(!imported.meshes.empty(), "sculpt imports geometry");
+                for (const auto& mesh : imported.meshes) for (const auto& v : mesh.vertices_sorted())
+                    near(v.position.z, .25, "sculpt material geometry");
+            }
+            check(sculpt_doc.serialize() == identity, "sculpt export leaves source document unchanged");
         }
         Payload gltf(root / "material.gltf"), glb(root / "material.glb");
         inspect(gltf, decoded.pixels);
@@ -778,6 +811,79 @@ int main(int argc, char **argv) {
         take(io::export_gltf(ld, root / "large.gltf", lo));
         Payload lp(root / "large.gltf");
         inspect(lp, take(assets::decode_tga_rgba8(large)).pixels);
+        {
+            project::MaterialCatalog rich_catalog;
+            auto rich = take(project::ProjectDocument::create("Whole-scene material budget fixture"));
+            const auto rich_path = root / "whole-scene.carto";
+            journal::Journal rich_journal(rich_path.string() + ".journal");
+            const auto created = rich.serialize();
+            static_cast<void>(take(rich_journal.append({{}, rich.revision(), "whole.scene.create",
+                {reinterpret_cast<const std::uint8_t *>(created.data()), created.size()}, std::nullopt})));
+            auto tx = take(project::ProjectTransaction::begin(rich, rich_journal, "whole.scene.fixture"));
+            assets::BlobStore blobs(root / ".carto-assets" / "source-blobs");
+            for (unsigned index = 0; index < 17; ++index) {
+                auto bytes = source_tga(1024, 1024);
+                bytes[18] = static_cast<std::uint8_t>(index);
+                auto source = record;
+                source.id = 1000 + index;
+                source.name = "Whole-scene texture " + std::to_string(index);
+                source.content_digest = assets::sha256(bytes);
+                source.width = source.height = 1024;
+                source.relative_locator = blobs.path_for(source.content_digest)
+                    .lexically_relative(blobs.root()).generic_string();
+                source.provenance = "Independent synthetic budget fixture";
+                static_cast<void>(take(blobs.put(bytes, "image/x-tga")));
+                okay(rich_catalog.insert_texture(source));
+                render::StandardMaterial material;
+                material.base_color.asset = source.id;
+                material.base_color.uv_set = 7;
+                material.roughness = .5;
+                okay(rich_catalog.insert_material({source.id, source.name, material, {}}));
+                const auto mesh = take(tx.add_mesh(mesh_fixture(true)));
+                const auto object = take(tx.create_object(source.name));
+                okay(tx.attach_mesh(object, mesh));
+                okay(rich_catalog.insert_assignment({{mesh, 1}, source.id, {}}));
+                okay(rich_catalog.insert_assignment({{mesh, 2}, source.id, {}}));
+            }
+            okay(tx.set_material_catalog(std::move(rich_catalog)));
+            static_cast<void>(take(tx.commit("whole.scene.materials")));
+            static_cast<void>(take(rich.save_atomic(rich_path)));
+            const auto unchanged = rich.serialize();
+            io::GltfExportOptions budget{rich_path};
+            auto refused = io::export_gltf(rich, root / "whole-scene-default.gltf", budget);
+            std::cerr << "default whole-scene result: " << (refused ? "exported" : refused.error().message) << '\n';
+            check(!refused && refused.error().message.find("embedded images exceed 64-image/64-MiB bound") !=
+                std::string::npos, "default embedded-image budget must remain explicit");
+            budget.embedded_image_limit = 256;
+            budget.embedded_image_byte_limit = 512ULL * 1024ULL * 1024ULL;
+            const auto report = take(io::export_gltf(rich, root / "whole-scene.gltf", budget));
+            check(report.images == 17 && report.embedded_image_bytes > 64ULL * 1024ULL * 1024ULL,
+                  "whole-scene mode must preserve all 17 full-resolution source images");
+            Payload whole(root / "whole-scene.gltf");
+            check(array(member(whole.json, "images")).size() == 17, "whole-scene glTF image count");
+            const auto materials = array(member(whole.json, "materials"));
+            const auto textured = std::find_if(materials.begin(), materials.end(), [](const auto& candidate) {
+                return candidate.find("\"baseColorTexture\"") != std::string_view::npos;
+            });
+            check(textured != materials.end(), "whole-scene glTF must contain a textured material");
+            auto expected_tga = source_tga(1024, 1024);
+            expected_tga[18] = 0;
+            check(pixels(whole, member(member(*textured, "pbrMetallicRoughness"), "baseColorTexture")) ==
+                take(assets::decode_tga_rgba8(expected_tga)).pixels,
+                  "per-material cache release must preserve exact source pixels");
+            check(rich.serialize() == unchanged, "export must not mutate the editable source");
+            budget.source_z_up = true;
+            static_cast<void>(take(io::export_gltf(rich, root / "whole-scene-z-up.gltf", budget)));
+            Payload converted(root / "whole-scene-z-up.gltf");
+            check(converted.json.find("\"source_frame\":\"right_handed_z_up\"") != std::string_view::npos &&
+                converted.json.find("\"matrix\":[1,0,0,0,0,0,-1,0,0,1,0,0,0,0,0,1]") != std::string_view::npos,
+                "explicit source frame preserves local transforms beneath a world-level Y-up conversion");
+            check(converted.json.find("\"cartographer_object_id\"") != std::string_view::npos &&
+                rich.serialize() == unchanged, "source hierarchy identities and editable source survive frame conversion");
+            budget.embedded_image_limit = 0;
+            check(!io::export_gltf(rich, root / "whole-scene-invalid.gltf", budget),
+                  "zero embedded-image budget must fail closed");
+        }
         std::cout << "PASS material channels, regions/variants/UV, embedded "
                      "PNG/system decode, transforms/samplers, constant graphs, "
                      "reopen and failure-atomic diagnostics\nartifacts="

@@ -130,7 +130,8 @@ struct GltfMaterialWriter::Impl {
     const project::MaterialCatalog &catalog;
     GltfExportOptions options;
     GltfExportReport &report;
-    production::AuthoringTextureLibrary loaded;
+    std::unique_ptr<production::AuthoringTextureLibrary> loaded =
+        std::make_unique<production::AuthoringTextureLibrary>();
     std::vector<std::string> materials, images, textures, samplers;
     std::map<std::pair<render::MaterialId, std::optional<project::MaterialVariantId>>,
              GltfMaterialProjection>
@@ -146,6 +147,11 @@ struct GltfMaterialWriter::Impl {
     Impl(const project::ProjectDocument &d, const GltfExportOptions &o, GltfExportReport &r)
         : catalog(d.material_catalog()), options(o), report(r) {}
     Result<void> load(const project::TextureSourceRecord &rec) {
+        if (!options.embedded_image_limit || !options.embedded_image_byte_limit)
+            return Result<void>::failure(unsupported("embedded image limits must be nonzero"));
+        if (rec.format == assets::TextureSourceFormat::pfm)
+            return Result<void>::failure(unsupported(
+                "scene-linear float PFM material texture cannot be exported to glTF without a lossy conversion"));
         if (options.textures || loaded_ids.contains(rec.id))
             return Result<void>::success();
         if (options.project_path.empty())
@@ -181,7 +187,7 @@ struct GltfMaterialWriter::Impl {
         auto bytes = store.read(rec.content_digest);
         if (!bytes)
             return Result<void>::failure(bytes.error());
-        auto admitted = loaded.admit(rec, bytes.value());
+        auto admitted = loaded->admit(rec, bytes.value());
         if (!admitted)
             return admitted;
         loaded_ids.insert(rec.id);
@@ -230,7 +236,7 @@ struct GltfMaterialWriter::Impl {
         auto admission = load(record->second);
         if (!admission)
             return Result<std::string>::failure(admission.error());
-        const auto *library = options.textures ? options.textures.get() : &loaded;
+        const auto *library = options.textures ? options.textures.get() : loaded.get();
         auto mip =
             library->prepare(record->second, semantic, assets::expected_color_space(semantic));
         if (!mip)
@@ -250,10 +256,11 @@ struct GltfMaterialWriter::Impl {
         if (auto i = image_ids.find(digest); i != image_ids.end())
             image = i->second;
         else {
-            if (images.size() >= 64 ||
-                report.embedded_image_bytes + encoded.size() > 64ULL * 1024 * 1024)
+            if (images.size() >= options.embedded_image_limit ||
+                report.embedded_image_bytes + encoded.size() > options.embedded_image_byte_limit)
                 return Result<std::string>::failure(
-                    unsupported("embedded images exceed 64-image/64-MiB bound"));
+                    unsupported("embedded images exceed " + std::to_string(options.embedded_image_limit) +
+                        "-image/" + std::to_string(options.embedded_image_byte_limit / 1024 / 1024) + "-MiB bound"));
             image = images.size();
             image_ids.emplace(digest, image);
             report.embedded_image_bytes += encoded.size();
@@ -344,7 +351,7 @@ struct GltfMaterialWriter::Impl {
             if(entry==catalog.textures().end())return R::failure(unsupported("graph bake texture source missing"));
             const auto admitted=load(entry->second);if(!admitted)return R::failure(admitted.error());
         }
-        auto program=production::compile_authoring_material(catalog,id,variant,options.textures?options.textures.get():&loaded);
+        auto program=production::compile_authoring_material(catalog,id,variant,options.textures?options.textures.get():loaded.get());
         if(!program)return R::failure(program.error());
         auto output=production::bake_authoring_material(program.value(),n);
         if(output)baked_texels+=std::uint64_t(n)*n;
@@ -366,6 +373,10 @@ struct GltfMaterialWriter::Impl {
         auto key = std::pair(id, variant);
         if (auto it = projected.find(key); it != projected.end())
             return Result<GltfMaterialProjection>::success(it->second);
+        if (!options.textures) {
+            loaded = std::make_unique<production::AuthoringTextureLibrary>();
+            loaded_ids.clear();
+        }
         if (materials.size() >= 32)
             return Result<GltfMaterialProjection>::failure(
                 unsupported("resolved materials exceed 32-material export bound"));

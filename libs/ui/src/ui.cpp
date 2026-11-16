@@ -11964,15 +11964,21 @@ core::Result<application::DispatchReceipt> UiController::run_selection_command(
         {selection_commands::loop, editor::SelectionExpansion::loop},
         {selection_commands::ring, editor::SelectionExpansion::ring},
         {selection_commands::boundary, editor::SelectionExpansion::boundary},
+        {selection_commands::all_boundary_edges, editor::SelectionExpansion::all_boundary_edges},
+        {selection_commands::triangle_faces, editor::SelectionExpansion::triangle_faces},
+        {selection_commands::quad_faces, editor::SelectionExpansion::quad_faces},
+        {selection_commands::ngon_faces, editor::SelectionExpansion::ngon_faces},
     };
     for (const auto& [id, expansion] : expansions) {
         if (command_id == id) return dispatch(application::ExpandSelectionAction{expansion});
     }
-    if (command_id == selection_commands::shortest_path) {
+    if (command_id == selection_commands::shortest_path ||
+        command_id == selection_commands::shortest_path_length) {
         if (!path_goal || !path_owner.has_value() || !*path_owner) {
             return refuse(invalid("shortest path requires an explicit owner and goal vertex"));
         }
-        return dispatch(application::SelectShortestPathAction{path_goal, path_owner});
+        return dispatch(application::SelectShortestPathAction{path_goal, path_owner,
+            command_id == selection_commands::shortest_path_length});
     }
     return refuse(core::Diagnostic(core::ErrorCode::not_found, "selection command is unknown"));
 }
@@ -12332,10 +12338,19 @@ std::vector<CommandView> UiController::command_views(
     const bool edges = components && current.selection.mode == editor::SelectionMode::edge;
     for (const auto& [id, label] : {
              std::pair{selection_commands::boundary, "Select Component Boundary"},
+             std::pair{selection_commands::all_boundary_edges, "Select All Open Boundary Edges"},
              std::pair{selection_commands::loop, "Select Edge Loop"},
              std::pair{selection_commands::ring, "Select Edge Ring"}}) {
         commands.push_back({std::string(id), label, {}, edges,
             edges ? "" : "Select mesh edges first"});
+    }
+    const bool faces = components && current.selection.mode == editor::SelectionMode::face;
+    for (const auto& [id, label] : {
+             std::pair{selection_commands::triangle_faces, "Select Triangle Faces"},
+             std::pair{selection_commands::quad_faces, "Select Quad Faces"},
+             std::pair{selection_commands::ngon_faces, "Select N-gon Faces"}}) {
+        commands.push_back({std::string(id), label, {}, faces,
+            faces ? "" : "Select mesh faces first"});
     }
     const bool path = components && current.selection.mode == editor::SelectionMode::vertex &&
         current.selection.component_groups.size() == 1U &&

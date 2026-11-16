@@ -79,9 +79,9 @@ Result<void> validate_executed_texture_binding(
             "scene PBR does not execute the authored " + std::string(slot_name) +
                 " texture " + std::string(setting)});
     };
-    if (semantic != assets::TextureSemantic::normal &&
-        binding.normal_convention != render::NormalConvention::directx_y_minus)
-        return unsupported("normal convention outside the normal-map slot");
+    // Normal Y convention has no meaning for non-normal slots. Historical
+    // glTF imports populated +Y there as well; retaining that metadata must
+    // not reject an otherwise valid color/data texture or change its pixels.
 
     const assets::ColorSpace expected = assets::expected_color_space(semantic);
     const assets::ColorSpace requested = binding.interpretation ==
@@ -659,6 +659,11 @@ assets::Sha256Digest request_digest(const SceneRenderRequest& request) {
     for (const auto& texture : request.textures) {
         append_u64(data, texture.asset); append_digest(data, texture.current_source_digest);
         append_digest(data, texture.mips.artifact_digest);
+        if (texture.linear_float_mips) {
+            append_u64(data, 0x4633324d49505631ULL); // F32MIPV1 domain separator
+            append_u32(data, static_cast<std::uint32_t>(texture.linear_float_semantic));
+            append_digest(data, texture.linear_float_mips->artifact_digest);
+        }
     }
     append_u64(data, request.samplers.size());
     for (const auto& [identity, sampler] : request.samplers)
@@ -779,6 +784,11 @@ assets::Sha256Digest material_texture_cache_identity(
         append_u64(data, texture.asset);
         append_digest(data, texture.current_source_digest);
         append_digest(data, texture.mips.artifact_digest);
+        if (texture.linear_float_mips) {
+            append_u64(data, 0x4633324d49505631ULL); // F32MIPV1 domain separator
+            append_u32(data, static_cast<std::uint32_t>(texture.linear_float_semantic));
+            append_digest(data, texture.linear_float_mips->artifact_digest);
+        }
     }
     append_u64(data, request.samplers.size());
     for (const auto& [identity, sampler] : request.samplers)
@@ -1579,13 +1589,30 @@ Result<void> SceneRenderRequest::validate() const {
                 "scene PBR sampling does not execute comparison samplers"});
     }
     for (const auto& texture : textures) {
+        const bool float_only=texture.mips.levels.empty() && texture.linear_float_mips.has_value();
         if (texture.asset == 0U || !available.emplace(texture.asset, &texture).second ||
-            texture.current_source_digest.is_zero() || texture.mips.source.digest != texture.current_source_digest)
+            texture.current_source_digest.is_zero() ||
+            (float_only ? texture.linear_float_mips->source_digest != texture.current_source_digest
+                        : texture.mips.source.digest != texture.current_source_digest))
             return Result<void>::failure({core::ErrorCode::stale_data, "scene texture has duplicate/missing identity or stale source digest"});
-        if (texture.mips.resident_bytes() > kPayloadLimit - payload)
-            return Result<void>::failure(invalid("scene mip payload exceeds 512 MiB"));
-        payload += texture.mips.resident_bytes();
-        if (auto valid = texture.mips.validate(); !valid) return valid;
+        if (!float_only) {
+            if (texture.mips.resident_bytes() > kPayloadLimit - payload)
+                return Result<void>::failure(invalid("scene mip payload exceeds 512 MiB"));
+            payload += texture.mips.resident_bytes();
+            if (auto valid = texture.mips.validate(); !valid) return valid;
+        }
+        if (texture.linear_float_mips) {
+            const auto semantic = texture.linear_float_semantic;
+            if ((semantic != assets::TextureSemantic::base_color && semantic != assets::TextureSemantic::emissive) ||
+                (!float_only && texture.mips.semantic != semantic) ||
+                !assets::validate_linear_float_mips(*texture.linear_float_mips))
+                return Result<void>::failure(invalid("invalid linear float color texture"));
+            for (const auto& level : texture.linear_float_mips->levels) {
+                const auto size=static_cast<std::uint64_t>(level.rgba.size())*sizeof(float);
+                if(size>kPayloadLimit-payload) return Result<void>::failure(invalid("float texture payload exceeds 512 MiB"));
+                payload+=size;
+            }
+        }
     }
     std::set<scene::ObjectId> object_ids;
     std::set<assets::TextureAssetId> used_textures;
@@ -1769,7 +1796,9 @@ Result<void> SceneRenderRequest::validate() const {
                 const auto found = available.find(id);
                 if (found == available.end()) return Result<void>::failure({core::ErrorCode::not_found, "bound scene texture is unavailable; no fallback permitted"});
                 const auto& mip = found->second->mips;
-                if (mip.semantic != kSemantics[slot] || mip.color_space != assets::expected_color_space(kSemantics[slot]))
+                const bool float_only=mip.levels.empty() && found->second->linear_float_mips.has_value();
+                if (float_only ? kSemantics[slot] != found->second->linear_float_semantic :
+                    (mip.semantic != kSemantics[slot] || mip.color_space != assets::expected_color_space(kSemantics[slot])))
                     return Result<void>::failure(invalid("scene texture semantic/color space differs from material slot"));
                 used_textures.insert(id);
             }
@@ -2189,11 +2218,40 @@ Result<SceneRenderImage> render_scene_impl(
     }
     if (!material_texture_cache_hit) {
         for (const auto& input : request.textures) {
+            if (input.linear_float_mips) {
+                const auto& chain=*input.linear_float_mips;
+                std::uint64_t cursor=0;
+                std::vector<std::uint64_t> offsets;
+                for(const auto& level:chain.levels) {
+                    cursor=(cursor+511U)&~std::uint64_t(511U); offsets.push_back(cursor);
+                    const auto pitch=(std::uint64_t(level.width)*16U+255U)&~std::uint64_t(255U);
+                    cursor+=pitch*level.height;
+                }
+                if(cursor>kPayloadLimit) return Result<SceneRenderImage>::failure(invalid("float texture upload exceeds 512 MiB"));
+                std::vector<std::uint8_t> upload(static_cast<std::size_t>(cursor),0U);
+                for(std::size_t m=0;m<chain.levels.size();++m) {
+                    const auto& level=chain.levels[m]; const auto row=std::uint64_t(level.width)*16U;
+                    const auto pitch=(row+255U)&~std::uint64_t(255U);
+                    for(std::uint32_t y=0;y<level.height;++y)
+                        std::memcpy(upload.data()+offsets[m]+pitch*y, level.rgba.data()+std::size_t(y)*level.width*4U, static_cast<std::size_t>(row));
+                }
+                const auto staging=owned.buffer({upload.size(),gpu::MemoryClass::upload,gpu::BufferUsage::transfer_source});
+                const auto handle=material_texture_owner->texture({chain.levels[0].width,chain.levels[0].height,1U,1U,
+                    static_cast<std::uint32_t>(chain.levels.size()),gpu::Format::rgba32_float,gpu::TextureDimension::texture_2d,
+                    gpu::TextureUsage::sampled|gpu::TextureUsage::transfer_destination});
+                if(!staging || !handle) return Result<SceneRenderImage>::failure(!staging?staging.error():handle.error());
+                if(auto written=device.write_buffer(staging.value(),0U,bytes(upload));!written) return Result<SceneRenderImage>::failure(written.error());
+                transition(stream,staging.value(),device_ir::ResourceState::undefined,device_ir::ResourceState::copy_source);
+                transition(stream,handle.value(),device_ir::ResourceState::undefined,device_ir::ResourceState::copy_destination);
+                for(std::uint32_t m=0;m<offsets.size();++m) stream.append(device_ir::CmdCopyBufferToTexture{staging.value(),handle.value(),offsets[m],m});
+                material_textures.source_textures.emplace(input.asset,handle.value());
+            } else {
             const auto plan = build_texture_upload_plan(input.mips);
             if (!plan) return Result<SceneRenderImage>::failure(plan.error());
             const auto handle = upload_texture(*material_texture_owner, plan.value());
             if (!handle) return Result<SceneRenderImage>::failure(handle.error());
             material_textures.source_textures.emplace(input.asset, handle.value());
+            }
         }
         for (const auto& [identity, descriptor] : request.samplers) {
             const auto handle = device.create_sampler(descriptor);

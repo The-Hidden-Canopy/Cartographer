@@ -2447,3 +2447,37 @@ add_test(NAME cartographer_starter_material_library_tests
     COMMAND cartographer_starter_material_library_tests
             "${CMAKE_SOURCE_DIR}/examples/material-libraries/starter-surfaces.gltf")
 
+add_executable(cartographer_sculpt_export_tests sculpt_export_tests.cpp)
+target_link_libraries(cartographer_sculpt_export_tests PRIVATE carto_application)
+carto_target(cartographer_sculpt_export_tests)
+add_test(NAME cartographer_sculpt_export_tests COMMAND cartographer_sculpt_export_tests)
+
+add_executable(cartographer_sculpt_gltf_export_tests sculpt_gltf_export_tests.cpp)
+target_link_libraries(cartographer_sculpt_gltf_export_tests PRIVATE carto_application carto_ui)
+carto_target(cartographer_sculpt_gltf_export_tests)
+add_test(NAME cartographer_sculpt_gltf_export_tests COMMAND cartographer_sculpt_gltf_export_tests)
+
+# Strict float PFM round trip: values above one and malformed payloads.
+add_executable(cartographer_linear_pfm_tests linear_pfm_tests.cpp)
+target_include_directories(cartographer_linear_pfm_tests PRIVATE "${PROJECT_SOURCE_DIR}")
+target_link_libraries(cartographer_linear_pfm_tests PRIVATE carto_assets)
+carto_target(cartographer_linear_pfm_tests)
+add_test(NAME cartographer_linear_pfm_tests COMMAND cartographer_linear_pfm_tests)
+
+# Project text uses shortest exact doubles; reload is bit-identical.
+add_executable(cartographer_project_number_format_tests project_number_format_tests.cpp)
+target_link_libraries(cartographer_project_number_format_tests PRIVATE carto_application)
+carto_target(cartographer_project_number_format_tests)
+add_test(NAME cartographer_project_number_format_tests COMMAND cartographer_project_number_format_tests)
+
+# Extended-sequential (SOF1) 8/12-bit JPEG entropy admission.
+add_executable(cartographer_jpeg_entropy_coverage_tests jpeg_entropy_coverage_tests.cpp)
+target_link_libraries(cartographer_jpeg_entropy_coverage_tests PRIVATE carto_assets)
+carto_target(cartographer_jpeg_entropy_coverage_tests)
+add_test(NAME cartographer_jpeg_entropy_coverage_tests COMMAND cartographer_jpeg_entropy_coverage_tests)
+
+# Source registry reimport planning budgets.
+add_executable(cartographer_source_registry_budget_tests source_registry_budget_tests.cpp)
+target_link_libraries(cartographer_source_registry_budget_tests PRIVATE carto_assets)
+carto_target(cartographer_source_registry_budget_tests)
+add_test(NAME cartographer_source_registry_budget_tests COMMAND cartographer_source_registry_budget_tests)

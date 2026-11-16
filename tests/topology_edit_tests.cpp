@@ -4123,6 +4123,34 @@ void admitted_triangle_to_quad_is_undoable_and_clears_selection() {
         *session.snapshot().viewport.scene.instances().front().mesh, shared_id));
 }
 
+void shortest_path_selection_uses_geometric_length() {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    const auto a = mesh.add_vertex({0, 0, 0});
+    const auto b = mesh.add_vertex({1, -0.1, 0});
+    const auto c = mesh.add_vertex({2, -0.1, 0});
+    const auto d = mesh.add_vertex({3, 0, 0});
+    const auto e = mesh.add_vertex({1.5, 10, 0});
+    REQUIRE(a && b && c && d && e);
+    REQUIRE(mesh.add_face({a.value(), b.value(), c.value(), d.value(), e.value()}));
+    const auto revision = mesh.revision();
+    const auto route = mesh.shortest_edge_path(a.value(), d.value());
+    REQUIRE(route);
+    REQUIRE((route.value() == std::vector<geometry::VertexId>{a.value(), b.value(), c.value(), d.value()}));
+    const auto topology = mesh.topology();
+    REQUIRE(topology);
+    const auto hop = topology.value().shortest_path(a.value(), d.value());
+    REQUIRE(hop);
+    REQUIRE((hop.value() == std::vector<geometry::VertexId>{a.value(), e.value(), d.value()}));
+    REQUIRE(mesh.shortest_edge_path(a.value(), a.value()));
+    REQUIRE(!mesh.shortest_edge_path(a.value(), geometry::VertexId{999999}));
+    editor::SelectionState selection;
+    REQUIRE(selection.select_vertex(mesh, a.value()));
+    REQUIRE(selection.select_shortest_path(d.value(), mesh, true));
+    REQUIRE((selection.selected_vertices_in_order() == route.value()));
+    REQUIRE(mesh.revision() == revision);
+}
+
 void admitted_shortest_path_selection_is_non_mutating_and_stale_safe() {
     carto::application::ApplicationSession session;
     REQUIRE(carto::application::HumanApplicationAccess::dispatch(
@@ -4351,6 +4379,7 @@ int main() {
         admitted_edge_dissolve_is_undoable_and_clears_selection();
         selected_multi_edge_dissolve_commits_one_revision_and_is_undoable();
         admitted_triangle_to_quad_is_undoable_and_clears_selection();
+        shortest_path_selection_uses_geometric_length();
         admitted_shortest_path_selection_is_non_mutating_and_stale_safe();
         admitted_owner_scoped_shortest_path_preserves_other_object_groups();
         admitted_vertex_slide_is_undoable_and_revision_bound();

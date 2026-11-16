@@ -42,7 +42,11 @@ bool valid_expansion(SelectionExpansion expansion) noexcept {
         expansion == SelectionExpansion::invert ||
         expansion == SelectionExpansion::loop ||
         expansion == SelectionExpansion::ring ||
-        expansion == SelectionExpansion::boundary;
+        expansion == SelectionExpansion::boundary ||
+        expansion == SelectionExpansion::all_boundary_edges ||
+        expansion == SelectionExpansion::triangle_faces ||
+        expansion == SelectionExpansion::quad_faces ||
+        expansion == SelectionExpansion::ngon_faces;
 }
 
 } // namespace
@@ -327,9 +331,16 @@ core::Result<void> SelectionState::expand(
     }
     if ((expansion == SelectionExpansion::loop ||
          expansion == SelectionExpansion::ring ||
-         expansion == SelectionExpansion::boundary) && mode_ != SelectionMode::edge) {
+         expansion == SelectionExpansion::boundary ||
+         expansion == SelectionExpansion::all_boundary_edges) && mode_ != SelectionMode::edge) {
         return core::Result<void>::failure(invalid(
-            "loop, ring, and boundary expansion require edge selection mode"));
+            "loop, ring, and boundary selection require edge selection mode"));
+    }
+    const bool face_sides_selection = expansion == SelectionExpansion::triangle_faces ||
+        expansion == SelectionExpansion::quad_faces || expansion == SelectionExpansion::ngon_faces;
+    if (face_sides_selection && mode_ != SelectionMode::face) {
+        return core::Result<void>::failure(invalid(
+            "face-side selection requires face selection mode"));
     }
     if (auto result = validate(mesh); !result) {
         return result;
@@ -339,6 +350,37 @@ core::Result<void> SelectionState::expand(
     if (!topology) {
         return core::Result<void>::failure(topology.error().with_context(
             "selection expansion topology"));
+    }
+
+    if (face_sides_selection) {
+        std::set<geometry::FaceId> matches;
+        for (const auto& face : mesh.faces_sorted()) {
+            const auto sides = face.vertices.size();
+            if ((expansion == SelectionExpansion::triangle_faces && sides == 3U) ||
+                (expansion == SelectionExpansion::quad_faces && sides == 4U) ||
+                (expansion == SelectionExpansion::ngon_faces && sides > 4U)) {
+                matches.insert(face.id);
+            }
+        }
+        vertices_.clear();
+        vertex_selection_order_.clear();
+        edges_.clear();
+        faces_ = std::move(matches);
+        return core::Result<void>::success();
+    }
+
+    if (expansion == SelectionExpansion::all_boundary_edges) {
+        // This operation needs only the topology snapshot, not the quadratic
+        // edge-neighbor graph used by linked/grow/shrink selection.
+        std::set<geometry::EdgeId> open_edges;
+        for (const auto& edge : topology.value().edges) {
+            if (!edge.second_half_edge.has_value()) open_edges.insert(edge.id);
+        }
+        vertices_.clear();
+        vertex_selection_order_.clear();
+        faces_.clear();
+        edges_ = std::move(open_edges);
+        return core::Result<void>::success();
     }
 
     std::map<geometry::VertexId, std::set<geometry::VertexId>> vertex_neighbors;
@@ -526,9 +568,16 @@ core::Result<void> SelectionState::expand(
     }
     if ((expansion == SelectionExpansion::loop ||
          expansion == SelectionExpansion::ring ||
-         expansion == SelectionExpansion::boundary) && mode_ != SelectionMode::edge) {
+         expansion == SelectionExpansion::boundary ||
+         expansion == SelectionExpansion::all_boundary_edges) && mode_ != SelectionMode::edge) {
         return core::Result<void>::failure(invalid(
-            "loop, ring, and boundary expansion require edge selection mode"));
+            "loop, ring, and boundary selection require edge selection mode"));
+    }
+    if ((expansion == SelectionExpansion::triangle_faces ||
+         expansion == SelectionExpansion::quad_faces ||
+         expansion == SelectionExpansion::ngon_faces) && mode_ != SelectionMode::face) {
+        return core::Result<void>::failure(invalid(
+            "face-side selection requires face selection mode"));
     }
     if (auto result = validate(scene, meshes); !result) return result;
 
@@ -590,7 +639,7 @@ core::Result<void> SelectionState::expand(
 
 core::Result<void> SelectionState::select_shortest_path(
     geometry::VertexId goal,
-    const geometry::EditableMesh& mesh) {
+    const geometry::EditableMesh& mesh, bool by_length) {
     if (!other_component_selections_.empty()) {
         return core::Result<void>::failure(invalid(
             "multi-object shortest path requires an explicit owner group"));
@@ -613,11 +662,9 @@ core::Result<void> SelectionState::select_shortest_path(
             "shortest-path selection requires exactly one selected start vertex"));
     }
     const auto topology = mesh.topology();
-    if (!topology) {
-        return core::Result<void>::failure(topology.error().with_context(
-            "shortest-path selection topology"));
-    }
-    const auto path = topology.value().shortest_path(*vertices_.begin(), goal);
+    if (!topology) return core::Result<void>::failure(topology.error());
+    const auto path = by_length ? mesh.shortest_edge_path(*vertices_.begin(), goal)
+                                : topology.value().shortest_path(*vertices_.begin(), goal);
     if (!path) {
         return core::Result<void>::failure(path.error());
     }
@@ -630,7 +677,7 @@ core::Result<void> SelectionState::select_shortest_path(
     scene::ObjectId owner,
     geometry::VertexId goal,
     const scene::Scene& scene,
-    const std::map<scene::ObjectId, const geometry::EditableMesh*>& meshes) {
+    const std::map<scene::ObjectId, const geometry::EditableMesh*>& meshes, bool by_length) {
     if (mode_ != SelectionMode::vertex || !owner) {
         return core::Result<void>::failure(invalid(
             "owner-scoped shortest path requires vertex mode and a valid object"));
@@ -653,7 +700,7 @@ core::Result<void> SelectionState::select_shortest_path(
     SelectionState isolated;
     isolated.mode_ = mode_;
     isolated.load_component_group(*owner_group, *mesh->second);
-    if (auto result = isolated.select_shortest_path(goal, *mesh->second); !result) return result;
+    if (auto result = isolated.select_shortest_path(goal, *mesh->second, by_length); !result) return result;
     const auto updated = isolated.active_component_group();
     if (component_object_.has_value() && *component_object_ == owner) {
         load_component_group(updated, *mesh->second);

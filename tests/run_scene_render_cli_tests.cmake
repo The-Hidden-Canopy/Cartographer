@@ -90,6 +90,69 @@ foreach(frame first repeat)
         message(FATAL_ERROR "Fixed project/camera/device capture is not reproducible")
     endif()
 endforeach()
+# PFM is an untone-mapped float32 RGB capture. Exposure only affects display.
+foreach(ev 0 3)
+    execute_process(COMMAND "${RENDER}" "${root}/room.carto" "${root}/linear-${ev}.pfm"
+        ${arguments} --exposure ${ev}
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+    if(NOT result EQUAL 0)
+        message(FATAL_ERROR "PFM render refused: ${output}${error}")
+    endif()
+    file(READ "${root}/linear-${ev}.pfm.receipt.json" hdr_receipt)
+    string(JSON hdr_format GET "${hdr_receipt}" output_format)
+    string(JSON hdr_digest GET "${hdr_receipt}" output_digest)
+    file(SHA256 "${root}/linear-${ev}.pfm" actual_hdr_digest)
+    file(SIZE "${root}/linear-${ev}.pfm" hdr_size)
+    file(READ "${root}/linear-${ev}.pfm" hdr_header LIMIT 16 HEX)
+    if(NOT hdr_format STREQUAL "pfm-linear-rgb-f32" OR
+       NOT hdr_digest STREQUAL actual_hdr_digest OR
+       NOT hdr_size EQUAL 3072016 OR NOT hdr_header STREQUAL "50460a363430203430300a2d312e300a")
+        message(FATAL_ERROR "PFM format, dimensions, byte size or digest invalid")
+    endif()
+    if(ev EQUAL 0)
+        set(first_hdr "${actual_hdr_digest}")
+    elseif(NOT first_hdr STREQUAL actual_hdr_digest)
+        message(FATAL_ERROR "Display exposure altered scene-linear PFM output")
+    endif()
+endforeach()
+execute_process(COMMAND "${FIXTURE}" --write-hdr-emissive-fixture "${root}/hdr-scene.carto"
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "HDR project fixture refused: ${output}${error}")
+endif()
+execute_process(COMMAND "${RENDER}" "${root}/hdr-scene.carto" "${root}/hdr-scene.pfm"
+    ${arguments} --hdr-emissive 501 "${root}/fixture-float.pfm"
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "HDR emissive CLI override refused: ${output}${error}")
+endif()
+execute_process(COMMAND "${FIXTURE}" --verify-hdr-pfm "${root}/hdr-scene.pfm"
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "HDR emissive pixels not preserved: ${output}${error}")
+endif()
+file(READ "${root}/hdr-scene.pfm.receipt.json" hdr_override_receipt)
+string(JSON hdr_override_id GET "${hdr_override_receipt}" float_emissive_textures 0 asset)
+string(JSON hdr_source_digest GET "${hdr_override_receipt}" float_emissive_textures 0 source_digest)
+file(SHA256 "${root}/fixture-float.pfm" expected_hdr_source_digest)
+if(NOT hdr_override_id EQUAL 501 OR NOT hdr_source_digest STREQUAL expected_hdr_source_digest)
+    message(FATAL_ERROR "HDR override receipt did not bind its source")
+endif()
+execute_process(COMMAND "${FIXTURE}" --write-persisted-hdr-fixture "${root}/persisted-hdr.carto"
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "Persisted HDR project fixture refused: ${output}${error}")
+endif()
+execute_process(COMMAND "${RENDER}" "${root}/persisted-hdr.carto" "${root}/persisted-hdr.pfm"
+    ${arguments} RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "Persisted HDR material render refused: ${output}${error}")
+endif()
+execute_process(COMMAND "${FIXTURE}" --verify-hdr-pfm "${root}/persisted-hdr.pfm"
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "Persisted HDR material did not reach pixels: ${output}${error}")
+endif()
 set(explicit_orthographic_output "${root}/explicit-orthographic.bmp")
 execute_process(COMMAND "${RENDER}" "${root}/room.carto"
     "${explicit_orthographic_output}" --identity fixture-room

@@ -160,7 +160,7 @@ public:
     [[nodiscard]] const std::map<std::string, core::Revision>& lineage() const noexcept {
         return lineage_;
     }
-    [[nodiscard]] core::Result<void> set_record(SourceImportRecord record);
+    [[nodiscard]] core::Result<void> set_record(const SourceImportRecord& record);
     [[nodiscard]] core::Result<void> erase_record(
         std::string_view identity,
         core::Revision expected_generation);
@@ -197,7 +197,7 @@ struct SourceReimportPlan final {
 
 [[nodiscard]] core::Result<SourceReimportPlan> plan_source_reimport(
     const ProjectAssetRegistry& current,
-    std::vector<SourceImportRecord> incoming);
+    const std::vector<SourceImportRecord>& incoming);
 
 // Revalidates a reviewed plan against its exact base snapshot and returns a
 // new registry. No current registry is mutated if the plan is stale or invalid.

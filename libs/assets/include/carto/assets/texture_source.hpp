@@ -18,6 +18,7 @@ enum class TextureSourceFormat {
     tga,
     dds,
     exr,
+    pfm, // RGB float32 PFM, explicitly interpreted as scene-linear Rec.709
 };
 
 enum class TextureSourceStage {
