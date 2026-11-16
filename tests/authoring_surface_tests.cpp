@@ -47,7 +47,7 @@ void sampling_and_failure_atomicity() {
     auto program = compile(c, l);
     near(at(program, .5).material.base_color_factor.x,
          .5); // linear-light bilinear, not sRGB .5 decoded
-    auto mip = at(program, .23, .5, {2, 0});
+    auto mip = at(program, .23, .5, {2, 0}, {0, 2});
     near(mip.material.base_color_factor.x, std::pow((188.0 / 255 + .055) / 1.055, 2.4));
     check(program.texture_bytes() == 12 && l.resident_bytes() == 20,
           "decoded and mip budgets counted separately");
@@ -73,6 +73,39 @@ void sampling_and_failure_atomicity() {
     check(!program.evaluate({{std::numeric_limits<double>::infinity(), 0}, {}, {}}),
           "nonfinite UV rejected");
     check(!program.evaluate({{1e7, 0}, {}, {}}), "coordinate bound enforced");
+}
+void anisotropic_minification_preserves_magnification() {
+    auto p = pixels(30, 8, 1, {{0, 0, 0, 255}, {255, 255, 255, 255},
+        {0, 0, 0, 255}, {0, 0, 0, 255}, {0, 0, 0, 255}, {0, 0, 0, 255},
+        {255, 255, 255, 255}, {0, 0, 0, 255}});
+    production::AuthoringTextureLibrary library;
+    okay(library.admit(p.record, p.encoded));
+    auto catalog = mapped_catalog(p);
+    project::SamplerIntent sampler;
+    sampler.id = 30;
+    sampler.name = "Nearest footprint test";
+    sampler.minification = sampler.magnification = sampler.mip = project::SamplerFilter::nearest;
+    okay(catalog.insert_sampler(sampler));
+    auto material = catalog.materials().at(1).definition;
+    material.base_color.sampler = sampler.id;
+    replace(catalog, material);
+    const auto program = compile(catalog, library);
+    near(at(program, .5, .5, {.5, 0}, {0, .01}).material.base_color_factor.x, 0);
+    near(at(program, .125, .5, {.1, 0}, {}).material.base_color_factor.x, 1);
+    check(!program.evaluate({{.5, .5}, {1e8, 0}, {}}),
+          "oversized anisotropic tap coordinates fail before texel conversion");
+
+    auto wide = pixels(31, 1, 1, {{0, 0, 0, 255}});
+    wide.encoded.resize(18 + 4096 * 4, 0);
+    wide.encoded[12] = 0;
+    wide.encoded[13] = 16;
+    wide.record.width = 4096;
+    wide.record.content_digest = assets::sha256(wide.encoded);
+    production::AuthoringTextureLibrary wide_library;
+    okay(wide_library.admit(wide.record, wide.encoded));
+    const auto wide_program = compile(mapped_catalog(wide), wide_library);
+    check(!wide_program.evaluate({{300000, .5}, {}, {}}),
+          "4K texture coordinates cannot overflow GPU signed texel addressing");
 }
 void sampler_identity_transform_and_data() {
     auto p = pixels(2, 2, 1, {{128, 64, 32, 255}, {255, 128, 64, 255}});
@@ -569,6 +602,7 @@ void unsupported_v5_texture_maps_are_rejected() {
 int main() {
     try {
         sampling_and_failure_atomicity();
+        anisotropic_minification_preserves_magnification();
         sampler_identity_transform_and_data();
         executable_uv_graphs();
         masked_raster_normal_and_reopen();

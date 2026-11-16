@@ -558,6 +558,13 @@ void native_surface_cases(d3d12::AuthoringViewport &renderer, const std::filesys
     r.height = 48;
     compare(take(production::render_authoring_viewport(f.document, r)),
             take(renderer.render(f.document, r)).image);
+    material = c.materials().at(1);
+    material.revision = material.revision.next();
+    material.definition.base_color.transform.scale = {64, .25};
+    okay(c.replace_material(material));
+    set_materials(f.document, c);
+    compare(take(production::render_authoring_viewport(f.document, r)),
+            take(renderer.render(f.document, r)).image);
     graph.revision = graph.revision.next();
     graph.nodes[2].constants[0] = 2;
     graph.outputs.roughness = 3;

@@ -49,7 +49,9 @@ float4 sample_map(uint slot, float2 uv, float2 dx, float2 dy, inout bool valid) 
     const float2 ax=dx*metadata.xy, ay=dy*metadata.xy;
     const float lx=length(ax), ly=length(ay);
     float rho=max(lx,ly);
-    bool finite=all(isfinite(uv)) && all(isfinite(dx)) && all(isfinite(dy)) && isfinite(rho) && all(abs(uv)<=1e6);
+    // Reserve signed-32-bit headroom for texel conversion and neighbours.
+    const float coordinate_limit=min(1e6,1e9/max(metadata.x,metadata.y));
+    bool finite=all(isfinite(uv)) && all(isfinite(dx)) && all(isfinite(dy)) && isfinite(rho) && all(abs(uv)<=coordinate_limit);
     valid=valid && finite;
     if(!finite) return 0;
     const float minor=max(min(lx,ly),1e-6);
@@ -62,6 +64,7 @@ float4 sample_map(uint slot, float2 uv, float2 dx, float2 dy, inout bool valid) 
     float4 value=0;
     [loop] for(uint k=0;k<taps;++k) {
         const float2 at=uv+major_uv*((float(k)+0.5)/float(taps)-0.5);
+        if(!all(isfinite(at)) || any(abs(at)>coordinate_limit)) { valid=false; return 0; }
         if((flags&4)==0) value+=sample_level(slot,at,uint(floor(lod+.5)),rho>1,metadata);
         else value+=lerp(sample_level(slot,at,lo,rho>1,metadata),sample_level(slot,at,min(lo+1,uint(metadata.z)-1),rho>1,metadata),frac(lod));
     }

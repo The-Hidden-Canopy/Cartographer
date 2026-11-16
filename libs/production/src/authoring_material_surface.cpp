@@ -103,17 +103,39 @@ Value sample(const BoundTexture &t, core::Vec2d uv, core::Vec2d dx, core::Vec2d 
         throw std::runtime_error(
             "texture coordinates/derivatives exceed the finite sampling bound");
     const auto &base = t.mips->levels.front();
-    const auto rho = std::max(std::hypot(dx.x * base.width, dx.y * base.height),
-                              std::hypot(dy.x * base.width, dy.y * base.height));
+    // GPU addressing converts scaled coordinates to signed 32-bit texels.
+    // Keep headroom for bilinear neighbours even at the largest admitted mip.
+    const double coordinate_limit = std::min(1e6, 1e9 / std::max(base.width, base.height));
+    if (std::abs(uv.x) > coordinate_limit || std::abs(uv.y) > coordinate_limit)
+        throw std::runtime_error("texture coordinates exceed the texel conversion bound");
+    const double lx = std::hypot(dx.x * base.width, dx.y * base.height),
+                 ly = std::hypot(dy.x * base.width, dy.y * base.height);
+    const auto rho = std::max(lx, ly);
     if (!std::isfinite(rho))
         throw std::runtime_error("texture footprint overflow");
+    // Match the GPU sampler: preserve magnification, otherwise bound the
+    // elongated footprint to eight taps along its major derivative.
+    const double minor = std::max(std::min(lx, ly), 1e-6);
+    const unsigned taps = rho > 1.0
+        ? static_cast<unsigned>(std::clamp(std::ceil(rho / minor), 1.0, 8.0))
+        : 1U;
+    const core::Vec2d major = lx >= ly ? dx : dy;
     const auto last = static_cast<unsigned>(t.mips->levels.size() - 1);
-    const double lod = std::clamp(std::log2(std::max(1.0, rho)), 0.0, double(last));
+    const double lod = std::clamp(std::log2(std::max(1.0, rho / taps)), 0.0, double(last));
     const auto lo = static_cast<unsigned>(std::floor(lod));
-    Value value = t.sampler.mip == project::SamplerFilter::nearest
-                      ? level_sample(t, static_cast<unsigned>(std::round(lod)), uv, rho > 1)
-                      : lerp(level_sample(t, lo, uv, rho > 1),
-                             level_sample(t, std::min(lo + 1, last), uv, rho > 1), lod - lo);
+    Value value{};
+    for (unsigned k = 0; k < taps; ++k) {
+        const double offset = (double(k) + 0.5) / double(taps) - 0.5;
+        const core::Vec2d at{uv.x + major.x * offset, uv.y + major.y * offset};
+        if (!at.finite() || std::abs(at.x) > coordinate_limit || std::abs(at.y) > coordinate_limit)
+            throw std::runtime_error("anisotropic sample coordinates exceed the finite sampling bound");
+        const Value tap = t.sampler.mip == project::SamplerFilter::nearest
+                              ? level_sample(t, static_cast<unsigned>(std::round(lod)), at, rho > 1)
+                              : lerp(level_sample(t, lo, at, rho > 1),
+                                     level_sample(t, std::min(lo + 1, last), at, rho > 1), lod - lo);
+        for (unsigned c = 0; c < 4; ++c) value[c] += tap[c];
+    }
+    for (unsigned c = 0; c < 4; ++c) value[c] /= double(taps);
     Value mapped{};
     for (unsigned c = 0; c < 4; ++c) {
         const auto channel = static_cast<unsigned>(t.binding.channels.rgba[c]);
