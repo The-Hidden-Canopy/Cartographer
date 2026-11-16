@@ -6323,6 +6323,13 @@ core::Result<DispatchReceipt> ApplicationSession::update_sculpt_layer(
 
 core::Result<DispatchReceipt> ApplicationSession::duplicate_mesh_instance(
     const DuplicateMeshInstanceAction& action) {
+    // A sibling changes the parent's child set. Existing non-human mutation
+    // scope admits the source object only, not authority over its hierarchy.
+    const auto* source = document_.scene().find(action.source);
+    if (source && source->parent && active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(core::ErrorCode::unsupported,
+            "duplicating a parented mesh instance requires a human action"));
+    }
     editor::ProjectCommandAdmission admission;
     return execute_command(
         std::make_unique<editor::DuplicateProjectMeshInstanceCommand>(

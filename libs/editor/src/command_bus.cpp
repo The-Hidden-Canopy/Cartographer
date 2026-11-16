@@ -5429,6 +5429,27 @@ core::Result<void> ImportGltfSceneCommand::undo() {
     return core::Result<void>::success();
 }
 
+namespace {
+core::Result<void> validate_duplicate_ancestors(
+    const scene::Scene& scene, std::optional<scene::ObjectId> parent) {
+    std::set<scene::ObjectId> visited;
+    while (parent) {
+        if (!visited.insert(*parent).second || visited.size() > 1024U) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state, "duplicate mesh instance ancestor chain is invalid"));
+        }
+        const auto* ancestor = scene.find(*parent);
+        if (!ancestor || ancestor->locked || !ancestor->visible) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "duplicate mesh instance requires visible, unlocked ancestors"));
+        }
+        parent = ancestor->parent;
+    }
+    return core::Result<void>::success();
+}
+} // namespace
+
 DuplicateProjectMeshInstanceCommand::DuplicateProjectMeshInstanceCommand(
     ProjectCommandAdmission,
     project::ProjectDocument& document,
@@ -5489,17 +5510,15 @@ core::Result<void> DuplicateProjectMeshInstanceCommand::create_first_instance() 
             core::ErrorCode::invalid_state,
             "duplicate mesh instance source object is hidden"));
     }
-    if (source->parent.has_value()) {
-        return core::Result<void>::failure(core::Diagnostic(
-            core::ErrorCode::invalid_state,
-            "duplicate mesh instance only supports root-level source objects"));
-    }
+    if (auto result = validate_duplicate_ancestors(document_->scene(), source->parent); !result)
+        return result;
     if (!source->mesh_asset.has_value() || !document_->meshes().contains(*source->mesh_asset)) {
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::invalid_state,
             "duplicate mesh instance source object has no available mesh asset"));
     }
     const std::uint64_t mesh_asset = *source->mesh_asset;
+    const auto parent = source->parent;
 
     core::Transform transform = source->local_transform;
     transform.translation = transform.translation + local_translation_offset_;
@@ -5526,13 +5545,22 @@ core::Result<void> DuplicateProjectMeshInstanceCommand::create_first_instance() 
     if (auto attach = document_->attach_mesh(object_id, mesh_asset); !attach) {
         return rollback(attach.error());
     }
+    if (parent) {
+        if (document_->revision().exhausted()) return rollback(core::Diagnostic(
+            core::ErrorCode::invalid_state, "project revision is exhausted"));
+        if (auto result = document_->scene_.set_parent(object_id, parent); !result)
+            return rollback(result.error());
+        document_->bump_revision();
+    }
+    if (auto world = document_->scene().world_transform(object_id); !world)
+        return rollback(world.error().with_context("duplicated mesh instance world transform"));
     const auto* inserted = document_->scene().find(object_id);
     if (!inserted || inserted->mesh_asset != std::optional<std::uint64_t>{mesh_asset} ||
-        inserted->parent.has_value() ||
+        inserted->parent != parent ||
         !inserted->visible || inserted->locked) {
         return rollback(core::Diagnostic(
             core::ErrorCode::invalid_state,
-            "duplicated mesh instance violated root-level instance invariants"));
+            "duplicated mesh instance violated sibling instance invariants"));
     }
     object_ = *inserted;
     const auto source_receipt = document_->biological_proxy_instance_receipts_.find(source_);
@@ -5569,8 +5597,15 @@ core::Result<void> DuplicateProjectMeshInstanceCommand::restore_instance() {
             core::ErrorCode::invalid_state,
             "duplicate mesh instance command has incomplete restoration state"));
     }
+    if (auto result = validate_duplicate_ancestors(document_->scene(), object_->parent); !result)
+        return result;
     const project::ProjectDocument before = *document_;
     if (auto result = document_->insert_object(*object_); !result) return result;
+    if (auto world = document_->scene().world_transform(object_->id); !world) {
+        *document_ = before;
+        return core::Result<void>::failure(world.error().with_context(
+            "restored mesh instance world transform"));
+    }
     if (biological_proxy_receipt_.has_value() &&
         !document_->biological_proxy_instance_receipts_.emplace(
             object_->id, *biological_proxy_receipt_).second) {

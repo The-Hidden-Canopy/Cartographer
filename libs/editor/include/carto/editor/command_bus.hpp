@@ -1426,10 +1426,9 @@ private:
     bool applied_ = false;
 };
 
-// Creates a second root-level scene object that references an existing mesh
-// asset. This deliberately duplicates no geometry and clones no hierarchy:
-// modelling edits to the shared asset remain explicit, while object placement
-// stays independently undoable.
+// Creates a sibling scene object that references an existing mesh asset.
+// The offset is in the source parent's local space. No geometry or child
+// hierarchy is cloned; placement remains independently undoable.
 class DuplicateProjectMeshInstanceCommand final : public CheckpointableEditorCommand<DuplicateProjectMeshInstanceCommand> {
 public:
     DuplicateProjectMeshInstanceCommand(
