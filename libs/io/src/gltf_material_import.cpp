@@ -19,8 +19,8 @@ namespace {
 assets::TextureSourceLimits gltf_texture_limits() {
     assets::TextureSourceLimits limits;
     limits.max_source_bytes = 32U * 1024U * 1024U;
-    limits.max_dimension = 2048U;
-    limits.max_pixels = 4'194'304U;
+    limits.max_dimension = 4096U;
+    limits.max_pixels = 16'777'216U;
     return limits;
 }
 

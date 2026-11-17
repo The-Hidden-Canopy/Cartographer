@@ -80,6 +80,36 @@ void reject(const std::vector<std::uint8_t> &bytes, const char *reason) {
 } // namespace
 int main(int argc, char **argv) {
     try {
+        // Deterministic grayscale PNG fixtures generated with Python stdlib zlib:
+        // filter-zero rows, 8-bit grayscale zero pixels, no color metadata.
+        // Full 4096-square decode is 64 MiB RGBA; aggregate admission stays 256 MiB.
+        {
+            const auto read_fixture = [](const char* name) {
+                const auto path = std::filesystem::path(__FILE__).parent_path() / "fixtures" / name;
+                std::ifstream stream(path, std::ios::binary);
+                check(bool(stream), "4K PNG fixture is readable");
+                return std::vector<std::uint8_t>(std::istreambuf_iterator<char>(stream), {});
+            };
+            const auto texture_source = [](const std::vector<std::uint8_t>& png, unsigned count) {
+                const auto image = std::string("{\"uri\":\"data:image/png;base64,") + b64(png) + "\"}";
+                std::string json = "{\"asset\":{\"version\":\"2.0\"},\"images\":[";
+                for (unsigned i = 0; i < count; ++i) { if (i) json += ','; json += image; }
+                json += "]}";
+                return std::vector<std::uint8_t>(json.begin(), json.end());
+            };
+            const auto png = read_fixture("gltf-texture-4096.png");
+            const auto imported = take(io::import_gltf_materials(texture_source(png, 1), false));
+            check(imported.catalog.textures().begin()->second.width == 4096 &&
+                  imported.catalog.textures().begin()->second.height == 4096 &&
+                  imported.encoded_images.at(0) == png,
+                  "full 4K glTF image decodes and retains exact source bytes");
+            const auto oversized = io::import_gltf_materials(
+                texture_source(read_fixture("gltf-texture-4097x1.png"), 1), false);
+            check(!oversized, "4097-pixel dimension remains refused");
+            const auto aggregate = io::import_gltf_materials(texture_source(png, 5), false);
+            check(!aggregate && aggregate.error().message.find("256 MiB") != std::string::npos,
+                  "fifth full 4K texture refuses at unchanged decoded aggregate bound");
+        }
         // Authored float32 components survive JSON glTF and GLB import exactly,
         // including signed zero. Slightly off-unit accepted input is normalized;
         // the existing admission bound still rejects genuinely nonunit input.
