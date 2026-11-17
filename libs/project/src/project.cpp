@@ -23,6 +23,7 @@
 #include <chrono>
 #include <fstream>
 #include <functional>
+#include <cstring>
 #include <iomanip>
 #include <limits>
 #include <locale>
@@ -820,6 +821,197 @@ core::Result<attributes::AttributeValue> read_attribute_value(
     }
     return core::Result<attributes::AttributeValue>::failure(parse_error(
         "attribute type is invalid"));
+}
+
+// Packed attribute layers. Large float layers (imported normals, tangents and
+// UVs: three per triangle) are one record instead of one 17-digit text line
+// per value: "ATTRIBUTE_PACKED f32|f64 <scalar count> <base64 little-endian>".
+// f32 is used only when every scalar is exactly a float32 (always true for
+// glTF sources), so both encodings round-trip bit for bit. Readers accept the
+// per-value form too; small layers keep it for readability and diffing.
+constexpr std::size_t kPackedAttributeThreshold = 4096U;
+
+std::size_t attribute_scalar_width(attributes::AttributeType type) {
+    switch (type) {
+    case attributes::AttributeType::float32:
+    case attributes::AttributeType::float64: return 1U;
+    case attributes::AttributeType::vec2: return 2U;
+    case attributes::AttributeType::vec3: return 3U;
+    case attributes::AttributeType::vec4:
+    case attributes::AttributeType::color4: return 4U;
+    default: return 0U;
+    }
+}
+
+void append_attribute_scalars(std::vector<double>& out, attributes::AttributeType type,
+                              const attributes::AttributeValue& value) {
+    switch (type) {
+    case attributes::AttributeType::float32: out.push_back(std::get<float>(value)); return;
+    case attributes::AttributeType::float64: out.push_back(std::get<double>(value)); return;
+    case attributes::AttributeType::vec2: {
+        const auto& v = std::get<core::Vec2d>(value); out.push_back(v.x); out.push_back(v.y); return;
+    }
+    case attributes::AttributeType::vec3: {
+        const auto& v = std::get<core::Vec3d>(value);
+        out.push_back(v.x); out.push_back(v.y); out.push_back(v.z); return;
+    }
+    case attributes::AttributeType::vec4:
+    case attributes::AttributeType::color4: {
+        const auto& v = std::get<core::Vec4d>(value);
+        out.push_back(v.x); out.push_back(v.y); out.push_back(v.z); out.push_back(v.w); return;
+    }
+    default: return;
+    }
+}
+
+constexpr char kBase64Alphabet[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+std::string base64_encode(std::span<const std::uint8_t> bytes) {
+    std::string out;
+    out.reserve((bytes.size() + 2U) / 3U * 4U);
+    std::size_t i = 0U;
+    for (; i + 2U < bytes.size(); i += 3U) {
+        const std::uint32_t v = (std::uint32_t{bytes[i]} << 16U) | (std::uint32_t{bytes[i + 1U]} << 8U) | bytes[i + 2U];
+        out.push_back(kBase64Alphabet[(v >> 18U) & 63U]); out.push_back(kBase64Alphabet[(v >> 12U) & 63U]);
+        out.push_back(kBase64Alphabet[(v >> 6U) & 63U]); out.push_back(kBase64Alphabet[v & 63U]);
+    }
+    if (i < bytes.size()) {
+        std::uint32_t v = std::uint32_t{bytes[i]} << 16U;
+        if (i + 1U < bytes.size()) v |= std::uint32_t{bytes[i + 1U]} << 8U;
+        out.push_back(kBase64Alphabet[(v >> 18U) & 63U]); out.push_back(kBase64Alphabet[(v >> 12U) & 63U]);
+        out.push_back(i + 1U < bytes.size() ? kBase64Alphabet[(v >> 6U) & 63U] : '=');
+        out.push_back('=');
+    }
+    return out;
+}
+
+std::optional<std::vector<std::uint8_t>> base64_decode(std::string_view text) {
+    if (text.size() % 4U != 0U) return std::nullopt;
+    const auto decode = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    std::vector<std::uint8_t> out;
+    out.reserve(text.size() / 4U * 3U);
+    for (std::size_t i = 0U; i < text.size(); i += 4U) {
+        const bool pad2 = text[i + 2U] == '=', pad3 = text[i + 3U] == '=';
+        if ((pad2 && !pad3) || ((pad2 || pad3) && i + 4U != text.size())) return std::nullopt;
+        const int a = decode(text[i]), b = decode(text[i + 1U]);
+        const int c = pad2 ? 0 : decode(text[i + 2U]), d = pad3 ? 0 : decode(text[i + 3U]);
+        if (a < 0 || b < 0 || c < 0 || d < 0 ||
+            (pad2 && (b & 15) != 0) || (pad3 && !pad2 && (c & 3) != 0)) return std::nullopt;
+        const std::uint32_t v = (std::uint32_t(a) << 18U) | (std::uint32_t(b) << 12U) | (std::uint32_t(c) << 6U) | std::uint32_t(d);
+        out.push_back(static_cast<std::uint8_t>(v >> 16U));
+        if (!pad2) out.push_back(static_cast<std::uint8_t>(v >> 8U));
+        if (!pad3) out.push_back(static_cast<std::uint8_t>(v));
+    }
+    return out;
+}
+
+void write_packed_attribute_layer(std::ostream& output, attributes::AttributeType type,
+                                  const std::vector<attributes::AttributeValue>& values,
+                                  const std::vector<std::size_t>& order) {
+    std::vector<double> scalars;
+    scalars.reserve(values.size() * attribute_scalar_width(type));
+    if (order.size() == values.size()) {
+        for (const std::size_t index : order) append_attribute_scalars(scalars, type, values.at(index));
+    } else {
+        for (const auto& value : values) append_attribute_scalars(scalars, type, value);
+    }
+    bool fits_f32 = true;
+    for (const double v : scalars) {
+        if (!std::isfinite(v) || std::abs(v) > std::numeric_limits<float>::max()) {
+            fits_f32 = false; break;
+        }
+        const double narrowed = static_cast<double>(static_cast<float>(v));
+        if (std::memcmp(&narrowed, &v, sizeof(double)) != 0) { fits_f32 = false; break; }
+    }
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(scalars.size() * (fits_f32 ? 4U : 8U));
+    for (const double v : scalars) {
+        if (fits_f32) {
+            const float f = static_cast<float>(v);
+            std::uint32_t bits = 0U; std::memcpy(&bits, &f, sizeof(bits));
+            for (unsigned shift = 0U; shift < 32U; shift += 8U) bytes.push_back(static_cast<std::uint8_t>(bits >> shift));
+        } else {
+            std::uint64_t bits = 0U; std::memcpy(&bits, &v, sizeof(bits));
+            for (unsigned shift = 0U; shift < 64U; shift += 8U) bytes.push_back(static_cast<std::uint8_t>(bits >> shift));
+        }
+    }
+    output << "ATTRIBUTE_PACKED " << (fits_f32 ? "f32" : "f64") << ' ' << scalars.size() << ' '
+           << base64_encode(bytes) << '\n';
+}
+
+core::Result<std::vector<attributes::AttributeValue>> read_packed_attribute_layer(
+    std::istream& input, attributes::AttributeType type, std::uint64_t value_count) {
+    using R = core::Result<std::vector<attributes::AttributeValue>>;
+    const std::size_t width = attribute_scalar_width(type);
+    std::string encoding, payload;
+    std::uint64_t scalar_count = 0U;
+    if (width == 0U || !(input >> encoding >> scalar_count) ||
+        (encoding != "f32" && encoding != "f64") || scalar_count != value_count * width)
+        return R::failure(parse_error("packed attribute layer header is invalid"));
+    const std::size_t scalar_bytes = encoding == "f32" ? 4U : 8U;
+    // Derive the exact encoded size from the bounded layer before allocating
+    // or consuming an attacker-controlled token. Reject overlong tokens early.
+    const std::uint64_t expected_bytes = scalar_count * scalar_bytes;
+    const std::uint64_t encoded_bytes = ((expected_bytes + 2U) / 3U) * 4U;
+    if (encoded_bytes > kMaxSerializedProjectBytes)
+        return R::failure(parse_error("packed attribute payload exceeds byte limit"));
+    input >> std::ws;
+    payload.reserve(static_cast<std::size_t>(encoded_bytes));
+    for (std::uint64_t i = 0; i < encoded_bytes; ++i) {
+        const int c = input.get();
+        if (c == std::char_traits<char>::eof() || c == ' ' || c == '\n' || c == '\r' || c == '\t')
+            return R::failure(parse_error("packed attribute payload length is invalid"));
+        payload.push_back(static_cast<char>(c));
+    }
+    const int terminator = input.peek();
+    if (terminator != '\n' && terminator != '\r' && terminator != ' ' && terminator != '\t')
+        return R::failure(parse_error("packed attribute payload length is invalid"));
+    const auto bytes = base64_decode(payload);
+    if (!bytes || bytes->size() != scalar_count * scalar_bytes)
+        return R::failure(parse_error("packed attribute layer payload is malformed"));
+    std::vector<double> scalars(static_cast<std::size_t>(scalar_count));
+    for (std::size_t i = 0U; i < scalars.size(); ++i) {
+        const std::uint8_t* b = bytes->data() + i * scalar_bytes;
+        if (scalar_bytes == 4U) {
+            const std::uint32_t bits = std::uint32_t{b[0]} | (std::uint32_t{b[1]} << 8U) |
+                                       (std::uint32_t{b[2]} << 16U) | (std::uint32_t{b[3]} << 24U);
+            float f = 0.0F; std::memcpy(&f, &bits, sizeof(f)); scalars[i] = f;
+        } else {
+            std::uint64_t bits = 0U;
+            for (unsigned k = 0U; k < 8U; ++k) bits |= std::uint64_t{b[k]} << (8U * k);
+            std::memcpy(&scalars[i], &bits, sizeof(double));
+        }
+        if (!std::isfinite(scalars[i]))
+            return R::failure(parse_error("packed attribute layer holds a non-finite value"));
+    }
+    std::vector<attributes::AttributeValue> values;
+    values.reserve(static_cast<std::size_t>(value_count));
+    for (std::size_t i = 0U; i < static_cast<std::size_t>(value_count); ++i) {
+        const double* s = scalars.data() + i * width;
+        switch (type) {
+        case attributes::AttributeType::float32: {
+            if (std::abs(s[0]) > std::numeric_limits<float>::max())
+                return R::failure(parse_error("packed float32 value is out of range"));
+            const float narrowed = static_cast<float>(s[0]);
+            if (!std::isfinite(narrowed) || static_cast<double>(narrowed) != s[0])
+                return R::failure(parse_error("packed float32 value loses precision"));
+            values.emplace_back(narrowed); break;
+        }
+        case attributes::AttributeType::float64: values.emplace_back(s[0]); break;
+        case attributes::AttributeType::vec2: values.emplace_back(core::Vec2d{s[0], s[1]}); break;
+        case attributes::AttributeType::vec3: values.emplace_back(core::Vec3d{s[0], s[1], s[2]}); break;
+        default: values.emplace_back(core::Vec4d{s[0], s[1], s[2], s[3]}); break;
+        }
+    }
+    return R::success(std::move(values));
 }
 
 std::filesystem::path temporary_path(const std::filesystem::path& target) {
@@ -6171,7 +6363,10 @@ std::string ProjectDocument::serialize() const {
                    << layer.values.size() << '\n';
             const auto value_order = serialized_attribute_value_order(
                 mesh, layer.descriptor.domain);
-            if (value_order.size() == layer.values.size()) {
+            if (layer.values.size() >= kPackedAttributeThreshold &&
+                attribute_scalar_width(layer.descriptor.type) != 0U) {
+                write_packed_attribute_layer(output, layer.descriptor.type, layer.values, value_order);
+            } else if (value_order.size() == layer.values.size()) {
                 for (const std::size_t index : value_order) {
                     output << "ATTRIBUTE_VALUE ";
                     write_attribute_value(output, layer.descriptor.type, layer.values.at(index));
@@ -6755,9 +6950,26 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
                         "mesh attribute layer has an unknown domain or type"));
                 }
                 std::vector<attributes::AttributeValue> values;
-                values.reserve(static_cast<std::size_t>(value_count.value()));
+                bool packed_layer = false;
+                if (value_count.value() != 0U) {
+                    const auto mark = input.tellg();
+                    std::string tag;
+                    if (input >> tag && tag == "ATTRIBUTE_PACKED") {
+                        if (version.value() < 41U)
+                            return core::Result<ProjectDocument>::failure(parse_error(
+                                "packed attributes require project schema 41"));
+                        auto packed = read_packed_attribute_layer(input, type, value_count.value());
+                        if (!packed) return core::Result<ProjectDocument>::failure(packed.error());
+                        values = std::move(packed.value());
+                        packed_layer = true;
+                    } else {
+                        input.clear();
+                        input.seekg(mark);
+                    }
+                }
+                if (!packed_layer) values.reserve(static_cast<std::size_t>(value_count.value()));
                 for (std::uint64_t value_index = 0U;
-                     value_index < value_count.value(); ++value_index) {
+                     !packed_layer && value_index < value_count.value(); ++value_index) {
                     if (auto result = require_line(input, "ATTRIBUTE_VALUE"); !result) {
                         return core::Result<ProjectDocument>::failure(result.error());
                     }

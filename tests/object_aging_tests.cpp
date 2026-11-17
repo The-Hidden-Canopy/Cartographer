@@ -162,8 +162,8 @@ int main(int argc, char **argv) {
                 neutral.masks.pixels[p + 2] == 0,
             "zero-age cause masks are neutral");
     check(d.serialize() == before, "baking does not mutate source document");
-    const std::string v40_header = "CARTOGRAPHER_PROJECT 40";
-    check(before.starts_with(v40_header), "integrated project uses schema v40");
+    const std::string v40_header = "CARTOGRAPHER_PROJECT " + std::to_string(project::ProjectDocument::kSchemaVersion);
+    check(before.starts_with(v40_header), "integrated project uses current schema");
     for (const std::string table : {"RIG_TEMPLATE_BINDINGS 0\n",
                                     "AGING_LAYERS 0\n"}) {
       auto missing_table = before;

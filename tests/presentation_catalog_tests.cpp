@@ -809,8 +809,8 @@ void schema_v17_migrates_and_current_schema_requires_spatial_field_table() {
 
     project::ProjectDocument document;
     auto current = document.serialize();
-    const auto v40_header = std::string("CARTOGRAPHER_PROJECT 40");
-    require(current.starts_with(v40_header), "integrated projects use schema v40");
+    const auto v40_header = std::string("CARTOGRAPHER_PROJECT " + std::to_string(project::ProjectDocument::kSchemaVersion));
+    require(current.starts_with(v40_header), "integrated projects use current schema");
     auto legacy_project = [&](unsigned version, bool realism) {
         auto value = current;
         const auto cut = value.find(realism ? "CONNECTION_PORT_GRAPH " :
