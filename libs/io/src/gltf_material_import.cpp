@@ -943,7 +943,11 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
                                       value(*ns, index, 2)};
                             if (std::abs(normal.length_squared() - 1) > 1e-4)
                                 throw std::runtime_error("authored normal is not unit length");
-                            normal = normal.normalized();
+                            // Preserve authored float32 components when their length is unit
+                            // within float32 rounding: normalizing here destroys exact
+                            // source values and prevents compact float32 project storage.
+                            if (std::abs(normal.length_squared() - 1) > 4e-7)
+                                normal = normal.normalized();
                         }
                         normals.push_back(normal);
                         uvs.push_back(us ? core::Vec2d{value(*us, index, 0), value(*us, index, 1)}

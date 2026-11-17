@@ -25,12 +25,12 @@ void append(std::vector<std::uint8_t> &bytes, std::uint32_t value) {
     for (unsigned i = 0; i < 4; ++i)
         bytes.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
 }
-std::vector<std::uint8_t> fixture(bool glb = false) {
+std::vector<std::uint8_t> fixture(bool glb = false, std::array<float, 3> normal = {0.f, 0.f, 1.f}) {
     // Independently authored synthetic glTF, not produced by Cartographer's
     // exporter: interleaved float vertices, uint8 indices, two mesh instances.
     std::vector<std::uint8_t> binary;
     for (const auto p : std::array<core::Vec2d, 3>{{{0, 0}, {1, 0}, {0, 1}}})
-        for (float x : {float(p.x), float(p.y), 0.f, 0.f, 0.f, 1.f, 0.f, 1.f, 0.f, -1.f, float(p.x),
+        for (float x : {float(p.x), float(p.y), 0.f, normal[0], normal[1], normal[2], 0.f, 1.f, 0.f, -1.f, float(p.x),
                         float(p.y)})
             append(binary, std::bit_cast<std::uint32_t>(x));
     binary.insert(binary.end(), {0, 1, 2});
@@ -80,6 +80,39 @@ void reject(const std::vector<std::uint8_t> &bytes, const char *reason) {
 } // namespace
 int main(int argc, char **argv) {
     try {
+        // Authored float32 components survive JSON glTF and GLB import exactly,
+        // including signed zero. Slightly off-unit accepted input is normalized;
+        // the existing admission bound still rejects genuinely nonunit input.
+        for (bool binary : {false, true}) {
+            const std::array<float, 3> source{0.6f, -0.0f, 0.8f};
+            const core::Vec3d expected{source[0], source[1], source[2]};
+            check(std::abs(expected.length_squared() - 1) > 0 &&
+                  std::abs(expected.length_squared() - 1) <= 4e-7,
+                  "preservation fixture differs from exact unit in float32 rounding range");
+            const auto parsed = take(io::import_gltf_scene(fixture(binary, source)));
+            const auto* normals = parsed.meshes[0].attributes().find("cartographer.normal0");
+            check(normals && normals->values.size() == 3, "authored corner normals present");
+            for (const auto& value : normals->values) {
+                const auto actual = std::get<core::Vec3d>(value);
+                check(std::bit_cast<std::uint64_t>(actual.x) == std::bit_cast<std::uint64_t>(expected.x) &&
+                      std::bit_cast<std::uint64_t>(actual.y) == std::bit_cast<std::uint64_t>(expected.y) &&
+                      std::bit_cast<std::uint64_t>(actual.z) == std::bit_cast<std::uint64_t>(expected.z),
+                      "float32 authored normals retain exact promoted component bits");
+            }
+            const std::array<float, 3> off_unit{0.60001f, 0.f, 0.8f};
+            const core::Vec3d before{off_unit[0], off_unit[1], off_unit[2]};
+            check(std::abs(before.length_squared() - 1) > 4e-7 &&
+                  std::abs(before.length_squared() - 1) < 1e-4,
+                  "normalization fixture lies between preservation and rejection bounds");
+            const auto normalized = take(io::import_gltf_scene(fixture(binary, off_unit)));
+            const auto after = std::get<core::Vec3d>(
+                normalized.meshes[0].attributes().find("cartographer.normal0")->values[0]);
+            check(std::abs(after.length_squared() - 1) < 1e-12 && after.x != before.x,
+                  "off-unit admitted normals are renormalized");
+            const auto rejected = io::import_gltf_scene(fixture(binary, {0.61f, 0.f, 0.8f}));
+            check(!rejected && rejected.error().message.find("authored normal is not unit length") != std::string::npos,
+                  "nonunit authored normals fail at unchanged admission bound");
+        }
         // The large exception is bounded, numeric-only and opt-in. Ordinary
         // arrays and all default parser users retain the original limit.
         const auto make_array = [](std::size_t count) {
