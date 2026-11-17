@@ -986,8 +986,7 @@ Result<SceneProgram> build_scene_program(
         {"TEXCOORD", 1U, gpu::VertexFormat::float4, 52U, 0U},
         // Adjacent UV pairs share an input attribute; uploaded bytes and UV semantics are unchanged.
         {"TEXCOORD", 2U, gpu::VertexFormat::float4, 68U, 0U},
-        {"TEXCOORD", 4U, gpu::VertexFormat::float2, 84U, 0U},
-        {"TEXCOORD", 5U, gpu::VertexFormat::float2, 92U, 0U},
+        {"TEXCOORD", 4U, gpu::VertexFormat::float4, 84U, 0U},
         {"TEXCOORD", 6U, gpu::VertexFormat::float4, 100U, 0U},
         {"TEXCOORD", 7U, gpu::VertexFormat::float4, 116U, 0U},
         {"TEXCOORD", 8U, gpu::VertexFormat::float4, 132U, 0U},

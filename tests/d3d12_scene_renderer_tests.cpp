@@ -3674,6 +3674,37 @@ void scene_depth_exposure_material_camera_and_lifetimes(d3d12::D3D12Device& devi
         device, paired_cache, paired_uvs, CARTO_D3D12_SHADER_DIR));
     require(paired_cached.linear_hdr_rgba == paired_image.linear_hdr_rgba,
         "packed distinct UV streams preserve cached/fresh pixel parity");
+    auto auxiliary_uvs = request();
+    auto& auxiliary = auxiliary_uvs.objects[0U].materials[0U].current_material.definition;
+    auxiliary.occlusion.asset = id + 3U;
+    auxiliary.occlusion_strength = 1.0;
+    auxiliary.occlusion.transform.offset = {0.25, -0.125};
+    auxiliary.emissive.asset = id + 4U;
+    auxiliary.emissive_factor = {0.4, 0.6, 0.8};
+    auxiliary.emissive_strength = 1.0;
+    auxiliary.emissive.transform.rotation = 0.4;
+    auxiliary.emissive.transform.scale = {0.8, 0.6};
+    auxiliary_uvs.textures.push_back(texture_grid(id + 3U, assets::TextureSemantic::occlusion));
+    auxiliary_uvs.textures.push_back(texture_grid(id + 4U, assets::TextureSemantic::emissive));
+    rebind(auxiliary_uvs.objects[0U]);
+    const auto auxiliary_image = capture(device, auxiliary_uvs);
+    d3d12::SceneRenderCache auxiliary_cache;
+    require(take(d3d12::render_scene_cached(device, auxiliary_cache, auxiliary_uvs,
+        CARTO_D3D12_SHADER_DIR)).linear_hdr_rgba == auxiliary_image.linear_hdr_rgba,
+        "packed occlusion/emissive UVs preserve fresh/cache parity");
+    for (const bool change_emissive : {false, true}) {
+        auto changed_uvs = auxiliary_uvs;
+        auto& changed = changed_uvs.objects[0U].materials[0U].current_material.definition;
+        if (change_emissive) changed.emissive.transform = {};
+        else changed.occlusion.transform = {};
+        rebind(changed_uvs.objects[0U]);
+        const auto changed_image = capture(device, changed_uvs);
+        require(changed_image.linear_hdr_rgba != auxiliary_image.linear_hdr_rgba,
+            "each packed occlusion/emissive half independently controls sampling");
+        require(take(d3d12::render_scene_cached(device, auxiliary_cache, changed_uvs,
+            CARTO_D3D12_SHADER_DIR)).linear_hdr_rgba == changed_image.linear_hdr_rgba,
+            "packed occlusion/emissive affine changes invalidate cached uploads");
+    }
     auto open_gl_normal_uvs = normal_uvs;
     open_gl_normal_uvs.objects[0U].materials[0U].current_material.definition.normal.
         normal_convention = render::NormalConvention::opengl_y_plus;

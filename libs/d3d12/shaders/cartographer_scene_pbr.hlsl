@@ -59,8 +59,7 @@ struct VertexInput
     float4 light_position : TEXCOORD1;
     // xy: metallic-roughness UV; zw: independently transformed normal UV.
     float4 metallic_roughness_normal_uv : TEXCOORD2;
-    float2 occlusion_uv : TEXCOORD4;
-    float2 emissive_uv : TEXCOORD5;
+    float4 occlusion_emissive_uv : TEXCOORD4;
     float4 camera_clearcoat : TEXCOORD6;
     float4 material_surface_factors : TEXCOORD7;
     float4 material_flags : TEXCOORD8;
@@ -122,8 +121,8 @@ VertexOutput VSMain(VertexInput input)
     output.light_position = input.light_position;
     output.metallic_roughness_uv = input.metallic_roughness_normal_uv.xy;
     output.normal_uv = input.metallic_roughness_normal_uv.zw;
-    output.occlusion_uv = input.occlusion_uv;
-    output.emissive_uv = input.emissive_uv;
+    output.occlusion_uv = input.occlusion_emissive_uv.xy;
+    output.emissive_uv = input.occlusion_emissive_uv.zw;
     output.camera_clearcoat = input.camera_clearcoat;
     output.material_surface_factors = input.material_surface_factors;
     output.material_flags = input.material_flags;
