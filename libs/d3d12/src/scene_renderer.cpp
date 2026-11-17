@@ -42,8 +42,9 @@ struct ScenePbrUploadVertex {
     std::array<float, 4U> channel_mapping_a{};
     std::array<float, 4U> channel_mapping_b{};
     std::array<float, 4U> channel_mapping_c{};
+    std::array<float, 2U> authored_anisotropy{};
 };
-static_assert(sizeof(ScenePbrUploadVertex) == 212U);
+static_assert(sizeof(ScenePbrUploadVertex) == 220U);
 static_assert(offsetof(ScenePbrUploadVertex, uv) == 28U);
 static_assert(offsetof(ScenePbrUploadVertex, tangent) == 36U);
 static_assert(offsetof(ScenePbrUploadVertex, light_position) == 52U);
@@ -60,6 +61,7 @@ static_assert(offsetof(ScenePbrUploadVertex, vertex_color) == 148U);
 static_assert(offsetof(ScenePbrUploadVertex, channel_mapping_a) == 164U);
 static_assert(offsetof(ScenePbrUploadVertex, channel_mapping_b) == 180U);
 static_assert(offsetof(ScenePbrUploadVertex, channel_mapping_c) == 196U);
+static_assert(offsetof(ScenePbrUploadVertex, authored_anisotropy) == 212U);
 constexpr std::uint64_t kPayloadLimit = 512ULL * 1024U * 1024U;
 constexpr std::uint64_t kMaxSpecularEnvironmentPixels = 4'194'304ULL;
 constexpr std::uint32_t kSplitSumBrdfLutExtent = 128U;
@@ -174,6 +176,7 @@ struct SceneMaterialUvState {
     float sheen_weight = 0.0F;
     float anisotropy = 0.0F;
     float graph_occlusion = 1.0F;
+    std::array<float, 2U> authored_anisotropy{};
 };
 
 Result<UvAffine> texture_uv_affine(const render::TextureTransform& transform) {
@@ -599,6 +602,7 @@ void append_vec(std::vector<std::uint8_t>& output, core::Vec3d value) {
 assets::Sha256Digest request_digest(const SceneRenderRequest& request) {
     constexpr std::string_view algorithm = kSceneRenderAlgorithm;
     std::vector<std::uint8_t> data(algorithm.begin(), algorithm.end());
+    append_u64(data, static_cast<std::uint64_t>(request.base_specular_model));
     append_u64(data, request.source_revision.value()); append_digest(data, request.source_digest);
     append_u64(data, request.width); append_u64(data, request.height);
     append_u64(data, static_cast<std::uint64_t>(request.antialiasing));
@@ -714,8 +718,9 @@ assets::Sha256Digest request_digest(const SceneRenderRequest& request) {
 }
 
 assets::Sha256Digest mesh_cache_identity(const SceneRenderRequest& request) {
-    constexpr std::string_view domain = "carto.d3d12.scene-mesh-cache.v10";
+    constexpr std::string_view domain = "carto.d3d12.scene-mesh-cache.v11";
     std::vector<std::uint8_t> data(domain.begin(), domain.end());
+    append_u64(data, static_cast<std::uint64_t>(request.base_specular_model));
     append_u64(data, request.source_revision.value());
     append_digest(data, request.source_digest);
     append_vec(data, request.light.direction_to_light);
@@ -767,6 +772,7 @@ assets::Sha256Digest material_texture_cache_identity(
     const SceneRenderRequest& request) {
     constexpr std::string_view domain = "carto.d3d12.scene-material-cache.v6";
     std::vector<std::uint8_t> data(domain.begin(), domain.end());
+    append_u64(data, static_cast<std::uint64_t>(request.base_specular_model));
     append_u64(data, request.source_revision.value());
     append_digest(data, request.source_digest);
     append_u64(data, request.local_lights.size());
@@ -988,7 +994,8 @@ Result<SceneProgram> build_scene_program(
         {"COLOR", 0U, gpu::VertexFormat::float4, 148U, 0U},
         {"TEXCOORD", 9U, gpu::VertexFormat::float4, 164U, 0U},
         {"TEXCOORD", 10U, gpu::VertexFormat::float4, 180U, 0U},
-        {"TEXCOORD", 11U, gpu::VertexFormat::float4, 196U, 0U}};
+        {"TEXCOORD", 11U, gpu::VertexFormat::float4, 196U, 0U},
+        {"TEXCOORD", 12U, gpu::VertexFormat::float2, 212U, 0U}};
     const auto pbr_pipeline = device.create_pipeline(pbr);
     if (!pbr_pipeline) return Result<SceneProgram>::failure(pbr_pipeline.error());
     program.pbr_pipeline = pbr_pipeline.value();
@@ -1264,7 +1271,7 @@ struct ScenePipelineCache {
 core::Result<production::CompiledMaterialArtifact>
 compile_scene_render_material_artifact(
     std::string source_identity,
-    const render::MaterialAsset& material) {
+    const render::MaterialAsset& material, SceneBaseSpecularModel model) {
     const auto source_digest = production::material_source_digest(material);
     if (!source_digest)
         return core::Result<production::CompiledMaterialArtifact>::failure(
@@ -1290,7 +1297,18 @@ compile_scene_render_material_artifact(
         return core::Result<production::CompiledMaterialArtifact>::failure(
             transforms.error());
 
+    if (model != SceneBaseSpecularModel::legacy &&
+        model != SceneBaseSpecularModel::correlated_smith_direct)
+        return Result<production::CompiledMaterialArtifact>::failure(invalid("unknown scene base specular model"));
+    if (model == SceneBaseSpecularModel::correlated_smith_direct &&
+        (definition.anisotropy_map || definition.normal))
+        return Result<production::CompiledMaterialArtifact>::failure({core::ErrorCode::unsupported,
+            "correlated-Smith direct mode refuses anisotropy and normal maps"});
     auto gpu_material = material;
+    if (model == SceneBaseSpecularModel::correlated_smith_direct) {
+        gpu_material.definition.anisotropy = 0.0;
+        gpu_material.definition.anisotropy_rotation = 0.0;
+    }
     const auto normalize_scene_adapter_fields = [](render::TextureRef& binding) {
         if (binding) {
             binding.uv_set = render::kUv0;
@@ -1324,7 +1342,7 @@ namespace {
 core::Result<void> validate_scene_render_material_artifact_source(
     const production::CompiledMaterialArtifact& artifact,
     std::string_view source_identity,
-    const render::MaterialAsset& current_material) {
+    const render::MaterialAsset& current_material, SceneBaseSpecularModel model) {
     const auto current_digest = production::material_source_digest(current_material);
     if (!current_digest)
         return core::Result<void>::failure(current_digest.error());
@@ -1337,7 +1355,7 @@ core::Result<void> validate_scene_render_material_artifact_source(
     }
     if (auto valid = artifact.validate(); !valid) return valid;
     const auto expected = compile_scene_render_material_artifact(
-        std::string(source_identity), current_material);
+        std::string(source_identity), current_material, model);
     if (!expected)
         return core::Result<void>::failure(expected.error());
     if (expected.value().artifact_digest != artifact.artifact_digest) {
@@ -1417,6 +1435,12 @@ core::Result<void> SceneRenderEnvironment::validate() const {
 }
 
 Result<void> SceneRenderRequest::validate() const {
+    if (base_specular_model != SceneBaseSpecularModel::legacy &&
+        base_specular_model != SceneBaseSpecularModel::correlated_smith_direct)
+        return Result<void>::failure(invalid("unknown scene base specular model"));
+    if (base_specular_model == SceneBaseSpecularModel::correlated_smith_direct && environment)
+        return Result<void>::failure({core::ErrorCode::unsupported,
+            "correlated-Smith base specular supports analytic direct lights only"});
     if (source_digest.is_zero() || source_revision.exhausted() || width == 0U || height == 0U ||
         width > kSceneRenderMaximumDimension ||
         height > kSceneRenderMaximumDimension ||
@@ -1692,7 +1716,7 @@ Result<void> SceneRenderRequest::validate() const {
             }
             if (auto valid = validate_scene_render_material_artifact_source(
                     binding.material, binding.source_identity,
-                    binding.current_material); !valid) return valid;
+                    binding.current_material, base_specular_model); !valid) return valid;
             const auto& definition = binding.current_material.definition;
             if (!std::isfinite(binding.graph_occlusion) || binding.graph_occlusion < 0.0 ||
                 binding.graph_occlusion > 1.0) {
@@ -1703,7 +1727,11 @@ Result<void> SceneRenderRequest::validate() const {
                 return Result<void>::failure(invalid(
                     "scene anisotropy must be finite and in [-1, 1]"));
             }
-            if (binding.anisotropy != 0.0) {
+            if (base_specular_model == SceneBaseSpecularModel::correlated_smith_direct && binding.anisotropy != 0.0)
+                return Result<void>::failure({core::ErrorCode::unsupported,
+                    "correlated-Smith mode refuses signed graph anisotropy"});
+            if (binding.anisotropy != 0.0 ||
+                (base_specular_model == SceneBaseSpecularModel::correlated_smith_direct && definition.anisotropy != 0.0)) {
                 if (environment.has_value()) {
                     return Result<void>::failure({core::ErrorCode::unsupported,
                         "scene anisotropy currently refuses environment lighting"});
@@ -1894,7 +1922,10 @@ Result<SceneRenderImage> render_scene_impl(
                             binding.current_material.definition),
                         static_cast<float>(binding.sheen_weight),
                         static_cast<float>(binding.anisotropy),
-                        static_cast<float>(binding.graph_occlusion)}).second) {
+                        static_cast<float>(binding.graph_occlusion),
+                        {static_cast<float>(binding.current_material.definition.anisotropy),
+                         static_cast<float>(std::remainder(binding.current_material.definition.anisotropy_rotation,
+                             6.2831853071795864769))}}).second) {
                 return Result<SceneRenderImage>::failure(invalid(
                     "scene material UV transforms contain a duplicate slot"));
             }
@@ -2087,6 +2118,13 @@ Result<SceneRenderImage> render_scene_impl(
             ? "One authored spotlight uses the scene shadow map; other local lights remain unshadowed; inverse-square intensity uses a 1 cm floor, quartic range fade, and uncalibrated linear units"
             : "Point/spot lights are unshadowed; inverse-square intensity uses a 1 cm floor, quartic range fade, and uncalibrated linear units");
     }
+    if (request.base_specular_model == SceneBaseSpecularModel::correlated_smith_direct) {
+        result.limitations.push_back(
+            "Explicit correlated-Smith direct base-specular model applies at zero strength too; "
+            "KHR sample visibility clamp [0,1] and numerical alpha floor 1e-4; "
+            "no environment, anisotropy maps, normal maps or signed graph anisotropy; "
+            "clearcoat remains legacy; not complete KHR material or energy validation");
+    }
     const bool uses_sheen = std::any_of(request.objects.begin(), request.objects.end(),
         [](const SceneRenderObject& object) {
             return std::any_of(object.materials.begin(), object.materials.end(),
@@ -2125,6 +2163,11 @@ Result<SceneRenderImage> render_scene_impl(
         const auto source = shader_text(shader_directory / shader_names[i]);
         if (!source) return Result<SceneRenderImage>::failure(source.error());
         shader_sources[i] = source.value();
+        if (i < 2U && request.base_specular_model == SceneBaseSpecularModel::correlated_smith_direct) {
+            const auto helper = shader_text(shader_directory / "cartographer_authored_anisotropy.hlsli");
+            if (!helper) return Result<SceneRenderImage>::failure(helper.error());
+            shader_sources[i] = "#define CARTO_CORRELATED_SMITH_DIRECT 1\n" + helper.value() + "\n" + shader_sources[i];
+        }
         const auto* source_bytes = reinterpret_cast<const std::uint8_t*>(
             shader_sources[i].data());
         source_digests[i] = assets::sha256(
@@ -2724,7 +2767,7 @@ Result<SceneRenderImage> render_scene_impl(
                             transformed_uvs[3U], transformed_uvs[4U],
                             camera_clearcoat, surface_factors, material_flags,
                             vertex_color, channel_mapping_a, channel_mapping_b,
-                            channel_mapping_c});
+                            channel_mapping_c, transforms.value().authored_anisotropy});
                         vertex_remap[source_index] = static_cast<std::uint32_t>(
                             object_vertices.size() - 1U);
                         touched_vertices.push_back(source_index);

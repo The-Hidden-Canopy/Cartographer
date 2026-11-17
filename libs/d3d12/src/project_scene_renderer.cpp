@@ -367,10 +367,11 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
     std::string_view project_identity, const project::ProjectDocument& document,
     SceneRenderCamera camera, std::uint32_t width, std::uint32_t height,
     std::vector<SceneRenderTexture> textures, render::PbrLight light,
-    SceneRenderMaterialGraphInputs graph_inputs) {
+    SceneRenderMaterialGraphInputs graph_inputs, SceneBaseSpecularModel model) {
     using Output = core::Result<SceneRenderRequest>;
     if (auto valid = document.validate(); !valid) return Output::failure(valid.error());
     SceneRenderRequest request;
+    request.base_specular_model = model;
     request.source_revision = document.revision();
     const auto canonical = document.serialize();
     request.source_digest = assets::sha256({reinterpret_cast<const std::uint8_t*>(canonical.data()), canonical.size()});
@@ -596,7 +597,7 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
                     catalog, material.definition, request.samplers); !collected) {
                 return Output::failure(collected.error());
             }
-            const auto artifact = compile_scene_render_material_artifact(identity, material);
+            const auto artifact = compile_scene_render_material_artifact(identity, material, model);
             if (!artifact) return Output::failure(artifact.error());
             rendered.materials.push_back({submesh.material_slot, identity, material,
                 artifact.value(), sheen_weight, anisotropy, graph_occlusion});
@@ -607,7 +608,8 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
         bool requires_anisotropy_frame = false;
         for (const auto& binding : rendered.materials) {
             const auto& material = binding.current_material.definition;
-            requires_anisotropy_frame |= binding.anisotropy != 0.0;
+            requires_anisotropy_frame |= binding.anisotropy != 0.0 ||
+                (model == SceneBaseSpecularModel::correlated_smith_direct && material.anisotropy != 0.0);
             const std::array<const render::TextureRef*, 5U> texture_slots{
                 &material.base_color, &material.metallic_roughness,
                 &material.normal, &material.occlusion, &material.emissive};

@@ -82,7 +82,8 @@ install(TARGETS carto_d3d12_bake EXPORT CartographerTargets)
 install(TARGETS carto_d3d12_scene EXPORT CartographerTargets)
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY shaders/ DESTINATION share/cartographer/shaders
-    FILES_MATCHING PATTERN "*.hlsl")
+    COMPONENT CartographerShaders
+    FILES_MATCHING PATTERN "*.hlsl" PATTERN "*.hlsli")
 
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/cartographer_authoring_motion.hlsl"

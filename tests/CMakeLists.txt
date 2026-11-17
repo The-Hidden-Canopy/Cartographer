@@ -1115,6 +1115,12 @@ if(CARTO_ENABLE_D3D12)
         CARTO_D3D12_SHADER_DIR="${PROJECT_SOURCE_DIR}/libs/d3d12/shaders")
     carto_target(cartographer_d3d12_scene_renderer_tests)
     add_test(NAME cartographer_d3d12_scene_renderer_tests COMMAND cartographer_d3d12_scene_renderer_tests)
+    add_test(NAME cartographer_correlated_smith_installed_tests COMMAND "${CMAKE_COMMAND}"
+        "-DFIXTURE=$<TARGET_FILE:cartographer_d3d12_scene_renderer_tests>"
+        "-DBUILD_DIR=${CMAKE_BINARY_DIR}"
+        "-DCONFIG=$<CONFIG>"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/run_correlated_smith_installed_tests.cmake")
+    set_tests_properties(cartographer_correlated_smith_installed_tests PROPERTIES RUN_SERIAL TRUE)
     # Focused material gates remain separate from full scene acceptance.
     add_test(NAME cartographer_d3d12_material_opacity_tests
         COMMAND cartographer_d3d12_scene_renderer_tests --graph-opacity-only)

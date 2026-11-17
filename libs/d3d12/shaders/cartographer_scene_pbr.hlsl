@@ -68,6 +68,7 @@ struct VertexInput
     float4 channel_mapping_a : TEXCOORD9;
     float4 channel_mapping_b : TEXCOORD10;
     float4 channel_mapping_c : TEXCOORD11;
+    float2 authored_anisotropy : TEXCOORD12;
 };
 
 struct VertexOutput
@@ -90,6 +91,7 @@ struct VertexOutput
     nointerpolation float4 channel_mapping_a : TEXCOORD13;
     nointerpolation float4 channel_mapping_b : TEXCOORD14;
     nointerpolation float4 channel_mapping_c : TEXCOORD15;
+    nointerpolation float2 authored_anisotropy : TEXCOORD16;
 };
 
 VertexOutput VSMain(VertexInput input)
@@ -129,6 +131,7 @@ VertexOutput VSMain(VertexInput input)
     output.channel_mapping_a = input.channel_mapping_a;
     output.channel_mapping_b = input.channel_mapping_b;
     output.channel_mapping_c = input.channel_mapping_c;
+    output.authored_anisotropy = input.authored_anisotropy;
     return output;
 }
 
@@ -511,6 +514,12 @@ float4 PSMain(VertexOutput input) : SV_TARGET
                 anisotropic_tangent, anisotropic_bitangent, view, light_direction);
         specular = lerp(specular, anisotropic_specular, abs(anisotropy));
     }
+#if CARTO_CORRELATED_SMITH_DIRECT
+    specular = fresnel * base_attenuation * carto_authored_anisotropy(
+        roughness, input.authored_anisotropy.x, input.authored_anisotropy.y,
+        float3(dot(view,tangent),dot(view,bitangent),dot(view,normal)),
+        float3(dot(light_direction,tangent),dot(light_direction,bitangent),dot(light_direction,normal))).z;
+#endif
     const float3 diffuse_weight = (1.0 - fresnel) * (1.0 - metallic);
     const float3 diffuse = diffuse_weight * base_color * base_attenuation / 3.14159265;
     const float clearcoat_distribution = distribution_ggx(n_dot_h, coat_roughness);
@@ -621,6 +630,12 @@ float4 PSMain(VertexOutput input) : SV_TARGET
                     anisotropic_tangent, anisotropic_bitangent, view, local_light_direction);
             local_specular = lerp(local_specular, anisotropic_specular, abs(anisotropy));
         }
+#if CARTO_CORRELATED_SMITH_DIRECT
+        local_specular = local_fresnel * local_base_attenuation * carto_authored_anisotropy(
+            roughness, input.authored_anisotropy.x, input.authored_anisotropy.y,
+            float3(dot(view,tangent),dot(view,bitangent),dot(view,normal)),
+            float3(dot(local_light_direction,tangent),dot(local_light_direction,bitangent),dot(local_light_direction,normal))).z;
+#endif
         const float3 local_diffuse_weight =
             (1.0 - local_fresnel) * (1.0 - metallic);
         const float3 local_diffuse = local_diffuse_weight * base_color *

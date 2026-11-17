@@ -2,6 +2,7 @@
 
 #include <carto/d3d12/scene_renderer.hpp>
 #include <carto/d3d12/scene_anisotropy.hpp>
+#include <carto/d3d12/authored_anisotropy.hpp>
 #include <carto/d3d12/scene_sheen.hpp>
 #include <carto/d3d12/scene_camera_navigation.hpp>
 #include <carto/d3d12/temporal_sampling.hpp>
@@ -54,7 +55,7 @@ void take(core::Result<void> result) {
     if (!result) throw std::runtime_error(result.error().message);
 }
 d3d12::SceneRenderRequest request();
-void rebind(d3d12::SceneRenderObject& object);
+void rebind(d3d12::SceneRenderObject& object, d3d12::SceneBaseSpecularModel model = d3d12::SceneBaseSpecularModel::legacy);
 d3d12::SceneRenderTexture texture(std::uint64_t id, std::array<std::uint8_t, 4U> rgba,
     assets::TextureSemantic semantic);
 assets::Sha256Digest hash(std::string_view text) {
@@ -2558,11 +2559,11 @@ void radiance_hdr_environment_preserves_linear_specular_mips() {
     rejects_legacy_payload(std::move(trailing_legacy),
         "trailing legacy RGBE data refuses");
 }
-void rebind(d3d12::SceneRenderObject& object) {
+void rebind(d3d12::SceneRenderObject& object, d3d12::SceneBaseSpecularModel model) {
     std::vector<production::LookdevMaterialBinding> bindings;
     for (auto& binding : object.materials) {
         binding.material = take(d3d12::compile_scene_render_material_artifact(
-            binding.source_identity, binding.current_material));
+            binding.source_identity, binding.current_material, model));
         bindings.push_back({binding.material_slot, binding.material});
     }
     object.draw_package = take(production::compile_lookdev_draw_package(object.mesh, bindings));
@@ -5017,6 +5018,110 @@ void sheen_direct_lights_match_reference_and_invalidate_mesh_cache(
         "native sheen receipt discloses the missing environment integration");
 }
 
+void correlated_smith_scene_mode(d3d12::D3D12Device& device,
+    const std::filesystem::path& shader_directory = CARTO_D3D12_SHADER_DIR) {
+    constexpr auto mode = d3d12::SceneBaseSpecularModel::correlated_smith_direct;
+    auto scene = request();
+    scene.width = scene.height = 97U;
+    scene.antialiasing = d3d12::SceneRenderAntialiasing::none;
+    scene.light = {{0.6, 0.0, 0.8}, {3.0, 3.0, 3.0}};
+    auto& binding = scene.objects.front().materials.front();
+    auto& material = binding.current_material.definition;
+    material.base_color_factor = {0.6, 0.4, 0.2, 1.0}; material.metallic = 1.0;
+    rebind(scene.objects.front());
+    d3d12::SceneRenderCache cache;
+    const auto draw = [&](const d3d12::SceneRenderRequest& value) {
+        return take(d3d12::render_scene_cached(device, cache, value, shader_directory));
+    };
+    const auto legacy = draw(scene);
+    scene.base_specular_model = mode;
+    rebind(scene.objects.front(), mode);
+    const auto zero = draw(scene);
+    require(zero.request_digest != legacy.request_digest && zero.linear_hdr_rgba != legacy.linear_hdr_rgba,
+        "explicit base model is in request and pipeline cache identity");
+    const std::size_t center = (48U * 97U + 48U) * 4U;
+    const std::array<double,3> base{.6,.4,.2};
+    const auto check = [&](const d3d12::SceneRenderImage& image, double strength, double rotation,
+                           core::Vec3d light, double attenuation) {
+        const auto reference = take(d3d12::evaluate_authored_anisotropy_reference(
+            .65, strength, rotation, {0,0,1}, light));
+        for (std::size_t c=0;c<3;++c) {
+            const double fresnel = base[c] + (1-base[c])*std::pow(1-std::sqrt(.9),5);
+            const double expected = .03*base[c] + fresnel*reference.kernel*.8*3*attenuation;
+            require(std::abs(image.linear_hdr_rgba[center+c]-expected)<2e-4,
+                "opted-in base lobe matches independent direct-light reference");
+        }
+    };
+    check(zero,0,0,{.6,0,.8},1);
+    for (double strength : {1e-5,.5,1.0}) {
+        material.anisotropy = strength;
+        for (double rotation : {0.0,.4,1.5707963267948966}) {
+            material.anisotropy_rotation = rotation;
+            rebind(scene.objects.front(), mode);
+            const auto image = draw(scene);
+            check(image,strength,rotation,{.6,0,.8},1);
+            require(image.linear_hdr_rgba == take(d3d12::render_scene(device,scene,shader_directory)).linear_hdr_rgba,
+                "authored factor edits preserve cached/fresh identity");
+            if (strength == 1e-5)
+                require(std::abs(image.linear_hdr_rgba[center]-zero.linear_hdr_rgba[center])<1e-5,
+                    "new model converges continuously to zero strength");
+        }
+    }
+    material.anisotropy = 0; material.anisotropy_rotation = .4;
+    rebind(scene.objects.front(),mode);
+    const auto rotated_zero = draw(scene);
+    require(std::abs(rotated_zero.linear_hdr_rgba[center]-zero.linear_hdr_rgba[center])<1e-6,
+        "zero strength is independent of extension rotation");
+    material.anisotropy_rotation = 0; rebind(scene.objects.front(),mode);
+    require(draw(scene).linear_hdr_rgba == zero.linear_hdr_rgba,
+        "omitted and explicitly zero factors share the same model");
+    scene.base_specular_model = d3d12::SceneBaseSpecularModel::legacy;
+    require(draw(scene).linear_hdr_rgba == legacy.linear_hdr_rgba,
+        "switching model restores exact legacy output");
+    scene.base_specular_model = mode; material.anisotropy = .8; material.anisotropy_rotation = .4;
+    rebind(scene.objects.front(),mode);
+    auto oblique = scene; oblique.light.direction_to_light = {.36,.48,.8};
+    const auto oblique_image=draw(oblique);
+    check(oblique_image,.8,.4,{.36,.48,.8},1);
+    auto mirrored = oblique;
+    for (auto& vertex : mirrored.objects.front().mesh.vertices) vertex.tangent->w = -1;
+    rebind(mirrored.objects.front(),mode);
+    const auto mirrored_image=draw(mirrored);
+    check(mirrored_image,.8,.4,{.36,-.48,.8},1);
+    require(std::abs(mirrored_image.linear_hdr_rgba[center]-oblique_image.linear_hdr_rgba[center])>1e-4,
+        "handedness reverses local light y and changes the rotated anisotropic highlight");
+    auto local = scene; local.light.radiance = {};
+    d3d12::SceneRenderLocalLight light;
+    light.object={902U}; light.position={3,0,4}; light.emission_direction={-.6,0,-.8};
+    light.radiance={3,3,3}; light.range=10; light.casts_shadows=false;
+    for (auto kind : {d3d12::SceneRenderLocalLightKind::point,d3d12::SceneRenderLocalLightKind::spot}) {
+        light.kind=kind;
+        light.inner_cone_radians=kind==d3d12::SceneRenderLocalLightKind::spot?.2:0;
+        light.outer_cone_radians=kind==d3d12::SceneRenderLocalLightKind::spot?.6:0;
+        local.local_lights={light};
+        check(draw(local),.8,.4,{.6,0,.8},(.9375*.9375)/25);
+    }
+    require(binding.material.source_digest == take(production::material_source_digest(binding.current_material)),
+        "opted-in adapter preserves exact authored source provenance");
+    auto bad=scene; bad.objects.front().materials.front().anisotropy=.2;
+    require(!bad.validate(),"mixed graph anisotropy refuses");
+    bad=scene; bad.environment=d3d12::SceneRenderEnvironment{};
+    require(!bad.validate(),"new model refuses environment");
+    bad=scene; bad.objects.front().materials.front().current_material.definition.anisotropy=.1;
+    require(!bad.validate(),"changed source without recompile refuses");
+    auto bad_material=binding.current_material; bad_material.definition.normal.asset=123U;
+    require(!d3d12::compile_scene_render_material_artifact(binding.source_identity,bad_material,mode),
+        "new model refuses normal maps");
+    bad_material=binding.current_material; bad_material.definition.anisotropy_map.asset=123U;
+    require(!d3d12::compile_scene_render_material_artifact(binding.source_identity,bad_material,mode),
+        "new model refuses anisotropy maps");
+    require(!d3d12::compile_scene_render_material_artifact(binding.source_identity,binding.current_material),
+        "default legacy compiler still refuses authored anisotropy");
+    bad=scene; for(auto& vertex:bad.objects.front().mesh.vertices) vertex.tangent.reset();
+    rebind(bad.objects.front(),mode);
+    require(!bad.validate(),"nonzero authored anisotropy requires explicit tangents");
+}
+
 void anisotropy_direct_lights_match_reference_and_authored_axes(
     d3d12::D3D12Device& device) {
     auto scene = request();
@@ -5542,6 +5647,14 @@ int main(int argc, char** argv) {
             std::cout << "PASS legacy saved texture metadata and native pixel parity\n";
             return 0;
         }
+        if ((argc == 2 || argc == 3) && std::string_view(argv[1]) == "--correlated-smith-only") {
+            auto device = take(d3d12::D3D12Device::create({{}, false, true}));
+            std::cout << "D3D12 adapter: " << device->identity().adapter_name << "\n";
+            correlated_smith_scene_mode(*device, argc == 3 ? argv[2] : CARTO_D3D12_SHADER_DIR);
+            require(device->debug_receipts().empty() && !device->device_lost(), "clean opted-in native device");
+            std::cout << "PASS correlated-Smith scene mode\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--material-gpu-only") {
             auto device = take(d3d12::D3D12Device::create({{}, false, true}));
             float_emissive_reaches_native_pixels(*device);
@@ -5645,6 +5758,7 @@ int main(int argc, char** argv) {
         std::cout << "PASS material graph opacity reaches native masked and blended coverage\n";
         sheen_direct_lights_match_reference_and_invalidate_mesh_cache(*device);
         std::cout << "PASS direct sheen reference pixels and mesh-cache invalidation\n";
+        correlated_smith_scene_mode(*device);
         anisotropy_direct_lights_match_reference_and_authored_axes(*device);
         std::cout << "PASS direct anisotropy reference pixels, axes and cache invalidation\n";
         anisotropic_normal_maps_match_transported_reference_and_cache(*device);
