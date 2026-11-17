@@ -2587,3 +2587,11 @@ target_link_libraries(cartographer_authored_anisotropy_reference_tests PRIVATE c
 target_include_directories(cartographer_authored_anisotropy_reference_tests PRIVATE "${PROJECT_SOURCE_DIR}/libs/d3d12/include")
 carto_target(cartographer_authored_anisotropy_reference_tests)
 add_test(NAME cartographer_authored_anisotropy_reference_tests COMMAND cartographer_authored_anisotropy_reference_tests)
+
+if(CARTO_ENABLE_D3D12)
+    add_executable(cartographer_authored_anisotropy_gpu_tests authored_anisotropy_gpu_tests.cpp)
+    target_link_libraries(cartographer_authored_anisotropy_gpu_tests PRIVATE carto_d3d12)
+    target_compile_definitions(cartographer_authored_anisotropy_gpu_tests PRIVATE CARTO_D3D12_SHADER_DIR="${PROJECT_SOURCE_DIR}/libs/d3d12/shaders")
+    carto_target(cartographer_authored_anisotropy_gpu_tests)
+    add_test(NAME cartographer_authored_anisotropy_gpu_tests COMMAND cartographer_authored_anisotropy_gpu_tests)
+endif()
