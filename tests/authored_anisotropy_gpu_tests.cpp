@@ -121,6 +121,8 @@ void parity() {
         Case{.5F,.8F,0,l,v}, Case{.5F,1,.7F,v,l}, Case{0,0,0,{0,0,1},{0,0,1}},
         Case{1,1,0,v,l}, Case{.1F,.9F,.3F,core::Vec3d{1,0,1e-6}.normalized(),core::Vec3d{-1,.1,1e-6}.normalized()},
         Case{.5F,.8F,0,core::Vec3d{1,0,1e-6}.normalized(),core::Vec3d{-1,0,1e-6}.normalized()},
+        // Normal float inputs whose half-vector squared length underflows in float.
+        Case{.5F,.8F,0,core::Vec3d{1,0,1e-25}.normalized(),core::Vec3d{-1,0,1e-25}.normalized()},
         Case{.5F,.8F,0,{0,0,-1},l}, Case{.5F,.8F,0,v,{1,0,0}},
         Case{.5F,.8F,-.3F,{v.x,-v.y,v.z},{l.x,-l.y,l.z}}, Case{.5F,.8F,.3F,v,l}
     };
