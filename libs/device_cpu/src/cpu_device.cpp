@@ -98,12 +98,13 @@ bool compare_depth(gpu::CompareOp operation, float left, float right) {
     return false;
 }
 
-float blend_factor(gpu::BlendFactor factor, float source_alpha) {
+float blend_factor(gpu::BlendFactor factor, float source_alpha, float source_channel) {
     switch (factor) {
     case gpu::BlendFactor::zero: return 0.0F;
     case gpu::BlendFactor::one: return 1.0F;
     case gpu::BlendFactor::source_alpha: return source_alpha;
     case gpu::BlendFactor::one_minus_source_alpha: return 1.0F - source_alpha;
+    case gpu::BlendFactor::source_color: return source_channel;
     }
     return 1.0F;
 }
@@ -1103,12 +1104,15 @@ core::Result<void> CpuDevice::rasterize_triangle(
             }
             if (pipeline.value()->descriptor.blend) {
                 const std::size_t base = pixel * 4U;
-                const float source_factor = blend_factor(
-                    pipeline.value()->descriptor.source_color, output[3]);
-                const float destination_factor = blend_factor(
-                    pipeline.value()->descriptor.destination_color, output[3]);
-                for (std::size_t channel = 0U; channel < 4U; ++channel) {
-                    output[channel] = output[channel] * source_factor +
+                const auto source = output;
+                // Match the native RHI contract: color factors affect RGB only.
+                // Source alpha replaces destination alpha (ONE/ZERO).
+                for (std::size_t channel = 0U; channel < 3U; ++channel) {
+                    const float source_factor = blend_factor(
+                        pipeline.value()->descriptor.source_color, source[3], source[channel]);
+                    const float destination_factor = blend_factor(
+                        pipeline.value()->descriptor.destination_color, source[3], source[channel]);
+                    output[channel] = source[channel] * source_factor +
                         target.value()->color[base + channel] * destination_factor;
                 }
             }

@@ -163,7 +163,7 @@ enum class PrimitiveTopology { triangle_list, triangle_strip, line_list };
 enum class PolygonMode { fill, line, point };
 enum class CullMode { none, front, back, front_and_back };
 enum class FrontFace { counter_clockwise, clockwise };
-enum class BlendFactor { zero, one, source_alpha, one_minus_source_alpha };
+enum class BlendFactor { zero, one, source_alpha, one_minus_source_alpha, source_color };
 enum class BlendOp { add, subtract, reverse_subtract, minimum, maximum };
 
 // Vertex attributes are explicit so native backends do not have to guess an
@@ -278,6 +278,7 @@ struct PipelineDesc {
     bool depth_write = true;
     CompareOp depth_compare = CompareOp::less_or_equal;
     bool blend = false;
+    // RGB-only blend factors; alpha always replaces the destination with source alpha.
     BlendFactor source_color = BlendFactor::one;
     BlendFactor destination_color = BlendFactor::zero;
     BlendOp color_blend = BlendOp::add;

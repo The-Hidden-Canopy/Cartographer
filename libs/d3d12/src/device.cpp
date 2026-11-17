@@ -1831,6 +1831,7 @@ core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
         case gpu::BlendFactor::one: return D3D12_BLEND_ONE;
         case gpu::BlendFactor::source_alpha: return D3D12_BLEND_SRC_ALPHA;
         case gpu::BlendFactor::one_minus_source_alpha: return D3D12_BLEND_INV_SRC_ALPHA;
+        case gpu::BlendFactor::source_color: return D3D12_BLEND_SRC_COLOR;
         }
         return D3D12_BLEND_ONE;
     };

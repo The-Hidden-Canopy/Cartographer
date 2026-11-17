@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -185,6 +186,43 @@ void cpu_reference_rasterizes_and_reads_back_a_triangle() {
     REQUIRE(pixels.value()[center + 3U] > 0.9F);
     REQUIRE(pixels.value()[corner] < 0.01F);
     REQUIRE(pixels.value()[corner + 1U] < 0.01F);
+
+    // Unequal RGB components expose scalar-vs-per-channel factor bugs. Alpha
+    // follows the RHI's fixed source replacement contract for every factor.
+    const std::array<float, 4U> source = {0.2F, 0.5F, 0.8F, 0.25F};
+    const std::array<float, 4U> background = {0.7F, 0.4F, 0.1F, 0.9F};
+    struct BlendCase { gpu::BlendFactor src, dst; std::array<float, 3U> expected; };
+    const std::array cases = {
+        BlendCase{gpu::BlendFactor::zero, gpu::BlendFactor::source_color, {0.14F, 0.20F, 0.08F}},
+        BlendCase{gpu::BlendFactor::source_color, gpu::BlendFactor::zero, {0.04F, 0.25F, 0.64F}},
+        BlendCase{gpu::BlendFactor::source_alpha, gpu::BlendFactor::one_minus_source_alpha, {0.575F, 0.425F, 0.275F}},
+        BlendCase{gpu::BlendFactor::one, gpu::BlendFactor::zero, {0.2F, 0.5F, 0.8F}},
+    };
+    for (const auto& item : cases) {
+        auto blended_descriptor = pipeline_descriptor;
+        blended_descriptor.blend = true;
+        blended_descriptor.source_color = item.src;
+        blended_descriptor.destination_color = item.dst;
+        const auto blended = device.create_pipeline(blended_descriptor);
+        REQUIRE(blended);
+        device_ir::DeviceCommandStream blended_stream;
+        blended_stream.append(device_ir::CmdBeginRendering{color.value(), depth.value()});
+        blended_stream.append(device_ir::CmdClearColor{color.value(), background});
+        blended_stream.append(device_ir::CmdClearDepth{depth.value(), 1.0F});
+        blended_stream.append(device_ir::CmdBindPipeline{blended.value()});
+        blended_stream.append(device_ir::CmdBindVertexBuffer{vertex_buffer.value(), 0U, 16U});
+        blended_stream.append(device_ir::CmdBindIndexBuffer{index_buffer.value(), 0U, device_ir::IndexFormat::uint32});
+        blended_stream.append(device_ir::CmdPushConstants{bytes_of(source)});
+        blended_stream.append(device_ir::CmdDrawIndexed{3U, 1U, 0U, 0, 0U});
+        blended_stream.append(device_ir::CmdEndRendering{});
+        REQUIRE(device.submit(blended_stream));
+        const auto result = device.read_texture_rgba32f(color.value());
+        REQUIRE(result);
+        for (std::size_t channel = 0; channel < 3U; ++channel)
+            REQUIRE(std::abs(result.value()[center + channel] - item.expected[channel]) < 1e-6F);
+        REQUIRE(result.value()[center + 3U] == source[3]);
+        REQUIRE(result.value()[corner + 3U] == background[3]);
+    }
 }
 
 void cpu_reference_copies_bytes_and_rejects_stale_handles() {
