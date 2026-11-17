@@ -34,10 +34,12 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using core::Vec3d;
 // Logical payload bound, excluding driver allocation alignment and staging.
-// A complete 4096-square RGBA8 chain needs about 85.4 MiB.
-constexpr std::uint64_t kMaterialResidentBudget = 96ULL * 1024ULL * 1024ULL;
+// A complete 4096-square RGBA8 chain needs about 85.4 MiB. Allow layered
+// material sets while retaining aggregate admission before GPU allocation.
+constexpr std::uint64_t kMaterialResidentBudget = 256ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaterialStagingBudget = 320ULL * 1024ULL * 1024ULL;
 constexpr const char *kMaterialBudgetError =
-    "GPU material residency byte budget exceeded (96 MiB logical payload); "
+    "GPU material residency byte budget exceeded (256 MiB logical payload); "
     "reduce texture resolution or texture count";
 template <class T> T need(core::Result<T> value) {
     if (!value)
@@ -953,7 +955,7 @@ struct AuthoringViewport::Impl {
         const auto upload = [&](std::shared_ptr<Resources> resources, gpu::TextureDesc desc,
                                 const std::vector<std::uint8_t> &data,
                                 const TextureUploadPlan *plan) {
-            if (frame.material_upload_bytes + data.size() > 128U * 1024U * 1024U)
+            if (frame.material_upload_bytes + data.size() > kMaterialStagingBudget)
                 throw std::runtime_error("GPU material staging budget exceeded");
             if (!staging)
                 staging = std::make_unique<Resources>(*device);

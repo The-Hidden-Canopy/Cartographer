@@ -83,21 +83,45 @@ int main() {
                       << frame.gpu_temporal_resolve_ms << '\n';
         }
         // The same source has different linear and sRGB semantic mip artifacts.
-        // Two full 4K chains exceed the bounded material payload admission.
+        // The raised budget admits two full 4K chains and their upload staging.
         material.revision = material.revision.next();
         material.definition.occlusion = {texture.id, 9};
         okay(catalog.replace_material(material));
-        auto over_budget = f.document;
+        auto layered = f.document;
+        set_materials(layered, catalog);
+        auto layered_source = std::make_shared<const project::ProjectDocument>(layered);
+        const auto two_maps = take(renderer->render(layered_source, r));
+        check(two_maps.material_resident_bytes > 170ULL * 1024 * 1024 &&
+                  two_maps.material_resident_bytes < 256ULL * 1024 * 1024,
+              "two 4K semantic chains fit the raised material budget");
+        const auto layered_cpu = take(production::render_authoring_viewport(layered, r));
+        const auto layered_expected = layered_cpu.linear_hdr[p];
+        const auto layered_actual = two_maps.image.linear_hdr[p];
+        for (auto [a, b] : {std::pair{layered_expected.x, layered_actual.x},
+                            std::pair{layered_expected.y, layered_actual.y},
+                            std::pair{layered_expected.z, layered_actual.z}})
+            check(std::isfinite(b) && std::abs(a - b) < 2e-4 + std::abs(a) * 1e-3,
+                  "two-map GPU color matches CPU reference");
+        const auto layered_warm = take(renderer->render(layered_source, r));
+        check(layered_warm.material_upload_bytes == 0 &&
+                  layered_warm.image.display_rgba8 == two_maps.image.display_rgba8,
+              "two 4K chains reuse resident resources");
+        // Three complete chains consume almost 256 MiB before program words.
+        // They must still be rejected before replacing the last good resources.
+        material.revision = material.revision.next();
+        material.definition.normal = {texture.id, 9};
+        okay(catalog.replace_material(material));
+        auto over_budget = layered;
         set_materials(over_budget, catalog);
         const auto refused = renderer->render(
             std::make_shared<const project::ProjectDocument>(over_budget), r);
         check(!refused && refused.error().message.find("GPU material residency byte budget") !=
                               std::string::npos,
-              "two 4K semantic chains must fail the material budget explicitly");
-        const auto recovered = take(renderer->render(source, r));
+              "three 4K semantic chains plus program words exceed the bounded material budget");
+        const auto recovered = take(renderer->render(layered_source, r));
         check(recovered.material_upload_bytes == 0 &&
-                  recovered.image.display_rgba8 == warm.image.display_rgba8,
-              "rejected replacement preserves the last good 4K texture");
+                  recovered.image.display_rgba8 == layered_warm.image.display_rgba8,
+              "rejected replacement preserves the last good two-map material");
         std::cout << "4K texture mip upload and warm reuse passed; device=" << cold.device_name
                   << "; cold_wall_ms=" << wall_ms
                   << "; upload_bytes=" << cold.material_upload_bytes
