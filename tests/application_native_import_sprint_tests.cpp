@@ -694,6 +694,12 @@ void authoring_publication_workflow(const std::filesystem::path& root) {
     require(!selected.envelope.products.empty(), "publication declares products");
     const auto product_path = selected.revision_path / selected.envelope.products.front().relative_path;
     {
+        // Published products are read-only. This fixture owns the temporary
+        // artifact and explicitly makes it writable to simulate hostile tampering.
+        std::error_code permission_error;
+        std::filesystem::permissions(product_path, std::filesystem::perms::owner_write,
+            std::filesystem::perm_options::add, permission_error);
+        require(!permission_error, "test-owned product can be made writable");
         std::fstream product(product_path, std::ios::binary | std::ios::in | std::ios::out);
         require(bool(product), "test-owned product opens");
         char byte = 0;

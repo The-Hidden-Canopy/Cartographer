@@ -9891,18 +9891,12 @@ core::Result<application::DispatchReceipt> UiController::import_material_texture
         *application_snapshot.project_path, encoded.value(), inspected.value(), limits);
     if (!locator) return fail(locator.error());
 
-    const auto filename = path.filename().u8string();
-    auto name_bytes = std::min<std::size_t>(filename.size(), 128U);
-    while (name_bytes < filename.size() &&
-        (static_cast<unsigned char>(filename[name_bytes]) & 0xc0U) == 0x80U) --name_bytes;
-    const std::string source_name(reinterpret_cast<const char*>(filename.data()), name_bytes);
     auto imported = dispatch(application::ImportMaterialTextureSourceAction{
         application_snapshot.project_revision,
         inspected.value().source.digest,
         inspected.value().format,
         inspected.value().width,
-        inspected.value().height,
-        source_name});
+        inspected.value().height});
     if (!imported) return fail(imported.error());
     return imported;
 }

@@ -104,7 +104,10 @@ int main(int argc, char** argv) try {
     write(base_path, image(40, true)); write(rough_path, image(180)); write(metal_path, image(96));
     take(ui.import_material_texture(base_path)); take(ui.import_material_texture(rough_path)); take(ui.import_material_texture(metal_path));
     snapshot = session.snapshot();
-    check(snapshot.texture_sources[0].name == "painted-checker-é.tga", "UTF-8 source filename retained");
+    check(std::filesystem::is_regular_file(base_path), "UTF-8 original source file preserved");
+    check(snapshot.texture_sources[0].name.find("painted-checker") == std::string::npos &&
+        snapshot.texture_sources[0].relative_locator.find("painted-checker") == std::string::npos,
+        "default import omits private source filename from durable asset metadata");
     definition = current_material().definition;
     definition.base_color.asset = snapshot.texture_sources[0].id;
     definition.emissive = definition.base_color;

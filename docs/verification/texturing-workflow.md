@@ -5,13 +5,20 @@ rebased onto `173a3c0` from `integration/staging-20261112`. The primary checkout
 and other worktrees were not edited. No network access, dependency installation,
 deployment, or schema migration is part of this work.
 
+During subsequent [worktree consolidation](worktree-integration-20261116.md),
+the broader UI suite exposed a default-import privacy regression. Automatic
+filename labels were removed: original files remain untouched, exact bytes
+remain managed, and neutral catalog names preserve the existing pathless
+contract. Explicit caller-supplied labels remain validated. Earlier run and
+visual notes below describe their dated candidate.
+
 ## Inspection before changes
 
 | Area | Existing implementation | Workflow gap addressed here |
 | --- | --- | --- |
 | Material truth | `MaterialCatalog`, `StandardMaterial`, create/update/mesh and face assignment actions; journaled catalog/document commands | Expose existing mapping data consistently and apply finished edits immediately |
 | UVs | Planar projection, triangle relaxation, island packing, unique lightmap candidates, seam/coordinate commands, UV inspector | Reuse these commands; exercise a generated UV set on an existing OBJ |
-| Texture assets | Container inspection, bounded decoding, content-addressed exact source storage, stable-ID reimport | Retain filenames; join generated outputs and separate PBR maps to the same catalog |
+| Texture assets | Container inspection, bounded decoding, content-addressed exact source storage, stable-ID reimport | Preserve original files and pathless defaults; join generated outputs and separate PBR maps to the same catalog |
 | Baking | CPU/D3D12 tiles, AO, normal, bent normal, height, curvature, thickness, world position, surface IDs, immutable receipts | Explicitly adopt supported AO/tangent-normal outputs; never mutate project truth from a worker |
 | Shading | CPU oracle and native D3D12 authoring renderer; base color, packed metallic/roughness, normal, AO, emissive, scalar optical V5 | Add mapping/channel/color-space controls and disclose unsupported paths |
 | Interchange | glTF/GLB embedded images and loss diagnostics; engine-neutral prepared products used by VANTA adapters | Exercise the existing routes with generated catalog maps, without a parallel exporter |
@@ -35,7 +42,8 @@ this baseline. Other worktrees remain untouched.
 2. Open the dockable/detachable Material instrument. Create a material and
    assign it to the selected mesh or faces. Shared mesh instances still share
    face slots; existing locked-instance checks remain in force.
-3. Import maps. The source filename and exact bytes are retained. Bind base
+3. Import maps. Original files remain untouched and exact bytes are copied to
+   managed storage; default catalog names omit source filenames. Bind base
    color, packed metallic/roughness, tangent normal, AO and emissive sources.
    Separate roughness and metallic images can be explicitly packed from their
    red channels, with no implicit resampling or color conversion.
@@ -143,9 +151,9 @@ a dataset/training/promotion claim.
 | Files | Concrete change |
 | --- | --- |
 | `apps/desktop/main.cpp`, `studio_texture_binding.hpp` | Finished-edit live apply, mapping/channel controls, linear roughness/metallic packing, explicit bake adoption, material proposal review/acceptance; Material workspace opens its existing instrument |
-| `libs/application/include/carto/application/application.hpp`, `src/material_texturing.cpp`, `src/application.cpp`, `CMakeLists.txt` | Validated adoption/packing actions; session-bound read-only reviews and human acceptance; filename intake; immutable generated-source policy; journaled catalog commands; Save As copies managed sources |
+| `libs/application/include/carto/application/application.hpp`, `src/material_texturing.cpp`, `src/application.cpp`, `CMakeLists.txt` | Validated adoption/packing actions; session-bound read-only reviews and human acceptance; explicit label intake; immutable generated-source policy; journaled catalog commands; Save As copies managed sources |
 | `libs/project/include/carto/project/material_catalog.hpp`, `src/material_catalog.cpp`, `src/package.cpp` | Validate generated-map provenance digests, retain them in source-blob inventory, copy them during package migration |
-| `libs/ui/include/carto/ui/ui.hpp`, `src/ui.cpp` | Source filename and bake-manifest adapters; shared review/acceptance API with operation/problem feedback |
+| `libs/ui/include/carto/ui/ui.hpp`, `src/ui.cpp` | Pathless texture-file and bake-manifest adapters; shared review/acceptance API with operation/problem feedback |
 | `libs/io/src/gltf_export.cpp` | Permit explicitly material-bound UVs without a separate active-render flag; still reject unresolved authored UVs |
 | `libs/production/src/authoring_material_surface.cpp`, `tests/authoring_surface_tests.cpp` | Match the existing GPU anisotropic sampler and add an independent thin-footprint numerical check; retain the intended isotropic mip check |
 | `tests/texturing_workflow_tests.cpp`, `tests/CMakeLists.txt` | Real-mesh workflow and refusal/rollback boundary coverage |
