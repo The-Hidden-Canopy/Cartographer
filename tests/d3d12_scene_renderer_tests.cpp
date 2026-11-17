@@ -3652,6 +3652,27 @@ void scene_depth_exposure_material_camera_and_lifetimes(d3d12::D3D12Device& devi
         transformed_normal_uv_image.pixel_digest != identity_normal_uv_image.pixel_digest &&
         transformed_normal_uv_image.linear_hdr_rgba != identity_normal_uv_image.linear_hdr_rgba,
         "normal-map UV affine changes sampling and the derived tangent frame");
+    // Both halves of the packed vertex attribute must remain independent.
+    auto paired_uvs = independent_uvs;
+    paired_uvs.objects[0U].materials[0U].current_material.definition.normal = normal_binding;
+    paired_uvs.textures.push_back(texture_grid(normal_map_id, assets::TextureSemantic::normal));
+    rebind(paired_uvs.objects[0U]);
+    const auto paired_image = capture(device, paired_uvs);
+    for (const bool change_normal : {false, true}) {
+        auto changed_uvs = paired_uvs;
+        auto& changed = changed_uvs.objects[0U].materials[0U].current_material.definition;
+        if (change_normal) changed.normal.transform = {};
+        else changed.metallic_roughness.transform = {};
+        rebind(changed_uvs.objects[0U]);
+        const auto changed_image = capture(device, changed_uvs);
+        require(changed_image.linear_hdr_rgba != paired_image.linear_hdr_rgba,
+            "each packed UV pair independently controls its own material sampling");
+    }
+    d3d12::SceneRenderCache paired_cache;
+    const auto paired_cached = take(d3d12::render_scene_cached(
+        device, paired_cache, paired_uvs, CARTO_D3D12_SHADER_DIR));
+    require(paired_cached.linear_hdr_rgba == paired_image.linear_hdr_rgba,
+        "packed distinct UV streams preserve cached/fresh pixel parity");
     auto open_gl_normal_uvs = normal_uvs;
     open_gl_normal_uvs.objects[0U].materials[0U].current_material.definition.normal.
         normal_convention = render::NormalConvention::opengl_y_plus;
@@ -5586,6 +5607,7 @@ int main(int argc, char** argv) {
             std::cout << "PASS scene source/texture/camera/budget admission boundaries\n";
         }
         auto device = take(d3d12::D3D12Device::create({{}, false, true}));
+        std::cout << "D3D12 adapter: " << device->identity().adapter_name << "\n";
         scene_render_uses_independent_material_slot_samplers(*device);
         std::cout << "PASS independent per-slot sampler pixels and cache parity\n";
         scene_render_cache_reuses_programs_meshes_materials_and_targets(*device);

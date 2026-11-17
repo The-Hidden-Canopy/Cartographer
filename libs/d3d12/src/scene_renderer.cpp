@@ -49,6 +49,8 @@ static_assert(offsetof(ScenePbrUploadVertex, tangent) == 36U);
 static_assert(offsetof(ScenePbrUploadVertex, light_position) == 52U);
 static_assert(offsetof(ScenePbrUploadVertex, metallic_roughness_uv) == 68U);
 static_assert(offsetof(ScenePbrUploadVertex, normal_uv) == 76U);
+static_assert(offsetof(ScenePbrUploadVertex, normal_uv) ==
+    offsetof(ScenePbrUploadVertex, metallic_roughness_uv) + sizeof(std::array<float, 2U>));
 static_assert(offsetof(ScenePbrUploadVertex, occlusion_uv) == 84U);
 static_assert(offsetof(ScenePbrUploadVertex, emissive_uv) == 92U);
 static_assert(offsetof(ScenePbrUploadVertex, camera_clearcoat) == 100U);
@@ -976,8 +978,8 @@ Result<SceneProgram> build_scene_program(
         {"TEXCOORD", 0U, gpu::VertexFormat::float2, 28U, 0U},
         {"TANGENT", 0U, gpu::VertexFormat::float4, 36U, 0U},
         {"TEXCOORD", 1U, gpu::VertexFormat::float4, 52U, 0U},
-        {"TEXCOORD", 2U, gpu::VertexFormat::float2, 68U, 0U},
-        {"TEXCOORD", 3U, gpu::VertexFormat::float2, 76U, 0U},
+        // Adjacent UV pairs share an input attribute; uploaded bytes and UV semantics are unchanged.
+        {"TEXCOORD", 2U, gpu::VertexFormat::float4, 68U, 0U},
         {"TEXCOORD", 4U, gpu::VertexFormat::float2, 84U, 0U},
         {"TEXCOORD", 5U, gpu::VertexFormat::float2, 92U, 0U},
         {"TEXCOORD", 6U, gpu::VertexFormat::float4, 100U, 0U},

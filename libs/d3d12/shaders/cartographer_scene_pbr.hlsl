@@ -57,8 +57,8 @@ struct VertexInput
     float2 uv : TEXCOORD0;
     float4 tangent : TANGENT;
     float4 light_position : TEXCOORD1;
-    float2 metallic_roughness_uv : TEXCOORD2;
-    float2 normal_uv : TEXCOORD3;
+    // xy: metallic-roughness UV; zw: independently transformed normal UV.
+    float4 metallic_roughness_normal_uv : TEXCOORD2;
     float2 occlusion_uv : TEXCOORD4;
     float2 emissive_uv : TEXCOORD5;
     float4 camera_clearcoat : TEXCOORD6;
@@ -118,8 +118,8 @@ VertexOutput VSMain(VertexInput input)
         mul((float3x3)model, input.tangent.xyz), fallback_tangent);
     output.tangent_sign = input.tangent.w * orientation;
     output.light_position = input.light_position;
-    output.metallic_roughness_uv = input.metallic_roughness_uv;
-    output.normal_uv = input.normal_uv;
+    output.metallic_roughness_uv = input.metallic_roughness_normal_uv.xy;
+    output.normal_uv = input.metallic_roughness_normal_uv.zw;
     output.occlusion_uv = input.occlusion_uv;
     output.emissive_uv = input.emissive_uv;
     output.camera_clearcoat = input.camera_clearcoat;
