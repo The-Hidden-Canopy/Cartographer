@@ -223,8 +223,10 @@ void masked_fur_mips_retain_coverage_and_exclude_matte_color() {
     invisible_material.alpha_mode = render::AlphaMode::masked;
     invisible_material.alpha_cutoff = .63;
     replace(invisible_catalog,invisible_material);
-    const auto invisible = at(compile(invisible_catalog,library),.5,.5,{1,0}).material;
+    const auto invisible_program = compile(invisible_catalog,library);
+    const auto invisible = at(invisible_program,.5,.5,{1,0},{0,2}).material;
     near(invisible.base_color_factor.w,0);
+    near(at(invisible_program,.5,.5,{1,0}).material.base_color_factor.w,50.0/255.0);
     const auto decoded = take(assets::decode_texture_rgba8(p.encoded));
     check(!assets::generate_rgba8_mips(decoded,
         {assets::TextureSemantic::base_color,assets::ColorSpace::srgb,false,161,true}),

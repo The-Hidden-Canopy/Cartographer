@@ -123,9 +123,49 @@ are intentionally retained after directory cleanup.
 
 ## Validation and final cleanup
 
-Pending completion of the combined candidate's native checks. Test results,
-exact promoted commit and cleanup totals will replace this paragraph before
-the ledger is finalized. Earlier per-feature visual observations in
-`texturing-workflow.md`, `masked-fur-mip-filter.md` and
-`preview-thin-strand-sampling.md` are historical evidence; the combined merge
-has not received a new interactive visual acceptance run.
+The Release CLI and desktop build succeeded. The selected set contains 85
+native CTest cases. The final broad run passed 83 and exposed two remaining
+fixture issues; after test-only corrections, both passed on targeted rerun
+(11.95 seconds). All 85 selected cases therefore have passing final evidence;
+this is not a claim that the entire 278-case repository suite ran.
+
+- `integration-tests-final.log`: broad run, 83 passed; its two failures remain
+  visible rather than being replaced with a success claim.
+- `integration-fixture-rerun.log`: native scene import/publication tampering and
+  authoring surface CPU/GPU tests both passed after their final rebuild.
+- `integration-build-final.log` and `integration-fixture-build.log`: successful
+  builds; non-fatal compiler warnings remain in the logs.
+- Coverage includes the real First Block OBJ through UVs, imported maps, AO and
+  normal bake adoption, assignment, CPU inspection, save/reopen/Save As,
+  glTF/GLB export/reimport and prepared publication; Agent Workbench/edge
+  command boundaries; actual journal I/O fault/reopen rejection; autorig
+  admission; UI pathless-import privacy; preview return/input/layout; native
+  GPU parity, two-sided shading, masked-mip cache separation and 4K admission.
+- A Windows dependency-symlink subcase explicitly skipped because this process
+  lacks symlink privilege. No claim is made for that subcase. Other products'
+  Python/npm suites, external VANTA runtime admission, the remaining native
+  suites and a new interactive visual pass were not run for this consolidation.
+  Earlier visual observations in the linked per-feature ledgers remain dated
+  evidence, not acceptance of the combined GUI.
+
+Pressure-driven repairs: `8603fd1` corrected masked-mip fixtures to declare
+isotropic derivatives while retaining numeric thin-footprint checks. The
+follow-up extends the same distinction to fully rejected transparent texels.
+The broader UI suite exposed automatic filename labels as a pathless-import
+regression; `690f858` restored neutral defaults and kept original files intact.
+The native publication tampering fixture now uses `core::native_io_path` for
+nested Windows paths. Its initially suspected read-only explanation was not
+confirmed; the permission workaround was removed. Production publication
+permissions and validation are unchanged, and tampered bytes still reject.
+The recovered documentation's workstation paths were replaced with
+placeholders in the unpublished recovery commit; exact originals remain in
+the local archives. Initial missing test/CLI fixture binaries were built before
+the complete selected run; those setup failures are retained in the logs.
+
+The publication audit passed on the reconciled history through `8603fd1` with
+`--ref HEAD --check-ignore-policy --fail-on-review`. The final primary checkout
+will receive the same check after cleanup; its result is recorded below.
+Source file manifests, final binary/evidence hashes and cleanup results are
+retained in the primary checkout's ignored integration archive.
+
+Cleanup completion is recorded after the verified removals below.

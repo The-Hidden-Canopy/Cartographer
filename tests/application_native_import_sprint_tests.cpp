@@ -1,5 +1,6 @@
 #include <carto/application/application.hpp>
 #include <carto/assets/blob_store.hpp>
+#include <carto/core/filesystem.hpp>
 #include <carto/journal/journal.hpp>
 #include <carto/io/gltf_export.hpp>
 #include <carto/project/package.hpp>
@@ -694,13 +695,13 @@ void authoring_publication_workflow(const std::filesystem::path& root) {
     require(!selected.envelope.products.empty(), "publication declares products");
     const auto product_path = selected.revision_path / selected.envelope.products.front().relative_path;
     {
-        // Published products are read-only. This fixture owns the temporary
-        // artifact and explicitly makes it writable to simulate hostile tampering.
-        std::error_code permission_error;
-        std::filesystem::permissions(product_path, std::filesystem::perms::owner_write,
-            std::filesystem::perm_options::add, permission_error);
-        require(!permission_error, "test-owned product can be made writable");
-        std::fstream product(product_path, std::ios::binary | std::ios::in | std::ios::out);
+        // Publication paths can exceed MAX_PATH under a nested worktree.
+        // Use the same native path adapter as production for this owned fixture.
+        std::error_code path_error;
+        const auto native_product_path = core::native_io_path(product_path, path_error);
+        require(!path_error && std::filesystem::is_regular_file(native_product_path),
+            "test-owned publication product exists at its native path");
+        std::fstream product(native_product_path, std::ios::binary | std::ios::in | std::ios::out);
         require(bool(product), "test-owned product opens");
         char byte = 0;
         product.read(&byte, 1);
@@ -762,7 +763,10 @@ int main(int argc, char** argv) {
         ui_default_material_projection(root / "projection");
         ui_external_buffer_capture(root / "external");
         authoring_publication_workflow(root / "workflow");
-        std::filesystem::remove_all(root);
+        std::error_code cleanup_error;
+        const auto cleanup_root = core::native_io_path(root, cleanup_error);
+        require(!cleanup_error, "test-owned cleanup path resolves");
+        std::filesystem::remove_all(cleanup_root);
         std::cout << "import sprint regression source complete\n";
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }
