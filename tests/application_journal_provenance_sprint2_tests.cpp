@@ -10,7 +10,11 @@
 #endif
 #include <carto/journal/journal.hpp>
 #include <carto/project/recovery.hpp>
+#include <carto/project/transaction.hpp>
+#include <carto/geometry/primitives.hpp>
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -99,11 +103,156 @@ void malformed_v2(const std::filesystem::path& root) {
         check(!project::recover_latest_snapshot(journal), "malformed V2 metadata refused");
     }
 }
+
+void transaction_journal_open(const std::filesystem::path& root) {
+    using namespace application;
+    const auto path = root / "transaction.carto";
+    auto document = project::ProjectDocument::create("transaction");
+    check(bool(document), "transaction project");
+    journal::Journal journal(std::filesystem::path(path.string() + ".journal"));
+    const auto initial = document.value().serialize();
+    const auto checkpoint = "CARTOGRAPHER_PROJECT_SNAPSHOT_V1\ndocument_bytes=" +
+        std::to_string(initial.size()) + "\n" + initial;
+    check(bool(journal.append({{}, document.value().revision(), "cartographer.snapshot",
+        {reinterpret_cast<const std::uint8_t*>(checkpoint.data()), checkpoint.size()}, {}})), "initial journal");
+    auto tx = project::ProjectTransaction::begin(document.value(), journal, "artist");
+    check(bool(tx) && bool(tx.value().create_object("fur")), "transaction edit");
+    check(bool(tx.value().commit("study.fur")), "transaction commit");
+    check(bool(document.value().save_atomic(path)), "transaction save");
+    const auto before = journal.read_all();
+    check(before && before.value().back().event_type == "study.fur", "transaction event retained");
+    ApplicationSession session;
+    check(bool(HumanApplicationAccess::dispatch(session, OpenProjectAction{path})), "open transaction journal");
+    check(bool(HumanApplicationAccess::dispatch(session, CreateBoxAction{"continued", {1,1,1}})),
+        "edit after transaction open");
+    const auto after = journal.read_all();
+    check(after && after.value().size() == before.value().size()+1 &&
+        after.value()[before.value().size()-1].payload == before.value().back().payload &&
+        after.value().back().event_type == "cartographer.application_action", "journal lineage retained");
+    check(bool(HumanApplicationAccess::dispatch(session, SaveProjectAction{})), "save continued edit");
+    ApplicationSession reopened;
+    check(bool(HumanApplicationAccess::dispatch(reopened, OpenProjectAction{path})), "reopen continued edit");
+    check(reopened.snapshot().project_revision == session.snapshot().project_revision,
+        "continued project revision preserved");
+}
+
+void malformed_transaction_open(const std::filesystem::path& root) {
+    using namespace application;
+    const std::vector<std::pair<std::string,std::string>> cases{
+        {"actor=\noperation=study.fur\n", "study.fur"},
+        {"actor=bad\tactor\noperation=study.fur\n", "study.fur"},
+        {"actor=" + std::string(257,'a') + "\noperation=study.fur\n", "study.fur"},
+        {"actor=artist\noperation=other\n", "study.fur"},
+        {"actor=artist\noperation=study.fur\nextra=bad\n", "study.fur"},
+        {"actor=artist\noperation=study.fur\n", "cartographer.application_action"}};
+    for (std::size_t i=0; i<cases.size(); ++i) {
+        auto document = project::ProjectDocument::create("invalid transaction");
+        check(bool(document), "invalid transaction project");
+        const auto path = root / ("invalid-transaction-"+std::to_string(i)+".carto");
+        check(bool(document.value().save_atomic(path)), "save invalid transaction fixture");
+        const auto snapshot = document.value().serialize();
+        const auto payload = "CARTOGRAPHER_PROJECT_TRANSACTION_V1\n"+cases[i].first+
+            "document_bytes="+std::to_string(snapshot.size())+"\n"+snapshot;
+        journal::Journal journal(std::filesystem::path(path.string()+".journal"));
+        check(bool(journal.append({{},document.value().revision(),cases[i].second,
+            {reinterpret_cast<const std::uint8_t*>(payload.data()),payload.size()}, {}})), "append malformed transaction");
+        ApplicationSession session;
+        check(!HumanApplicationAccess::dispatch(session,OpenProjectAction{path}), "invalid transaction refused");
+    }
+    auto saved = project::ProjectDocument::create("saved");
+    auto other = project::ProjectDocument::create("different same-revision document");
+    check(saved && other && saved.value().revision() == other.value().revision(), "stale fixture");
+    const auto path = root / "stale-transaction.carto";
+    check(bool(saved.value().save_atomic(path)), "save stale fixture");
+    const auto snapshot = other.value().serialize();
+    const auto payload = "CARTOGRAPHER_PROJECT_TRANSACTION_V1\nactor=artist\noperation=study.fur\n"
+        "document_bytes=" + std::to_string(snapshot.size()) + "\n" + snapshot;
+    journal::Journal journal(std::filesystem::path(path.string()+".journal"));
+    check(bool(journal.append({{},saved.value().revision(),"study.fur",
+        {reinterpret_cast<const std::uint8_t*>(payload.data()),payload.size()}, {}})), "append stale snapshot");
+    ApplicationSession session;
+    check(!HumanApplicationAccess::dispatch(session,OpenProjectAction{path}), "same-revision different snapshot refused");
+}
+
+void parented_mesh_reuse(const std::filesystem::path& root, bool ancestor_visible, bool ancestor_locked,
+                         bool overflow=false) {
+    using namespace application;
+    const auto path=root/(std::string("parented-")+(ancestor_visible?"visible":"hidden")+
+                           (ancestor_locked?"-locked":"-unlocked")+(overflow?"-overflow":"")+".carto");
+    auto document=project::ProjectDocument::create("parented eye fixture");
+    check(bool(document),"create parented project");
+    journal::Journal journal(std::filesystem::path(path.string()+".journal"));
+    const auto initial=document.value().serialize();
+    const auto envelope="CARTOGRAPHER_PROJECT_SNAPSHOT_V1\ndocument_bytes="+
+        std::to_string(initial.size())+"\n"+initial;
+    check(bool(journal.append({{},document.value().revision(),"cartographer.snapshot",
+        {reinterpret_cast<const std::uint8_t*>(envelope.data()),envelope.size()}, {}})),"parented checkpoint");
+    auto tx=project::ProjectTransaction::begin(document.value(),journal,"fixture");
+    check(bool(tx),"parented transaction");
+    auto box=geometry::make_box({1,1,1}); check(bool(box),"parented mesh");
+    const auto asset=tx.value().add_mesh(std::move(box.value())); check(bool(asset),"parented asset");
+    core::Transform anchor=core::Transform::identity();
+    anchor.translation={3,4,5}; anchor.rotation={0,0,.7071067811865475,.7071067811865475};
+    anchor.scale={overflow?1e308:2,.5,1};
+    check(bool(tx.value().insert_object({scene::ObjectId{1},"Anchor",anchor,{}, {},ancestor_visible,ancestor_locked})),"insert anchor");
+    check(bool(tx.value().insert_object({scene::ObjectId{2},"Eye parent",core::Transform::identity(),scene::ObjectId{1},{},true,false})),"insert eye parent");
+    core::Transform local=core::Transform::identity(); local.translation={.1,.2,.3};
+    check(bool(tx.value().insert_object({scene::ObjectId{3},"Globe",local,scene::ObjectId{2},asset.value(),true,false})),"insert globe");
+    check(bool(tx.value().commit("fixture.parented")),"commit parented fixture");
+    check(bool(document.value().save_atomic(path)),"save parented fixture");
+    ApplicationSession session;
+    check(bool(HumanApplicationAccess::dispatch(session,OpenProjectAction{path})),"open parented fixture");
+    const auto before=session.snapshot();
+    const auto before_entries=journal.read_all(); check(bool(before_entries),"read parented journal");
+    const DuplicateMeshInstanceAction action{scene::ObjectId{3},"Globe copy",{overflow?10.:.4,.5,.6}};
+    check(!session.dispatch(HumanActionAdmission{}, action, OperationSource::ai_proposal, "unapproved parent scope"),
+          "AI cannot expand scope into parent hierarchy");
+    check(session.snapshot().project_revision==before.project_revision,"AI refusal preserves project");
+    const auto result=HumanApplicationAccess::dispatch(session,action);
+    if (!ancestor_visible || ancestor_locked || overflow) {
+        check(!result && session.snapshot().project_revision==before.project_revision &&
+              journal.read_all().value().size()==before_entries.value().size(),"invalid hierarchy refuses without journal mutation");
+        return;
+    }
+    check(bool(result),"human can duplicate parented mesh");
+    auto snapshot=session.snapshot();
+    const auto found=std::find_if(snapshot.objects.begin(),snapshot.objects.end(),
+        [](const auto& view){ return view.object.name=="Globe copy"; });
+    check(found!=snapshot.objects.end(),"duplicate found");
+    const auto copy=found->object;
+    check(copy.parent==std::optional<scene::ObjectId>{scene::ObjectId{2}} && copy.mesh_asset==asset.value() &&
+        std::abs(copy.local_transform.translation.x-.5)<1e-9 &&
+        std::abs(copy.local_transform.translation.y-.7)<1e-9 &&
+        std::abs(copy.local_transform.translation.z-.9)<1e-9,"sibling shares mesh and local offset");
+    auto entries=journal.read_all();
+    check(entries && entries.value().size()==before_entries.value().size()+1 &&
+          entries.value().back().event_type=="cartographer.application_action", "duplicate journal event");
+    check(bool(HumanApplicationAccess::dispatch(session,UndoAction{})),"undo parented duplicate");
+    check(session.snapshot().objects.size()==3,"undo preserves source hierarchy");
+    check(bool(HumanApplicationAccess::dispatch(session,RedoAction{})),"redo parented duplicate");
+    check(bool(HumanApplicationAccess::dispatch(session,SaveProjectAction{})),"save parented duplicate");
+    const auto saved=project::ProjectDocument::load(path);
+    check(bool(saved),"load parented duplicate for transform check");
+    const auto source_world=saved.value().scene().world_transform(scene::ObjectId{3});
+    const auto copy_world=saved.value().scene().world_transform(copy.id);
+    check(source_world && copy_world &&
+          std::abs((copy_world.value().translation.x-source_world.value().translation.x)+.25)<1e-9 &&
+          std::abs((copy_world.value().translation.y-source_world.value().translation.y)-.8)<1e-9 &&
+          std::abs((copy_world.value().translation.z-source_world.value().translation.z)-.6)<1e-9,
+          "local offset follows rotated and scaled ancestor");
+    ApplicationSession reopened;
+    check(bool(HumanApplicationAccess::dispatch(reopened,OpenProjectAction{path})),"reopen parented duplicate");
+    const auto again=reopened.snapshot();
+    const auto restored=std::find_if(again.objects.begin(),again.objects.end(),
+        [&](const auto& view){ return view.object.id==copy.id; });
+    check(restored!=again.objects.end() && restored->object.parent==copy.parent &&
+          restored->object.mesh_asset==copy.mesh_asset,"parented duplicate survives reopen");
+}
 }
 int main() {
     const auto dir = std::filesystem::temp_directory_path() /
         ("carto-provenance-sprint2-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    try { std::filesystem::create_directories(dir); legacy_recovery(dir); human_attribution_gate(dir); malformed_v2(dir); std::filesystem::remove_all(dir); }
+    try { std::filesystem::create_directories(dir); legacy_recovery(dir); human_attribution_gate(dir); malformed_v2(dir); transaction_journal_open(dir); malformed_transaction_open(dir); parented_mesh_reuse(dir,true,false); parented_mesh_reuse(dir,false,false); parented_mesh_reuse(dir,true,true); parented_mesh_reuse(dir,true,false,true); std::filesystem::remove_all(dir); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
     catch (...) { std::cerr << "unknown provenance test failure\n"; return 1; }
     return 0;

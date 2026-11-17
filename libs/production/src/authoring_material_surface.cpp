@@ -10,6 +10,7 @@
 #include <new>
 #include <set>
 #include <stdexcept>
+#include <tuple>
 
 namespace carto::production {
 namespace {
@@ -207,7 +208,7 @@ struct AuthoringTextureLibrary::Impl {
     struct Entry {
         project::TextureSourceRecord record;
         assets::DecodedRgba8Texture decoded;
-        std::map<std::pair<assets::TextureSemantic, assets::ColorSpace>,
+        std::map<std::tuple<assets::TextureSemantic, assets::ColorSpace, std::optional<std::uint8_t>>,
                  std::shared_ptr<const assets::Rgba8MipChain>>
             mips;
     };
@@ -251,7 +252,8 @@ core::Result<void> AuthoringTextureLibrary::admit(const project::TextureSourceRe
 }
 core::Result<std::shared_ptr<const assets::Rgba8MipChain>>
 AuthoringTextureLibrary::prepare(const project::TextureSourceRecord &record,
-                                 assets::TextureSemantic semantic, assets::ColorSpace space) const {
+                                 assets::TextureSemantic semantic, assets::ColorSpace space,
+                                 std::optional<std::uint8_t> masked_color_cutoff) const {
     using Result = core::Result<std::shared_ptr<const assets::Rgba8MipChain>>;
     try {
         std::lock_guard lock(impl_->mutex);
@@ -264,11 +266,13 @@ AuthoringTextureLibrary::prepare(const project::TextureSourceRecord &record,
             found->second.record.format != record.format)
             throw std::runtime_error("texture source is missing or stale in the decoded library");
         auto &entry = found->second;
-        const auto key = std::pair{semantic, space};
+        const auto key = std::tuple{semantic, space, masked_color_cutoff};
         if (const auto ready = entry.mips.find(key); ready != entry.mips.end())
             return Result::success(ready->second);
         auto mip = std::make_shared<const assets::Rgba8MipChain>(need(assets::generate_rgba8_mips(
-            entry.decoded, {semantic, space}, authoring_texture_limits())));
+            entry.decoded, {semantic, space, masked_color_cutoff.has_value(),
+                masked_color_cutoff.value_or(128U), masked_color_cutoff.has_value()},
+            authoring_texture_limits())));
         if (impl_->mip_bytes + mip->resident_bytes() > kMipBudget)
             throw std::runtime_error("semantic mip library budget exceeded");
         entry.mips.emplace(key, mip);
@@ -535,7 +539,19 @@ compile_authoring_material(const project::MaterialCatalog &catalog, render::Mate
                     bound.sampler = sampler->second;
                     need(bound.sampler.validate());
                 }
-                bound.mips = need(library->prepare(record->second, semantic, space));
+                std::optional<std::uint8_t> masked_color_cutoff;
+                // A fragment graph may replace alpha independently of this
+                // map, so only derive coverage for direct, constant-factor
+                // base-color bindings whose mask predicate is known here.
+                const auto alpha = program->base.base_color_factor.w;
+                const auto cutoff = program->base.alpha_cutoff;
+                if (slot == 0 && program->base.alpha_mode == render::AlphaMode::masked &&
+                    !catalog.material_graph_bindings().contains(id) && cutoff > 0 && alpha >= cutoff) {
+                    unsigned threshold = 1;
+                    while (threshold < 255 && double(threshold) / 255.0 * alpha < cutoff) ++threshold;
+                    masked_color_cutoff = static_cast<std::uint8_t>(threshold);
+                }
+                bound.mips = need(library->prepare(record->second, semantic, space, masked_color_cutoff));
                 program->maps[slot] = static_cast<unsigned>(program->textures.size());
                 program->textures.push_back(std::move(bound));
             }

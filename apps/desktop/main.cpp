@@ -44,6 +44,7 @@
 #include "studio_file_picker.hpp"
 #include "studio_native_chrome.hpp"
 #include "studio_scene_camera.hpp"
+#include "studio_rendered_preview.hpp"
 #include "studio_style.hpp"
 #include "studio_draft.hpp"
 #include "studio_environment_import.hpp"
@@ -3201,10 +3202,12 @@ struct DesktopState {
 
     ApplicationSession session;
     bool material_viewport_enabled = false;
-    // Queueing a CPU frame does not prove that it replaced the preview on
-    // screen. Once preview is enabled, keep viewport editing paused for this
-    // session until displayed-frame identity can be established safely.
-    bool viewport_edit_requires_restart = false;
+    // Rendered pixels do not share a verified picking projection. Pause
+    // editing until a current live canvas frame is presented again.
+    bool viewport_edit_paused = false;
+    carto::studio::PreviewReturnGate preview_return_gate;
+    std::optional<carto::studio::PreviewReturnFrame> preview_return_candidate;
+    bool preview_return_final_layout = false;
     bool viewport_controls_open = false;
     bool shared_rigs_open = false;
     bool shared_rig_rights_confirmed = false;
@@ -8674,7 +8677,7 @@ struct DesktopState {
     }
 
     bool route_native_pointer(const carto::ui::NativePointerEvent& event) {
-        if (material_viewport_enabled || viewport_edit_requires_restart) return false;
+        if (material_viewport_enabled || viewport_edit_paused) return false;
         if (mesh_loop_cut_seed_pick_active) {
             return route_native_loop_cut_seed_pick(event);
         }
@@ -11120,6 +11123,36 @@ struct DesktopState {
         draw_action_feedback(snapshot,false);ImGui::End();
     }
 
+    [[nodiscard]] carto::studio::PreviewReturnFrame preview_return_frame(
+        const UiSnapshot& snapshot) const {
+        const auto* main_viewport = ImGui::GetMainViewport();
+        if (!main_viewport || !native_viewport_hits.valid ||
+            native_viewport_hits.scene_source != carto::ui::ViewportSceneSource::live_project ||
+            native_viewport_hits.project_generation != snapshot.project_generation ||
+            native_viewport_hits.project_revision != snapshot.project_revision) return {};
+        return {snapshot.project_generation, snapshot.project_revision.value(),
+            native_viewport_hits.screen_origin.x, native_viewport_hits.screen_origin.y,
+            native_viewport_hits.extent.x, native_viewport_hits.extent.y,
+            main_viewport->Pos.x, main_viewport->Pos.y,
+            main_viewport->Size.x, main_viewport->Size.y};
+    }
+
+    void note_preview_return_presented(bool presented) {
+        if (preview_return_candidate &&
+            *preview_return_candidate != preview_return_frame(ui.snapshot()))
+            preview_return_candidate.reset();
+        preview_return_gate.observe(presented, material_viewport_enabled, preview_return_candidate);
+        const bool gesture_active = native_transform_drag.has_value() || native_sculpt_stroke.has_value() ||
+            native_knife_stroke.has_value() || native_condition_gizmo_drag.has_value() ||
+            work_surface_camera_panning || ImGui::IsAnyMouseDown();
+        if (preview_return_candidate && preview_return_gate.finish_resume(
+                preview_return_final_layout, material_viewport_enabled, gesture_active,
+                *preview_return_candidate)) {
+            native_viewport_hits.reset();
+            viewport_edit_paused = false;
+        }
+    }
+
     void draw_toolbar(const UiSnapshot& snapshot) {
         heading_text("Work surface");
         ImGui::SameLine();
@@ -11130,8 +11163,11 @@ struct DesktopState {
         ImGui::BeginDisabled(gesture_active);
         if (ImGui::Checkbox("Rendered viewport", &material_viewport_enabled)) {
             // The displayed image cannot be correlated with an input event.
-            viewport_edit_requires_restart = true;
-            native_viewport_hits.interactive = false;
+            viewport_edit_paused = true;
+            if (material_viewport_enabled) preview_return_gate.cancel();
+            else preview_return_gate.request_mode_exit(
+                snapshot.project_generation, snapshot.project_revision.value());
+            native_viewport_hits.reset();
         }
         ImGui::EndDisabled();
         if (gesture_active && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -11141,32 +11177,50 @@ struct DesktopState {
         ImGui::Checkbox("Rendered viewport", &material_viewport_enabled);
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("Rendered viewport is unavailable in this build.");
+            ImGui::SetTooltip("Rendered viewport is not included in this build. "
+                "On Windows, use the desktop-render-preview-release CMake preset.");
 #endif
-        if (viewport_edit_requires_restart) {
-            ImGui::TextWrapped("Viewport editing is paused after rendered preview. Save your work and restart to resume viewport editing.");
+        preview_return_final_layout = viewport_edit_paused && !material_viewport_enabled &&
+            preview_return_gate.pending();
+        if (viewport_edit_paused && !preview_return_gate.pending()) {
+            if (material_viewport_enabled) {
+                ImGui::TextUnformatted("Preview only. Turn it off to return to viewport editing.");
+            } else {
+                const bool return_gesture_active = native_transform_drag.has_value() ||
+                    native_sculpt_stroke.has_value() || native_knife_stroke.has_value() ||
+                    native_condition_gizmo_drag.has_value() || work_surface_camera_panning;
+                const bool ready = preview_return_gate.may_resume(false, return_gesture_active,
+                    preview_return_frame(snapshot));
+                ImGui::BeginDisabled(!ready);
+                if (ImGui::Button("Resume viewport editing") &&
+                    preview_return_gate.request_resume(false, return_gesture_active, preview_return_frame(snapshot))) {
+                    native_viewport_hits.reset();
+                }
+                ImGui::EndDisabled();
+                if (!ready && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("Wait for the current live canvas to be presented; finish any pointer gesture first.");
+            }
         }
         if (material_viewport_enabled) {
 #ifdef CARTO_DESKTOP_RESIDENT_WORKER
-            ImGui::TextWrapped("Rendered preview is capped at 1,048,576 pixels and uses temporal history.");
+            ImGui::TextWrapped("Rendered preview is resolution-limited and uses temporal history.");
 #else
-            ImGui::TextWrapped("Readback preview is capped at 1,048,576 pixels and has no temporal accumulation.");
+            ImGui::TextWrapped("Readback preview is resolution-limited and has no temporal accumulation.");
 #endif
-            // Status must not resize the canvas whose extent is part of the
-            // worker request key. Removing this row on completion invalidated
-            // the completed frame and could keep readback in a retry loop.
             const bool current_frame_displayed = material_viewport_displayed && material_viewport_image &&
                 material_viewport_generation == snapshot.project_generation &&
                 material_viewport_image->source_revision == snapshot.project_revision;
-            const char* idle_status = current_frame_displayed ? "Ready" : "Awaiting current frame";
-            std::string status = material_viewport_diagnostic.empty()
-                ? idle_status : material_viewport_diagnostic;
-            std::replace(status.begin(), status.end(), '\n', ' ');
-            std::replace(status.begin(), status.end(), '\r', ' ');
-            ImGui::Text("Rendered preview: %s", status.c_str());
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", material_viewport_diagnostic.empty()
-                ? idle_status : material_viewport_diagnostic.c_str());
+            const auto& environment = snapshot.presentation_catalog.environment();
+            const bool no_scene_illumination = snapshot.presentation_catalog.lights().empty() &&
+                (!environment || !environment->enabled || environment->intensity <= 0.0);
+            const std::string_view preview_status = current_frame_displayed &&
+                material_viewport_diagnostic.empty() && no_scene_illumination
+                ? "No authored light or environment; surfaces may render black."
+                : std::string_view{material_viewport_diagnostic};
+            carto::studio::draw_rendered_preview_status(preview_status, current_frame_displayed);
         }
+        // Keep status text independent of control placement. Long diagnostics
+        // must not push the environment and camera controls out of view.
         if (!material_viewport_enabled) ImGui::SameLine();
         if (ImGui::Button("Environment")) ImGui::OpenPopup("Environment lighting");
         draw_environment_controls(snapshot);
@@ -11963,7 +12017,7 @@ struct DesktopState {
         if (ImGui::CollapsingHeader("Display & shading")) {
             if (material_viewport_enabled) {
                 ImGui::SetNextItemWidth(72.0F);
-                ImGui::Combo("Render scale", &material_viewport_scale, "100%\0 50%\0 25%\0");
+                ImGui::Combo("Render scale", &material_viewport_scale, "200% (fine detail)\0 100%\0 50%\0 25%\0");
             }
             const bool geometry_visible = viewport_projected_geometry_last_frame;
             int selected_spatial = static_cast<int>(viewport_view.spatial);
@@ -12036,7 +12090,7 @@ struct DesktopState {
             snapshot.agent_task->status != carto::agent::TaskStatus::rejected;
         const bool space_pan_active = ImGui::IsKeyDown(ImGuiKey_Space);
         native_viewport_hits.interactive =
-            !material_viewport_enabled && !viewport_edit_requires_restart &&
+            !material_viewport_enabled && !viewport_edit_paused &&
             (!showing_agent_preview || ghost_edit_available) && !work_surface_pan_tool_active &&
             !perspective_camera_orbit_tool_active &&
             !space_pan_active && !condition_kinematic_pose_preview_enabled &&
@@ -12407,7 +12461,6 @@ struct DesktopState {
             request.temporal.enabled = !material_viewport_cpu_reference;
             request.temporal.session = snapshot.project_generation;
 #endif
-            const double scale = std::array{1.0, 0.5, 0.25}[static_cast<std::size_t>(material_viewport_scale)];
             std::uint64_t max_pixels = carto::production::kAuthoringCpuMaxPixels;
 #if defined(CARTO_DESKTOP_ASYNC_READBACK) || defined(CARTO_DESKTOP_RESIDENT_WORKER)
             max_pixels = carto::production::kAuthoringNativeMaxPixels;
@@ -12416,23 +12469,16 @@ struct DesktopState {
             max_pixels = material_viewport_cpu_reference ? carto::production::kAuthoringCpuMaxPixels
                 : carto::production::kAuthoringNativeMaxPixels;
 #endif
-            const double max_readback_pixels = static_cast<double>(max_pixels);
-            // Clamp both dimensions before multiplication/conversion, then
-            // scale proportionally and retain the canvas aspect in the view.
-            const double requested_width = std::clamp(static_cast<double>(extent.x) * scale,
-                1.0, max_readback_pixels);
-            const double requested_height = std::clamp(static_cast<double>(extent.y) * scale,
-                1.0, max_readback_pixels);
-            const double limit_scale = std::min(1.0,
-                std::min(std::sqrt(max_readback_pixels / (requested_width * requested_height)),
-                    double(carto::production::kAuthoringNativeMaxDimension) / std::max(requested_width, requested_height)));
-            request.width = static_cast<std::uint32_t>(std::max(1.0, std::floor(requested_width * limit_scale)));
-            request.height = static_cast<std::uint32_t>(std::max(1.0, std::floor(requested_height * limit_scale)));
-            if (std::uint64_t(request.width) * request.height > max_pixels)
-                request.width = static_cast<std::uint32_t>(max_pixels / request.height);
-            const bool render_extent_capped = limit_scale < 1.0 ||
-                static_cast<double>(extent.x) * scale > max_readback_pixels ||
-                static_cast<double>(extent.y) * scale > max_readback_pixels;
+            auto render_extent = carto::studio::preview_render_extent(extent.x, extent.y,
+                material_viewport_scale, max_pixels, carto::production::kAuthoringNativeMaxDimension);
+            if (!render_extent) {
+                material_viewport_scale = 0;
+                render_extent = carto::studio::preview_render_extent(extent.x, extent.y,
+                    material_viewport_scale, max_pixels, carto::production::kAuthoringNativeMaxDimension);
+            }
+            request.width = render_extent ? render_extent->width : 0;
+            request.height = render_extent ? render_extent->height : 0;
+            const bool render_extent_capped = render_extent && render_extent->capped;
             if (navigation_view) request.view = *navigation_view;
             // Authored cameras also retain the exact canvas aspect when the
             // render target is downscaled, capped or rounded to whole pixels.
@@ -13663,7 +13709,7 @@ struct DesktopState {
             // rendered frame alone and keep workspace picking disabled.
             draw->AddText(origin + ImVec2(8.0F, 8.0F),
                 rgba(snapshot.colors.semantic_warning, 1.0F),
-                "Preview only. Save your work and restart to resume viewport editing.");
+                "Preview only. Turn it off to return to viewport editing.");
             ImGui::EndChild();
             return;
         } else if (material_viewport_enabled) {
@@ -14867,7 +14913,7 @@ struct DesktopState {
         // Perspective workspace picking is dispatched by the generation-bound
         // native hit route after this draw; raw screen-space hits here would bypass
         // its depth, cache-completeness, and stale-snapshot checks.
-        if (!material_viewport_enabled && !viewport_edit_requires_restart &&
+        if (!material_viewport_enabled && !viewport_edit_paused &&
             carto::studio::use_legacy_screen_pick(
                 surface == ShellSurface::workspace, perspective_camera_active) &&
             ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -14993,6 +15039,11 @@ struct DesktopState {
                 }
             }
             ImGui::EndDragDropTarget();
+        }
+        if (viewport_edit_paused && !material_viewport_enabled &&
+            !showing_agent_preview && !invalid_render_snapshot && native_viewport_hits.valid &&
+            ImGui::GetWindowViewport() == ImGui::GetMainViewport()) {
+            preview_return_candidate = preview_return_frame(snapshot);
         }
         ImGui::EndChild();
     }
@@ -31823,7 +31874,7 @@ struct DesktopState {
 
         // Pan remains available, but editing never uses a cache from a
         // preview or a transition whose displayed frame is unknown.
-        if (material_viewport_enabled || viewport_edit_requires_restart) {
+        if (material_viewport_enabled || viewport_edit_paused) {
             native_event_window = nullptr;
             return;
         }
@@ -32595,7 +32646,7 @@ int run(HINSTANCE instance, int show_command) {
             static_cast<void>(state.dispatch(carto::application::OpenProjectAction{
                 std::filesystem::path(fixture)}));
             state.material_viewport_enabled = true;
-            state.viewport_edit_requires_restart = true;
+            state.viewport_edit_paused = true;
             state.material_viewport_authored_camera = true;
             const auto* hold = std::getenv("CARTO_DESKTOP_VIEWPORT_PROFILE_HOLD");
             state.material_profile_auto_close = !(hold && std::string_view(hold)=="1");
@@ -32708,6 +32759,7 @@ int run(HINSTANCE instance, int show_command) {
         ImGui::NewFrame();
         if (trace_first_frame) trace_desktop_startup("ui.draw.begin");
         state.viewport_producer_seen_this_frame = false;
+        state.preview_return_candidate.reset();
         if (state.close_accepted) {
             ImGui::OpenPopup("Stopping renderer");
             if (ImGui::BeginPopupModal("Stopping renderer", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -32736,6 +32788,8 @@ int run(HINSTANCE instance, int show_command) {
 #endif
         if (trace_first_frame) trace_desktop_startup("present.begin");
         const bool presented = state.renderer.render(ImGui::GetDrawData());
+        state.note_preview_return_presented(presented && IsWindowVisible(state.window) &&
+            !IsIconic(state.window) && GetForegroundWindow() == state.window);
         if (trace_first_frame) trace_desktop_startup("present.end");
         if ((imgui_io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0) {
             ImGui::UpdatePlatformWindows();

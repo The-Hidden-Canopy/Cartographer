@@ -877,7 +877,7 @@ core::Result<std::string_view> journal_entry_document_snapshot(
     using Result = core::Result<std::string_view>;
     const bool is_snapshot = entry.event_type == kSnapshotEvent;
     const bool is_mutation = entry.event_type == kActionEvent;
-    if ((!is_snapshot && !is_mutation) || entry.payload.empty()) {
+    if (entry.payload.empty()) {
         return Result::failure(core::Diagnostic(core::ErrorCode::validation_failed,
             "journal entry does not contain a supported project snapshot"));
     }
@@ -892,19 +892,39 @@ core::Result<std::string_view> journal_entry_document_snapshot(
         return line;
     };
     const auto header = next_line();
+    const bool project_transaction = !is_snapshot && !is_mutation && header.has_value() &&
+        *header == "CARTOGRAPHER_PROJECT_TRANSACTION_V1";
     const bool mutation_v2 = is_mutation && header.has_value() &&
         *header == "CARTOGRAPHER_APPLICATION_MUTATION_V2";
-    if (!header.has_value() || (!mutation_v2 && *header !=
+    if (!header.has_value() || (!project_transaction && !mutation_v2 &&
+        ((!is_snapshot && !is_mutation) || *header !=
             (is_snapshot ? "CARTOGRAPHER_PROJECT_SNAPSHOT_V1"
-                         : "CARTOGRAPHER_APPLICATION_MUTATION_V1"))) {
+                         : "CARTOGRAPHER_APPLICATION_MUTATION_V1")))) {
         return Result::failure(core::Diagnostic(core::ErrorCode::validation_failed,
             "journal snapshot envelope header is invalid"));
     }
-    if (is_mutation) {
+    const auto safe_transaction_text = [](std::string_view value, std::size_t limit) {
+        return !value.empty() && value.size() <= limit &&
+            std::all_of(value.begin(), value.end(), [](unsigned char c) {
+                return c >= 0x20U && c != 0x7fU;
+            });
+    };
+    if (project_transaction) {
+        const auto actor = next_line();
+        if (!actor || !actor->starts_with("actor=") ||
+            !safe_transaction_text(actor->substr(6U), 256U)) {
+            return Result::failure(core::Diagnostic(core::ErrorCode::validation_failed,
+                "journal transaction actor is invalid"));
+        }
+    }
+    if (is_mutation || project_transaction) {
         const auto operation = next_line();
         if (!operation.has_value() || !operation->starts_with("operation=") ||
             operation->size() == std::string_view("operation=").size() ||
             operation->find_first_of("\r\n") != std::string_view::npos ||
+            (project_transaction &&
+                (!safe_transaction_text(operation->substr(10U), 128U) ||
+                 operation->substr(10U) != entry.event_type)) ||
             (mutation_v2 && (operation->size() > 4106U ||
                 std::any_of(operation->begin(), operation->end(), [](unsigned char c) {
                     return c < 0x20U || c == 0x7fU;
@@ -6353,6 +6373,13 @@ core::Result<DispatchReceipt> ApplicationSession::update_sculpt_layer(
 
 core::Result<DispatchReceipt> ApplicationSession::duplicate_mesh_instance(
     const DuplicateMeshInstanceAction& action) {
+    // A sibling changes the parent's child set. Existing non-human mutation
+    // scope admits the source object only, not authority over its hierarchy.
+    const auto* source = document_.scene().find(action.source);
+    if (source && source->parent && active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(core::ErrorCode::unsupported,
+            "duplicating a parented mesh instance requires a human action"));
+    }
     editor::ProjectCommandAdmission admission;
     return execute_command(
         std::make_unique<editor::DuplicateProjectMeshInstanceCommand>(

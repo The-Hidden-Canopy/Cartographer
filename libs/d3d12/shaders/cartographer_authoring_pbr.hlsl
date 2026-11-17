@@ -82,6 +82,7 @@ struct VertexOutput
     float2 uv : TEXCOORD2;
     float3 world_tangent : TEXCOORD3;
     float tangent_sign : TEXCOORD4;
+    nointerpolation float orientation : TEXCOORD5;
 };
 
 VertexOutput VSMain(VertexInput input)
@@ -103,6 +104,7 @@ VertexOutput VSMain(VertexInput input)
     output.uv = input.uv;
     output.world_tangent = normalize(mul((float3x3)model, input.tangent.xyz));
     output.tangent_sign = input.tangent.w * orientation;
+    output.orientation = orientation;
     return output;
 }
 
@@ -126,7 +128,8 @@ float3 fresnel_schlick(float cos_theta, float3 f0)
     return f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
 }
 
-float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID) : SV_TARGET
+float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID,
+              bool front_facing : SV_IsFrontFace) : SV_TARGET
 {
     const float3 geometric_normal = normalize(input.world_normal);
 #ifdef CARTO_AUTHORING_VIEWPORT
@@ -150,7 +153,7 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID) : SV_TARGET
         return float4(0,0,0,-((abs(camera_position_and_view.w)-1)*65536+primitive+1));
 #elif defined(CARTO_AUTHORING_VIEWPORT)
     // G1 constant material path: no normal/UV texture is claimed executable.
-    const float3 normal = geometric_normal;
+    float3 normal = geometric_normal;
     // Negative w selects an orthographic view direction in xyz; nonnegative
     // w selects a perspective camera position. Fused draws also pack their
     // ordinal in abs(w). Exposure is exclusively display-owned.
@@ -165,11 +168,14 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID) : SV_TARGET
     // The bounded first material contract uses the DirectX Y- convention.
     tangent_normal.y = -tangent_normal.y;
     tangent_normal.xy *= surface_factors.z;
-    const float3 normal = normalize(
+    float3 normal = normalize(
         tangent * tangent_normal.x + bitangent * tangent_normal.y +
         geometric_normal * tangent_normal.z);
     const float3 view = normalize(camera_position_and_view.xyz - input.world_position);
 #endif
+    // Authoring uses two-sided rasterization. Match glTF by reversing the
+    // complete shading normal, including normal maps, on the back side.
+    if (front_facing == (input.orientation < 0.0)) normal = -normal;
     const float3 light_direction = normalize(light_direction_intensity.xyz);
     const float n_dot_l = max(dot(normal, light_direction), 0.0);
     const float n_dot_v = max(dot(normal, view), 0.0);

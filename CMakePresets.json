@@ -72,6 +72,18 @@
       }
     },
     {
+      "name": "desktop-render-preview-release",
+      "displayName": "Cartographer desktop with rendered preview",
+      "description": "Windows Vulkan desktop with opt-in D3D12 material preview via asynchronous readback",
+      "inherits": "desktop-vulkan-release",
+      "binaryDir": "${sourceDir}/build/desktop-render-preview-release",
+      "cacheVariables": {
+        "CARTO_BUILD_DEVICE_CPU": "ON",
+        "CARTO_ENABLE_D3D12": "ON",
+        "CARTO_DESKTOP_ASYNC_READBACK": "ON"
+      }
+    },
+    {
       "name": "d3d12-headless-release",
       "displayName": "Cartographer D3D12 headless acceptance",
       "inherits": "headless-release",
@@ -123,6 +135,11 @@
     {
       "name": "desktop-vulkan-release",
       "configurePreset": "desktop-vulkan-release"
+    },
+    {
+      "name": "desktop-render-preview-release",
+      "configurePreset": "desktop-render-preview-release",
+      "targets": ["cartographer_desktop"]
     },
     {
       "name": "d3d12-headless-release",

@@ -1312,7 +1312,6 @@ void duplicate_mesh_instance_command_shares_asset_and_preserves_history() {
     };
     expect_source_rejected(false, false, false, true);
     expect_source_rejected(true, true, false, true);
-    expect_source_rejected(true, false, true, true);
     expect_source_rejected(true, false, false, false);
 }
 

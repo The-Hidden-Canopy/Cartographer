@@ -21,7 +21,8 @@ class AuthoringTextureLibrary final {
                                            std::span<const std::uint8_t> encoded);
     [[nodiscard]] core::Result<std::shared_ptr<const assets::Rgba8MipChain>>
     prepare(const project::TextureSourceRecord &record, assets::TextureSemantic semantic,
-            assets::ColorSpace color_space) const;
+            assets::ColorSpace color_space,
+            std::optional<std::uint8_t> masked_color_cutoff = std::nullopt) const;
     [[nodiscard]] std::uint64_t resident_bytes() const;
     // Copies admitted records and decoded pixels atomically into a separate
     // library. Derived mip caches are not shared or copied; the snapshot
