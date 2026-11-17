@@ -168,4 +168,36 @@ will receive the same check after cleanup; its result is recorded below.
 Source file manifests, final binary/evidence hashes and cleanup results are
 retained in the primary checkout's ignored integration archive.
 
-Cleanup completion is recorded after the verified removals below.
+Cleanup completed: **19 worktree directories removed** (18 superseded copies
+plus the integration workspace). The primary checkout is on `main`, with a
+clean tracked/untracked status; the only other entry in this repository's
+worktree registry is the unresolved `carto-material-v5` draft. The separately
+registered running render copy and the adjacent foreign/private/verification
+copies listed above remain intact. No remote push or deployment occurred.
+
+Git's initial cleanup hit a Windows path-length limit and unregistered one
+copy before its directory was fully removed. Every remaining file in that
+exact directory was checked against the saved Git tip or archives before a
+native PowerShell removal using its explicit extended-length path. A direct
+filesystem scan also preserved 132 additional generated long-path files in
+the remaining copies, which the initial Git listing omitted. These are in
+`*-longpaths.zip` with hashes. Subsequent Git removals used per-command
+`core.longpaths=true`; no user Git configuration was changed. The archives
+preserve identified source, assets and evidence, not a bit-for-bit snapshot of
+all rebuildable build outputs.
+
+Final logs, all ordinary and supplementary evidence archives, cleanup receipts,
+source manifests and the two hash-verified local QA binaries live under
+`build/worktree-integration-20261116/`. The copied binaries are developer QA
+artifacts, not a newly qualified distribution package. The complete 68-path
+source delta is listed in `changed-files.txt`. Original branches and
+`refs/archive/worktrees-20261116/*` retain rollback lineage; archive refs must
+not be included in a public push.
+
+Final primary publication check: **PASS**, using
+`python scripts/public_boundary_audit.py --ref HEAD --check-ignore-policy --fail-on-review`
+on main `03fed39` plus this cleanup ledger in the working tree. The final
+commit only records these cleanup/audit observations. The exact output is in
+`publication-audit-main.log`. The retained Material V5 source hashes still
+match the original snapshot, and the separately running render editor remains
+at `96dbc11`.
