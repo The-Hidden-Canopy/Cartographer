@@ -128,7 +128,11 @@ void masked_fur_mips_retain_coverage_and_exclude_matte_color() {
     const auto encoded_catalog = catalog.serialize();
     const auto masked = compile(catalog,library);
     check(catalog.serialize() == encoded_catalog,"masked mip compilation mutated the catalog");
-    const auto sample = at(masked,.25,.5,{1,0}).material;
+    // Equal four-texel derivatives select the coarse coverage-preserving mip.
+    // A one-axis footprint instead uses the newer bounded anisotropic path.
+    const auto sample = at(masked,.25,.5,{1,0},{0,4}).material;
+    near(at(masked,.25,.5,{1,0}).material.base_color_factor.w,.25);
+    near(at(masked,.125,.5,{.01,0},{0,.01}).material.base_color_factor.w,1);
     check(sample.base_color_factor.w >= material.alpha_cutoff,
         "minified masked fur lost all coverage");
     near(sample.base_color_factor.x,1);
@@ -148,7 +152,7 @@ void masked_fur_mips_retain_coverage_and_exclude_matte_color() {
     check(masked_chain->artifact_digest != original_digest &&
         original->artifact_digest == original_digest,
         "masked and opaque derivations aliased a cache product");
-    check(at(opaque,.25,.5,{1,0}).material.base_color_factor.y > .7,
+    check(at(opaque,.25,.5,{1,0},{0,4}).material.base_color_factor.y > .7,
         "masked preparation changed an existing opaque program");
 #ifdef CARTO_AUTHORING_MASKED_FUR_GPU
     auto f = fixture();
@@ -199,11 +203,11 @@ void masked_fur_mips_retain_coverage_and_exclude_matte_color() {
     material.alpha_cutoff=.63;
     material.base_color_factor.w=.5;
     replace(catalog,material);
-    check(at(compile(catalog,library),.25,.5,{1,0}).material.base_color_factor.w < .63,
+    check(at(compile(catalog,library),.25,.5,{1,0},{0,4}).material.base_color_factor.w < .63,
         "mip preparation invented coverage for an entirely rejected material");
     material.alpha_cutoff=.25;
     replace(catalog,material);
-    check(at(compile(catalog,library),.25,.5,{1,0}).material.base_color_factor.w >= .25,
+    check(at(compile(catalog,library),.25,.5,{1,0},{0,4}).material.base_color_factor.w >= .25,
         "coverage derivation ignored the material alpha factor");
     check(catalog.serialize() != encoded_catalog,
         "test did not exercise authored alpha-factor changes");
