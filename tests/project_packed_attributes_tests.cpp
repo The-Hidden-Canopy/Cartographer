@@ -254,7 +254,7 @@ int main() {
         rejects(text.substr(packed_at, packed_end-packed_at)+"AAAA");
         auto invalid = text.substr(packed_at, packed_end-packed_at);
         invalid[data_at-packed_at] = '!'; rejects(invalid);
-        // Change declared count beyond the unchanged one-million-value admission cap.
+        // Change declared counts around the four-values-per-face admission cap.
         auto oversized = text;
         const auto layer_line = oversized.rfind("\nLAYER \"test.normal\" ", packed_at);
         require(layer_line != std::string::npos && layer_line < packed_at,
@@ -267,11 +267,20 @@ int main() {
                 "normal layer value count offset is valid");
         require(oversized.substr(count_at + 1U, line_end - count_at - 1U) == std::to_string(corners),
                 "normal layer original count equals fixture corner count");
-        oversized.replace(count_at+1U, line_end-count_at-1U, "1000001");
+        // A corner layer past one million values is within the admission cap
+        // (four values per face for the largest admitted mesh): this count is
+        // rejected only because it no longer matches the fixture's corners.
+        auto corner_scale = oversized;
+        corner_scale.replace(count_at+1U, line_end-count_at-1U, "1000001");
+        const auto corner_scale_result = project::ProjectDocument::deserialize(corner_scale);
+        require(!corner_scale_result, "mismatched corner layer count rejected");
+        require(corner_scale_result.error().message.find("exceeds the Cartographer v1 limit") == std::string::npos,
+                "corner layer over one million values passes the value-count admission cap");
+        oversized.replace(count_at+1U, line_end-count_at-1U, "4000001");
         const auto oversized_result = project::ProjectDocument::deserialize(oversized);
         require(!oversized_result, "oversized layer rejected");
         require(oversized_result.error().message.find(
-                    "mesh attribute value count exceeds the Cartographer v1 limit of 1000000") != std::string::npos,
+                    "mesh attribute value count exceeds the Cartographer v1 limit of 4000000") != std::string::npos,
                 "oversized layer fails specifically at the value-count admission cap");
         std::filesystem::remove_all(root);
         std::cout << "PASS packed attribute layers round-trip bit-exactly\n";

@@ -62,7 +62,12 @@ static_assert(offsetof(ScenePbrUploadVertex, channel_mapping_a) == 164U);
 static_assert(offsetof(ScenePbrUploadVertex, channel_mapping_b) == 180U);
 static_assert(offsetof(ScenePbrUploadVertex, channel_mapping_c) == 196U);
 static_assert(offsetof(ScenePbrUploadVertex, authored_anisotropy) == 212U);
-constexpr std::uint64_t kPayloadLimit = 512ULL * 1024U * 1024U;
+// CPU-side bound on one scene's mesh, UV-stream and material-mip uploads.
+// Each draw owns its own buffer, so this is a whole-scene budget rather than
+// a single-resource limit; 2 GiB admits dense instanced vegetation (a mowed
+// lawn of library grass is ~0.75 GiB) while staying well inside the 16 GB
+// review GPUs.
+constexpr std::uint64_t kPayloadLimit = 2048ULL * 1024U * 1024U;
 constexpr std::uint64_t kMaxSpecularEnvironmentPixels = 4'194'304ULL;
 constexpr std::uint32_t kSplitSumBrdfLutExtent = 128U;
 constexpr std::uint32_t kSplitSumBrdfSampleCount = 256U;
@@ -1622,7 +1627,7 @@ Result<void> SceneRenderRequest::validate() const {
             return Result<void>::failure({core::ErrorCode::stale_data, "scene texture has duplicate/missing identity or stale source digest"});
         if (!float_only) {
             if (texture.mips.resident_bytes() > kPayloadLimit - payload)
-                return Result<void>::failure(invalid("scene mip payload exceeds 512 MiB"));
+                return Result<void>::failure(invalid("scene mip payload exceeds 2 GiB"));
             payload += texture.mips.resident_bytes();
             if (auto valid = texture.mips.validate(); !valid) return valid;
         }
@@ -1634,7 +1639,7 @@ Result<void> SceneRenderRequest::validate() const {
                 return Result<void>::failure(invalid("invalid linear float color texture"));
             for (const auto& level : texture.linear_float_mips->levels) {
                 const auto size=static_cast<std::uint64_t>(level.rgba.size())*sizeof(float);
-                if(size>kPayloadLimit-payload) return Result<void>::failure(invalid("float texture payload exceeds 512 MiB"));
+                if(size>kPayloadLimit-payload) return Result<void>::failure(invalid("float texture payload exceeds 2 GiB"));
                 payload+=size;
             }
         }
@@ -1680,7 +1685,7 @@ Result<void> SceneRenderRequest::validate() const {
             sizeof(production::PbrUploadVertex) +
             static_cast<std::uint64_t>(object.mesh.indices.size()) * sizeof(std::uint32_t);
         if (packed_mesh_bytes > kPayloadLimit - payload)
-            return Result<void>::failure(invalid("scene packed mesh upload exceeds 512 MiB"));
+            return Result<void>::failure(invalid("scene packed mesh upload exceeds 2 GiB"));
         payload += packed_mesh_bytes;
         const auto additional_uv_bytes =
             static_cast<std::uint64_t>(object.mesh.vertices.size()) *
@@ -1688,7 +1693,7 @@ Result<void> SceneRenderRequest::validate() const {
             sizeof(core::Vec2d);
         if (additional_uv_bytes > kPayloadLimit - payload)
             return Result<void>::failure(invalid(
-                "scene additional UV streams exceed 512 MiB"));
+                "scene additional UV streams exceed 2 GiB"));
         payload += additional_uv_bytes;
         for (const auto& draw : object.draw_package.draws) {
             const auto maximum_draw_vertices = std::min<std::uint64_t>(
@@ -1698,7 +1703,7 @@ Result<void> SceneRenderRequest::validate() const {
                 static_cast<std::uint64_t>(draw.index_count) * sizeof(std::uint32_t);
             if (draw_upload_bytes > kPayloadLimit - payload)
                 return Result<void>::failure(invalid(
-                    "per-material transformed mesh uploads exceed 512 MiB"));
+                    "per-material transformed mesh uploads exceed 2 GiB"));
             payload += draw_upload_bytes;
         }
         std::vector<production::LookdevMaterialBinding> bindings;
@@ -2271,7 +2276,7 @@ Result<SceneRenderImage> render_scene_impl(
                     const auto pitch=(std::uint64_t(level.width)*16U+255U)&~std::uint64_t(255U);
                     cursor+=pitch*level.height;
                 }
-                if(cursor>kPayloadLimit) return Result<SceneRenderImage>::failure(invalid("float texture upload exceeds 512 MiB"));
+                if(cursor>kPayloadLimit) return Result<SceneRenderImage>::failure(invalid("float texture upload exceeds 2 GiB"));
                 std::vector<std::uint8_t> upload(static_cast<std::size_t>(cursor),0U);
                 for(std::size_t m=0;m<chain.levels.size();++m) {
                     const auto& level=chain.levels[m]; const auto row=std::uint64_t(level.width)*16U;

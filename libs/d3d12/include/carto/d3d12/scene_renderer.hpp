@@ -292,7 +292,7 @@ struct SceneRenderRequest {
     // source-image specular environment sampling:
     // <=4096 objects, 65536 draws, <=64 point/spot sources,
     // 1024 textures, 1024 sampler descriptors, up to 8192x4320 (8K-class),
-    // 512 MiB mesh/material-mip payload, 64 MiB environment mip payload, and
+    // 2 GiB mesh/material-mip payload, 64 MiB environment mip payload, and
     // 128 MiB environment upload. Caller-owned temporal texture allocations
     // are not included in those CPU payload bounds. Blended submeshes sort
     // back-to-front by centroid;

@@ -169,7 +169,10 @@ constexpr std::uint64_t kMaxSerializedMeshPatchRecords = 100'000U;
 constexpr std::uint64_t kMaxSerializedMeshPatchAggregateBytes = 64ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaxSerializedAttributeDomains = 64U;
 constexpr std::uint64_t kMaxSerializedAttributeLayers = 1'000'000U;
-constexpr std::uint64_t kMaxSerializedAttributeValues = 1'000'000U;
+// A layer holds one value per element of its domain. Corner layers (UVs,
+// split normals) need one value per face corner, so the bound must admit the
+// corners of the largest admitted mesh: kMaxSerializedFaces quads.
+constexpr std::uint64_t kMaxSerializedAttributeValues = 4U * kMaxSerializedFaces;
 constexpr std::uint64_t kMaxSerializedUvSets = 1'000'000U;
 constexpr std::uint64_t kMaxSerializedSculptStacks = 100'000U;
 constexpr std::uint64_t kMaxSerializedGarmentAssets = 100'000U;
