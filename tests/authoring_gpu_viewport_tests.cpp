@@ -1,6 +1,7 @@
 #include "authoring_environment_fixture.hpp"
 #include "authoring_shadow_fixture.hpp"
 #include "authoring_surface_fixture.hpp"
+#include "authoring_triangle_budget_fixture.hpp"
 #include <carto/d3d12/authoring_viewport.hpp>
 #include <carto/d3d12/device.hpp>
 #include <carto/device_ir/command.hpp>
@@ -725,6 +726,42 @@ int main(int argc, char **argv) {
             take(d3d12::D3D12Device::create({{}, false, true})));
         graphics_table_limits(*test_device);
         auto renderer = take(d3d12::AuthoringViewport::create_on_device(test_device));
+        {
+            const auto bounded = triangle_budget_fixture();
+            const auto original = bounded.document.serialize();
+            const auto br = request(bounded);
+            const auto accepted = take(renderer->render(bounded.document, br));
+            check(accepted.image.display_rgba8[center(accepted.image) * 4 + 3] != 0,
+                  "GPU renders 262144 triangles across bounded per-mesh instances");
+            const auto overflow = one_triangle_over_scene_budget(bounded);
+            const auto overflow_bytes = overflow.serialize();
+            const auto refused = renderer->render(overflow, br);
+            check(!refused && refused.error().message.find("triangle budget exceeded") != std::string::npos,
+                  "GPU rejects exactly one triangle above the scene bound");
+            const auto recovered = take(renderer->render(bounded.document, br));
+            check(recovered.image.display_rgba8 == accepted.image.display_rgba8 &&
+                      recovered.target_generation == accepted.target_generation &&
+                      recovered.geometry_upload_bytes == 0,
+                  "rejected scene preserves the good target and warm geometry for recovery");
+            check(original == bounded.document.serialize() && overflow_bytes == overflow.serialize(),
+                  "GPU scene admission never mutates accepted or rejected project sources");
+        }
+        {
+            auto opposed = fixture();
+            auto mesh = triangle();
+            auto payload = mesh.attributes();
+            okay(payload.set_domain_count(attributes::AttributeDomain::corner, 3U));
+            const core::Vec3d normal{0, 0, -1};
+            okay(payload.add_layer({{"cartographer.normal0", attributes::AttributeDomain::corner,
+                attributes::AttributeType::vec3}, {normal, normal, normal}}));
+            okay(mesh.set_attribute_payload(std::move(payload), {}));
+            mutate(opposed.document, [&](auto& tx) {
+                okay(tx.replace_mesh(opposed.front_mesh, std::move(mesh)));
+            });
+            const auto opposed_request = request(opposed);
+            compare(take(production::render_authoring_viewport(opposed.document, opposed_request)),
+                    take(renderer->render(opposed.document, opposed_request)).image);
+        }
         {
             auto lighting = fixture();
             auto light = lighting.document.presentation_catalog().lights().at(lighting.light);

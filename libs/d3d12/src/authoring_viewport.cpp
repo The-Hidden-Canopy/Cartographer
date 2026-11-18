@@ -254,7 +254,7 @@ Prepared prepare(const project::ProjectDocument &document,
         const auto base = artifact_for(*object.mesh_asset, {}, false);
         timing.prepare_meshes_ms += elapsed(phase);
         triangles += base->indices.size() / 3;
-        if (triangles > 65536)
+        if (triangles > production::kAuthoringMaxSceneTriangles)
             throw std::runtime_error("GPU viewport triangle budget exceeded");
         for (const auto &submesh : base->submeshes) {
             phase = Clock::now();

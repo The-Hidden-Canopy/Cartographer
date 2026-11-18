@@ -297,7 +297,7 @@ render_reference(const project::ProjectDocument &document, const AuthoringViewpo
         }
         const auto &artifact = compiled->second;
         triangle_count += artifact.indices.size() / 3U;
-        if (triangle_count > 65'536U)
+        if (triangle_count > kAuthoringMaxSceneTriangles)
             return Result::failure(invalid("reference viewport triangle budget exceeded"));
         auto transform = document.scene().world_transform(object.id);
         if (!transform)

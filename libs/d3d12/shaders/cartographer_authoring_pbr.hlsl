@@ -108,13 +108,18 @@ VertexOutput VSMain(VertexInput input)
     return output;
 }
 
-float distribution_ggx(float n_dot_h, float roughness)
+float distribution_ggx(float3 normal, float3 half_vector, float roughness)
 {
     const float alpha = max(0.045 * 0.045, roughness * roughness);
     const float alpha_squared = alpha * alpha;
-    const float cosine = saturate(n_dot_h);
+    const float cosine = saturate(dot(normal, half_vector));
     const float cosine_squared = cosine * cosine;
-    precise float denominator = (1.0 - cosine_squared) + alpha_squared * cosine_squared;
+    // Both vectors are normalized. Preserve the small angle at a smooth peak
+    // without subtracting a rounded cosine squared from one.
+    const float3 sine = cross(normal, half_vector);
+    // Preserve the original clamped back-hemisphere value, including -parallel.
+    const float sine_squared = cosine > 0.0 ? dot(sine, sine) : 1.0;
+    precise float denominator = sine_squared + alpha_squared * cosine_squared;
     return alpha_squared / (3.14159265 * denominator * denominator);
 }
 
@@ -221,7 +226,7 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID,
     const float3 fresnel = fresnel_schlick(v_dot_h, f0);
     const float clearcoat_fresnel = 0.04 + 0.96 * pow(1.0 - v_dot_h, 5.0);
     const float base_attenuation = saturate(1.0 - clearcoat * clearcoat_fresnel);
-    float distribution = distribution_ggx(n_dot_h, roughness);
+    float distribution = distribution_ggx(normal, half_vector, roughness);
     float3 specular_normal = normal;
 #ifdef CARTO_AUTHORING_SURFACE
     if(anisotropy>0) {
@@ -249,7 +254,7 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID,
     const float3 diffuse_weight = (1.0 - fresnel) * (1.0 - metallic) * (1.0 - transmission);
     const float3 diffuse = diffuse_weight * base_color * base_attenuation / 3.14159265;
     const float clearcoat_distribution = distribution_ggx(
-        n_dot_h, clearcoat_roughness);
+        normal, half_vector, clearcoat_roughness);
     const float clearcoat_geometry =
         geometry_schlick_ggx(n_dot_l, clearcoat_roughness) *
         geometry_schlick_ggx(n_dot_v, clearcoat_roughness);
