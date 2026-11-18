@@ -360,7 +360,7 @@ Prepared prepare(const project::ProjectDocument &document,
                         throw std::runtime_error(
                             "GPU material tangent handedness changes within a primitive");
                 }
-            if (out.draws.size() == 256)
+            if (out.draws.size() >= production::kAuthoringNativeMaxDraws)
                 throw std::runtime_error("GPU viewport draw budget exceeded");
             out.draws.push_back({object.id,
                                  std::move(active),
@@ -2474,12 +2474,13 @@ core::Result<AuthoringGpuFrame> AuthoringViewport::render_impl(
                             clear_background();
                             continue;
                         }
-                        if (!std::isfinite(packed) || packed < 1 || packed > 16777216.0)
+                        std::uint32_t token_bits = 0;
+                        std::memcpy(&token_bits, &hdr_pixel[3], sizeof(token_bits));
+                        constexpr std::uint32_t normal_bias = 0x00800000U;
+                        if (!std::isfinite(packed) || token_bits <= normal_bias ||
+                            std::uint64_t(token_bits) > normal_bias + scene.draws.size() * 65536ULL)
                             throw std::runtime_error("GPU packed identity is invalid");
-                        const auto integer = static_cast<std::uint32_t>(packed);
-                        if (double(integer) != packed)
-                            throw std::runtime_error("GPU packed identity is fractional");
-                        const auto value = integer - 1U;
+                        const auto value = token_bits - normal_bias - 1U;
                         ordinal = value / 65536U;
                         primitive = static_cast<long>(value % 65536U) + 1;
                         if (ordinal >= scene.draws.size())

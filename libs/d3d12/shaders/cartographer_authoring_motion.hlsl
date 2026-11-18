@@ -18,9 +18,11 @@ void CSMain(uint3 id:SV_DispatchThreadID) {
     if(any(id.xy>=extent_draws.xy))return;
     uint words[9]={0,0,0,0,0,0,0,0,0};
     float token=current_hdr.Load(int3(id.xy,0)).a;
-    // Match the existing exact float24 coverage token. Magenta failures have -1.
-    if(isfinite(token) && token>=1 && token<=16777216 && floor(token)==token) {
-        uint packed=(uint)token-1,draw=packed/65536,primitive=packed%65536;
+    // Same bit-preserving positive-normal encoding as fused PBR readback.
+    // Actual draw/face ranges remain checked against the owner-built palettes.
+    uint token_bits=asuint(token);
+    if(isfinite(token) && token>0 && token_bits>0x00800000u) {
+        uint packed=token_bits-0x00800000u-1u,draw=packed/65536,primitive=packed%65536;
         if(draw<extent_draws.w) {
             uint b=draw*24;
             if(primitive<draw_word(b+3)) {

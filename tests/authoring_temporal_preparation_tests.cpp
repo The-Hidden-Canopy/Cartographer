@@ -138,9 +138,49 @@ void host_lifecycle() {
     check(!take(d3d12::compile_hlsl(d3d12::authoring_packed_temporal_shader())).bytes.empty(),
           "actual packed temporal resolve DXIL compiles without device");
 }
+void shared_instance_palettes() {
+    using namespace carto;
+    d3d12::AuthoringTemporalHostState state;
+    const std::vector<geometry::FaceId> faces{{0xfedcba9876543210ULL}};
+    std::vector<d3d12::AuthoringTemporalDraw> draws;
+    for (std::uint64_t i=0;i<4096;++i)draws.push_back({i+1,{},faces});
+    d3d12::AuthoringTemporalHostInput input;
+    input.epoch={assets::sha256(std::array<std::uint8_t,1>{19}),core::Revision{1},1,1};
+    input.view.position={0,0,5};input.view.rotation={0,0,0,1};input.draws=draws;
+    auto accepted=take(state.prepare(input));
+    check(accepted.draw_words.size()==4096*24 && accepted.face_words->size()==2,
+          "4096 transformed draws share exact identity64 faces within the unchanged palette byte bound");
+    check(bool(state.commit(accepted)),"shared face plan commits");
+    draws.push_back({4097,{},faces});input.draws=draws;
+    check(!state.prepare(input),"one draw above the bounded instance count rejects");
+    draws.pop_back();input.draws=draws;
+    check(take(state.prepare(input)).face_words==accepted.face_words,
+          "draw rejection preserves the previous shared face palette");
+    const std::vector<geometry::FaceId> other{{23}};
+    draws={{1,{},faces},{2,{},other},{3,{},faces}};input.draws=draws;
+    auto first=take(state.prepare(input));check(bool(state.commit(first)),"binding fixture commits");
+    draws[2].faces=other;input.draws=draws;
+    auto rebound=take(state.prepare(input));
+    check(*first.face_words==*rebound.face_words && first.face_digest!=rebound.face_digest &&
+              rebound.reset==d3d12::AuthoringTemporalReset::source,
+          "rebinding to an already resident face range invalidates topology history");
+    std::vector<geometry::FaceId> complete;
+    for(std::uint64_t i=1;i<=65536;++i)complete.push_back({i});
+    draws.clear();for(std::uint64_t i=0;i<64;++i)draws.push_back({i+1,{},complete});input.draws=draws;
+    auto boundary=take(state.prepare(input));
+    check(boundary.face_words->size()==131072,
+          "four million expanded faces reuse the exact unchanged 512KiB identity table");
+    draws.push_back({65,{},faces});input.draws=draws;
+    check(!state.prepare(input),"one extra expanded face rejects even when its table is shared");
+    draws={{1,{},complete}};auto different=complete;different[0].value=999999;
+    draws.push_back({2,{},different});input.draws=draws;
+    check(!state.prepare(input),"genuinely distinct face tables beyond the unchanged byte bound reject");
+}
+
 int main() {
     try {
         host_lifecycle();
+        shared_instance_palettes();
         d3d12::AuthoringTemporalEpoch epoch{assets::sha256(std::array<std::uint8_t, 1>{42}),
                                             core::Revision{7}, 9, 5};
         const auto plan = take(d3d12::prepare_authoring_temporal(epoch, epoch, true, false));

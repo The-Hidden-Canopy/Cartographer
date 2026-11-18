@@ -243,7 +243,7 @@ core::Result<AuthoringTemporalHostPlan>
 AuthoringTemporalHostState::prepare(const AuthoringTemporalHostInput &in) const {
     using R = core::Result<AuthoringTemporalHostPlan>;
     try {
-        if (in.draws.size() > 256)
+        if (in.draws.size() > production::kAuthoringNativeMaxDraws)
             throw std::runtime_error("temporal draw budget exceeded");
         const auto aspect = in.view.aspect_ratio > 0 ? in.view.aspect_ratio
                                                      : double(in.epoch.width) / in.epoch.height;
@@ -265,19 +265,45 @@ AuthoringTemporalHostState::prepare(const AuthoringTemporalHostInput &in) const 
         next->quality = in.quality;
         next->session = in.session;
         auto faces = std::make_shared<std::vector<std::uint32_t>>();
+        std::map<std::vector<std::uint64_t>, std::uint32_t> face_offsets;
+        std::vector<std::uint32_t> face_bindings;
+        std::uint64_t expanded_faces = 0;
         bool moved = false;
         for (std::size_t d = 0; d < in.draws.size(); ++d) {
             const auto &draw = in.draws[d];
-            if (!draw.object || draw.faces.empty() || draw.faces.size() > 65536 ||
-                faces->size() + draw.faces.size() * 2 > 131072)
+            if (!draw.object || draw.faces.empty() || draw.faces.size() > 65536)
                 throw std::runtime_error("temporal face/object budget invalid");
+            expanded_faces += draw.faces.size();
+            if (expanded_faces > production::kAuthoringMaxSceneTriangles)
+                throw std::runtime_error("temporal expanded face budget invalid");
+            std::vector<std::uint64_t> face_ids;
+            face_ids.reserve(draw.faces.size());
+            for (auto face : draw.faces) {
+                if (!face.value)
+                    throw std::runtime_error("temporal face identity is zero");
+                face_ids.push_back(face.value);
+            }
+            const auto found = face_offsets.find(face_ids);
+            std::uint32_t offset = 0;
+            if (found != face_offsets.end()) {
+                offset = found->second;
+            } else {
+                if (faces->size() + face_ids.size() * 2 > 131072)
+                    throw std::runtime_error("temporal face/object budget invalid");
+                offset = static_cast<std::uint32_t>(faces->size());
+                for (auto face : face_ids) {
+                    faces->push_back(static_cast<std::uint32_t>(face));
+                    faces->push_back(static_cast<std::uint32_t>(face >> 32));
+                }
+                face_offsets.emplace(std::move(face_ids), offset);
+            }
+            face_bindings.insert(face_bindings.end(), {offset, static_cast<std::uint32_t>(draw.faces.size())});
             const auto current = matrix(draw.transform);
             bool supported = previous_ && d < previous_->draws.size() &&
                              previous_->draws[d].first == draw.object;
             moved |= supported && pose(previous_->draws[d].second) != pose(draw.transform);
             const auto old = supported ? matrix(previous_->draws[d].second) : current;
             const auto motion = floats(multiply(old, inverse(current)));
-            const auto offset = static_cast<std::uint32_t>(faces->size());
             plan.draw_words.insert(plan.draw_words.end(),
                                    {static_cast<std::uint32_t>(draw.object),
                                     static_cast<std::uint32_t>(draw.object >> 32), offset,
@@ -285,15 +311,12 @@ AuthoringTemporalHostState::prepare(const AuthoringTemporalHostInput &in) const 
             for (auto f : motion)
                 plan.draw_words.push_back(std::bit_cast<std::uint32_t>(f));
             plan.draw_words.insert(plan.draw_words.end(), {supported ? 1U : 0U, 0, 0, 0});
-            for (auto face : draw.faces) {
-                if (!face.value)
-                    throw std::runtime_error("temporal face identity is zero");
-                faces->push_back(static_cast<std::uint32_t>(face.value));
-                faces->push_back(static_cast<std::uint32_t>(face.value >> 32));
-            }
             next->draws.emplace_back(draw.object, draw.transform);
         }
-        plan.face_digest = words_digest(*faces);
+        // Bind per-draw ranges as well as shared table contents. Rebinding a
+        // draw to an existing range must invalidate its old topology history.
+        face_bindings.insert(face_bindings.end(), faces->begin(), faces->end());
+        plan.face_digest = words_digest(face_bindings);
         if (previous_ && plan.face_digest == previous_->face_digest)
             plan.face_words = previous_->faces;
         else

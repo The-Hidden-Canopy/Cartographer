@@ -14,10 +14,11 @@ static_assert(kAuthoringCpuMaxPixels == 1048576ULL);
 int main() try {
     const auto f = triangle_budget_fixture();
     const auto original = f.document.serialize();
-    const auto r = request(f);
+    auto r = request(f);
+    r.width = r.height = 1;
     const auto accepted = take(render_authoring_viewport(f.document, r));
     check(accepted.display_rgba8[center(accepted) * 4 + 3] != 0,
-          "CPU reference renders the 262144-triangle scene boundary");
+          "CPU reference renders the exact aggregate instance-triangle boundary");
     const auto overflow = one_triangle_over_scene_budget(f);
     const auto overflow_bytes = overflow.serialize();
     const auto refused = render_authoring_viewport(overflow, r);

@@ -350,9 +350,11 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID,
     if(!all(isfinite(hdr))) return float4(0,0,0,-((abs(camera_position_and_view.w)-1)*65536+primitive+1));
 #endif
 #ifdef CARTO_FUSED_IDENTITY
-    // Opaque/masked coverage only. At most 256 draws and 65,536 primitives
-    // make every packed ordinal exactly representable in float32 (<=2^24).
-    const float packed_identity = (abs(camera_position_and_view.w)-1.0)*65536.0 + primitive+1.0;
+    // Preserve integer identity bits in a positive normal float, rather than
+    // converting a >24-bit ordinal numerically. The bias avoids subnormal FTZ.
+    const uint draw_ordinal = (uint)(abs(camera_position_and_view.w)-1.0);
+    const uint identity = draw_ordinal*65536u + primitive + 1u;
+    const float packed_identity = asfloat(0x00800000u + identity);
     return float4(hdr, packed_identity);
 #else
     return float4(hdr, alpha);

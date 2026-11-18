@@ -20,9 +20,13 @@ inline constexpr std::uint64_t kAuthoringNativeMaxPixels = 3840ULL * 2160ULL;
 inline constexpr std::uint32_t kAuthoringNativeMaxDimension = 4096;
 inline constexpr std::uint64_t kAuthoringNativeAttachmentBudget = 1024ULL * 1024ULL * 1024ULL;
 // Aggregate visible-instance work, shared by reference and native rendering.
-// Detailed reusable components can coexist; per-mesh, primitive-ID, geometry
+// Detailed instanced fur on a pair of reusable components can coexist;
+// per-mesh, primitive-ID, geometry
 // cache and material-residency bounds remain independent admission gates.
-inline constexpr std::uint64_t kAuthoringMaxSceneTriangles = 262'144ULL;
+inline constexpr std::uint64_t kAuthoringMaxSceneTriangles = 4'194'304ULL;
+// Native material draws are separately bounded; instanced detailed component
+// pairs may share geometry while retaining independent transforms and regions.
+inline constexpr std::uint64_t kAuthoringNativeMaxDraws = 4'096ULL;
 [[nodiscard]] constexpr bool valid_authoring_native_extent(std::uint32_t w, std::uint32_t h) noexcept {
     const auto pixels = std::uint64_t(w) * h;
     return w && h && w <= kAuthoringNativeMaxDimension && h <= kAuthoringNativeMaxDimension &&

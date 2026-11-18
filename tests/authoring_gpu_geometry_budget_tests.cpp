@@ -1,4 +1,5 @@
 #include "authoring_surface_fixture.hpp"
+#include "authoring_triangle_budget_fixture.hpp"
 #include <carto/d3d12/authoring_viewport.hpp>
 #include <carto/d3d12/device.hpp>
 #include <carto/production/render_mesh.hpp>
@@ -149,6 +150,104 @@ void shared_geometry_material_orders(d3d12::AuthoringViewport& renderer) {
     }
     std::cout << "PASS shared geometry with textured/untextured materials in both orders\n";
 }
+
+void aggregate_instance_work(d3d12::AuthoringViewport& renderer) {
+    const auto f = triangle_budget_fixture();
+    const auto before = f.document.serialize();
+    auto r = request(f);
+    r.width = r.height = 1;
+    const auto accepted = take(renderer.render(f.document, r));
+    check(accepted.triangles == production::kAuthoringMaxSceneTriangles &&
+              accepted.image.display_rgba8[3] != 0 && accepted.geometry_upload_bytes < prepared_limit,
+          "exact aggregate instance work renders while shared geometry stays independently bounded");
+    const auto overflow = one_triangle_over_scene_budget(f);
+    const auto overflow_before = overflow.serialize();
+    const auto refused = renderer.render(overflow, r);
+    check(!refused && refused.error().message.find("triangle budget exceeded") != std::string::npos,
+          "one extra instance triangle is rejected at the larger scene boundary");
+    const auto recovered = take(renderer.render(f.document, r));
+    same_image(accepted.image, recovered.image);
+    check(recovered.geometry_upload_bytes == 0 && recovered.target_generation == accepted.target_generation,
+          "aggregate overflow preserves the good target and shared warm geometry");
+    check(f.document.serialize() == before && overflow.serialize() == overflow_before,
+          "larger aggregate admission and refusal preserve source documents");
+    std::cout << "PASS exact aggregate instance work, one-triangle overflow and recovery\n";
+}
+
+void native_draw_work(d3d12::AuthoringViewport& renderer) {
+    constexpr std::uint64_t requested_draws = 4096;
+    auto f = fixture();
+    auto nearest = f.front;
+    mutate(f.document, [&](auto& tx) {
+        okay(tx.remove_object(f.back));
+        for (std::uint64_t i = 1; i < requested_draws; ++i) {
+            const auto object = take(tx.create_object("Native draw boundary instance", {{0, 0, double(i) * .00001}}));
+            okay(tx.attach_mesh(object, f.front_mesh));
+            nearest = object;
+        }
+    });
+    const auto before = f.document.serialize();
+    auto r = request(f);
+    r.width = r.height = 1;
+    const auto accepted = take(renderer.render(f.document, r));
+    check(accepted.image.display_rgba8[3] != 0 &&
+              requested_draws == production::kAuthoringNativeMaxDraws &&
+              accepted.triangles == requested_draws && accepted.geometry_upload_bytes < prepared_limit,
+          "exact native draw boundary renders shared geometry below the independent triangle bound");
+    check(accepted.image.objects[0] == nearest &&
+              accepted.image.faces[0] == f.document.meshes().at(f.front_mesh).faces_sorted().front().id,
+          "high draw ordinals resolve the actual nearest authored object and face without aliasing");
+    auto overflow = f.document;
+    mutate(overflow, [&](auto& tx) {
+        const auto object = take(tx.create_object("One native draw over budget"));
+        okay(tx.attach_mesh(object, f.front_mesh));
+    });
+    const auto overflow_before = overflow.serialize();
+    const auto refused = renderer.render(overflow, r);
+    check(!refused && refused.error().message.find("draw budget exceeded") != std::string::npos,
+          "one additional native draw is rejected independently of triangle count");
+    const auto recovered = take(renderer.render(f.document, r));
+    same_image(accepted.image, recovered.image);
+    check(recovered.target_generation == accepted.target_generation && recovered.geometry_upload_bytes == 0,
+          "native draw overflow preserves the previous target and warm shared geometry");
+    check(f.document.serialize() == before && overflow.serialize() == overflow_before,
+          "native draw admission and rejection preserve both source documents");
+    std::cout << "PASS exact native draw work, one-draw overflow and recovery\n";
+}
+
+void maximum_primitive_identity(d3d12::AuthoringViewport& renderer) {
+    auto f = fixture();
+    constexpr std::uint64_t columns = 128, rows = 256, stride = columns + 1;
+    std::vector<geometry::Vertex> vertices;
+    std::vector<geometry::Face> faces;
+    for (std::uint64_t y = 0; y <= rows; ++y)
+        for (std::uint64_t x = 0; x <= columns; ++x)
+            vertices.push_back({geometry::VertexId{vertices.size() + 1}, {10 + double(x)*.001, 10 + double(y)*.001, 0}});
+    for (std::uint64_t y = 0; y < rows; ++y)
+        for (std::uint64_t x = 0; x < columns; ++x) {
+            const auto a = y*stride+x+1, b = a+1, c = a+stride, d = c+1;
+            for (const auto ids : {std::array{a,b,d},std::array{a,d,c}})
+                if (faces.size() < 65535)
+                    faces.push_back({geometry::FaceId{faces.size()+1},{geometry::VertexId{ids[0]},geometry::VertexId{ids[1]},geometry::VertexId{ids[2]}}});
+        }
+    const auto first = vertices.size()+1;
+    vertices.push_back({geometry::VertexId{first},{-1,-1,0}});
+    vertices.push_back({geometry::VertexId{first+1},{1,-1,0}});
+    vertices.push_back({geometry::VertexId{first+2},{0,1,0}});
+    faces.push_back({geometry::FaceId{65536},{geometry::VertexId{first},geometry::VertexId{first+1},geometry::VertexId{first+2}}});
+    geometry::EditableMesh mesh;
+    okay(mesh.insert_bulk(std::move(vertices),std::move(faces)));
+    attributes::AttributeSet payload({{attributes::AttributeDomain::face,65536}});
+    okay(payload.add_layer({{"cartographer.material_slot",attributes::AttributeDomain::face,attributes::AttributeType::uint32},std::vector<attributes::AttributeValue>(65536,std::uint32_t{1})}));
+    okay(mesh.set_attribute_payload(std::move(payload),{}));
+    mutate(f.document,[&](auto& tx){okay(tx.remove_object(f.back));okay(tx.replace_mesh(f.front_mesh,std::move(mesh)));});
+    const auto before=f.document.serialize();auto r=request(f);r.width=r.height=1;
+    const auto frame=take(renderer.render(f.document,r));
+    check(frame.image.objects[0]==f.front && frame.image.faces[0].value==65536,
+          "bit-preserving coverage retains the complete 16-bit primitive ordinal");
+    check(f.document.serialize()==before,"maximum primitive picking preserves source");
+    std::cout << "PASS maximum primitive identity in fused readback\n";
+}
 }
 
 int main() try {
@@ -156,6 +255,9 @@ int main() try {
     auto renderer = take(d3d12::AuthoringViewport::create_on_device(device));
     shared_geometry_material_orders(*renderer);
     independent_geometry_budget(*renderer);
+    aggregate_instance_work(*renderer);
+    native_draw_work(*renderer);
+    maximum_primitive_identity(*renderer);
     check(device->debug_receipts().empty(), "resource-bound checks leave native debug validation clean");
     return 0;
 } catch (const std::exception& e) {

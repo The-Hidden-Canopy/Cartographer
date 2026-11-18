@@ -967,7 +967,7 @@ int main(int argc, char **argv) {
             const auto br = request(bounded);
             const auto accepted = take(renderer->render(bounded.document, br));
             check(accepted.image.display_rgba8[center(accepted.image) * 4 + 3] != 0,
-                  "GPU renders 262144 triangles across bounded per-mesh instances");
+                  "GPU renders the exact aggregate boundary across bounded per-mesh instances");
             const auto overflow = one_triangle_over_scene_budget(bounded);
             const auto overflow_bytes = overflow.serialize();
             const auto refused = renderer->render(overflow, br);

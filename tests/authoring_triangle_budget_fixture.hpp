@@ -7,6 +7,12 @@ namespace {
 inline Fixture triangle_budget_fixture() {
     auto f = fixture();
     constexpr std::uint64_t cells = 32, stride = cells + 1;
+    constexpr auto instance_triangles = cells * cells * 2;
+    // Keep requested fixture work independent of the implementation limit:
+    // reverting that limit must reject this detailed-component regression.
+    constexpr std::uint64_t requested_scene_triangles = 4'194'304;
+    static_assert(requested_scene_triangles % instance_triangles == 0);
+    constexpr auto instance_count = requested_scene_triangles / instance_triangles;
     std::vector<geometry::Vertex> vertices;
     std::vector<geometry::Face> faces;
     for (std::uint64_t y = 0; y <= cells; ++y)
@@ -30,8 +36,8 @@ inline Fixture triangle_budget_fixture() {
     mutate(f.document, [&](auto& tx) {
         okay(tx.replace_mesh(f.front_mesh, std::move(grid)));
         okay(tx.remove_object(f.back));
-        for (unsigned i = 1; i < 128; ++i) {
-            const auto object = take(tx.create_object("Scene triangle budget instance"));
+        for (std::uint64_t i = 1; i < instance_count; ++i) {
+            const auto object = take(tx.create_object("Scene triangle budget instance", {{0, 0, double(i) * .00001}}));
             okay(tx.attach_mesh(object, f.front_mesh));
         }
     });
