@@ -189,7 +189,7 @@ struct Accessor {
 
 struct PrimitiveRecord {
     std::size_t position_accessor = 0, normal_accessor = 0, index_accessor = 0, material = 0;
-    std::optional<std::size_t> uv_accessor, tangent_accessor;
+    std::optional<std::size_t> uv_accessor, tangent_accessor, color_accessor;
     std::optional<std::uint32_t> slot;
     std::vector<geometry::FaceId> triangle_faces;
 };
@@ -409,6 +409,8 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
         return found == sculpt_meshes.end() ? source : found->second;
     };
     std::map<std::uint64_t, std::set<attributes::UvSetId>> authored_tangent_sets;
+    // One authored color4 layer per mesh travels as COLOR_0 (linear RGBA).
+    std::map<std::uint64_t, std::string> color_layers;
     bool has_edge_sharp_marks = false;
     for (const auto& [mesh_id, source_mesh] : document.meshes()) {
         const auto& mesh = effective_mesh(mesh_id, source_mesh);
@@ -447,9 +449,17 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
                 }
                 authored_tangent_sets[mesh_id].insert(descriptor->first);
             }
-            if (layer.descriptor.type == attributes::AttributeType::color4)
-                return core::Result<GltfExportReport>::failure(validation(
-                    "glTF export cannot preserve authored color layers on mesh " + std::to_string(mesh_id)));
+            if (layer.descriptor.type == attributes::AttributeType::color4) {
+                if (layer.descriptor.domain != attributes::AttributeDomain::vertex &&
+                    layer.descriptor.domain != attributes::AttributeDomain::corner)
+                    return core::Result<GltfExportReport>::failure(validation(
+                        "glTF COLOR_0 needs a vertex- or corner-domain color layer on mesh " + std::to_string(mesh_id)));
+                if (!color_layers.emplace(mesh_id, id).second)
+                    return core::Result<GltfExportReport>::failure(validation(
+                        "glTF export carries one color layer per mesh; mesh " + std::to_string(mesh_id) +
+                        " authors several"));
+                continue;
+            }
         }
         if (!export_materials && mesh.attributes().find("cartographer.material_slot") != nullptr)
             return core::Result<GltfExportReport>::failure(validation(
@@ -479,7 +489,8 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
             const bool supported = id == "cartographer.normal0" ||
                 id == "condition.material_region" || edge_sharp_marks ||
                 (id == "cartographer.material_slot" && export_materials) ||
-                declared_uv || authored_tangent;
+                declared_uv || authored_tangent ||
+                (color_layers.contains(mesh_id) && color_layers.at(mesh_id) == id);
             if (!supported) {
                 return core::Result<GltfExportReport>::failure(validation(
                     "glTF export cannot preserve attribute layer '" + id +
@@ -528,6 +539,8 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
         base_options.material_slot_layer=slots.value();
         if (mesh.attributes().find("cartographer.normal0") != nullptr)
             base_options.normal_layer = "cartographer.normal0";
+        if (const auto colors = color_layers.find(mesh_id); colors != color_layers.end())
+            base_options.vertex_color_layer = colors->second;
         auto base = production::compile_render_mesh_artifact(source_identity, mesh, base_options);
         if (!base)
             return core::Result<GltfExportReport>::failure(base.error());
@@ -590,11 +603,19 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
                 std::vector<core::Vec3d> render_positions, render_normals;
                 std::vector<std::array<float, 2>> texcoords;
                 std::vector<std::array<float, 4>> tangents;
+                std::vector<std::array<float, 4>> colors;
                 render_positions.reserve(source.vertices.size());
                 render_normals.reserve(source.vertices.size());
                 for (const auto &vertex : source.vertices) {
                     render_positions.push_back(vertex.position);
                     render_normals.push_back(vertex.normal);
+                    if (vertex.color) {
+                        const auto c = *vertex.color;
+                        colors.push_back({static_cast<float>(std::clamp(c.x, 0.0, 1.0)),
+                                          static_cast<float>(std::clamp(c.y, 0.0, 1.0)),
+                                          static_cast<float>(std::clamp(c.z, 0.0, 1.0)),
+                                          static_cast<float>(std::clamp(c.w, 0.0, 1.0))});
+                    }
                     if (vertex.uv) {
                         auto coord = finite_vec2(*vertex.uv, "mesh UV");
                         if (!coord)
@@ -762,7 +783,21 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
                     tangent_accessor = accessors.size() - 1U;
                 }
 
+                std::optional<std::size_t> color_accessor;
+                if (!colors.empty()) {
+                    if (colors.size() != positions.size())
+                        return core::Result<GltfExportReport>::failure(validation(
+                            "glTF COLOR_0 must cover every exported vertex"));
+                    align_four(buffer);
+                    const std::size_t color_offset = buffer.size();
+                    append_vector(buffer, colors);
+                    views.push_back({color_offset, colors.size() * sizeof(colors.front()), kGlArrayBuffer});
+                    accessors.push_back({views.size() - 1U, kGlFloat, colors.size(), "VEC4", {}, {}, false});
+                    color_accessor = accessors.size() - 1U;
+                }
+
                 PrimitiveRecord primitive;
+                primitive.color_accessor = color_accessor;
                 primitive.position_accessor = position_accessor;
                 primitive.normal_accessor = normal_accessor;
                 primitive.uv_accessor = uv_accessor;
@@ -1024,6 +1059,8 @@ static core::Result<GltfExportReport> export_interchange(const project::ProjectD
                 json << ",\"TEXCOORD_0\":" << *primitive.uv_accessor;
             if (primitive.tangent_accessor)
                 json << ",\"TANGENT\":" << *primitive.tangent_accessor;
+            if (primitive.color_accessor)
+                json << ",\"COLOR_0\":" << *primitive.color_accessor;
             json << "},\"indices\":" << primitive.index_accessor
                  << ",\"material\":" << primitive.material << ",\"mode\":" << kGlTriangles
                  << ",\"extras\":{\"cartographer_mesh_id\":" << mesh.source_id;

@@ -1165,6 +1165,11 @@ int main(int argc, char** argv) {
         okay(color_attributes.add_layer({{"color.corner", attributes::AttributeDomain::corner,
                                          attributes::AttributeType::color4},
                                         std::vector<attributes::AttributeValue>(6, core::Vec4d{.2, .4, .6, 1})}));
+        // One COLOR_0 layer is now supported; several authored layers must still
+        // refuse rather than silently choose one and overwrite a good artifact.
+        okay(color_attributes.add_layer({{"color.second", attributes::AttributeDomain::corner,
+                                         attributes::AttributeType::color4},
+                                        std::vector<attributes::AttributeValue>(6, core::Vec4d{.1, .3, .5, 1})}));
         okay(color_mesh.set_attribute_payload(std::move(color_attributes), color_mesh.uv_sets()));
         auto color_root = root / "authored-color";
         std::filesystem::create_directory(color_root);
@@ -1172,7 +1177,7 @@ int main(int argc, char** argv) {
         auto color_export = io::export_gltf(color_scene.doc, good);
         check(!color_export && color_export.error().message.find("color") != std::string::npos &&
                   read(good) == before,
-              "authored color loss is refused without replacing prior glTF");
+              "multiple authored color layers refuse without replacing prior glTF");
         auto custom_mesh = fixture();
         auto custom_attributes = custom_mesh.attributes();
         okay(custom_attributes.add_layer({{"author.roughness", attributes::AttributeDomain::face,

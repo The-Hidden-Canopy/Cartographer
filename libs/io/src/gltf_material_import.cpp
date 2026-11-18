@@ -816,7 +816,8 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
                     !get(object(extra), "condition_material_region").empty();
             std::vector<geometry::Vertex> vertices;
             std::vector<geometry::Face> faces;
-            std::vector<attributes::AttributeValue> normals, tangents, uvs, slots;
+            std::vector<attributes::AttributeValue> normals, tangents, uvs, slots, colors;
+            bool any_color = false;
             std::map<std::pair<std::uint64_t, std::size_t>, geometry::VertexId> ids;
             std::set<attributes::UvSetId> uv_ids;
             bool any_uv = false, any_tangent = false, missing_tangent = false;
@@ -835,7 +836,7 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
                 if (integer(get(primitive, "mode", "4")) != 4)
                     throw std::runtime_error("only triangle-list primitives are supported");
                 const auto attrs = object(get(primitive, "attributes"));
-                fields(attrs, {"POSITION", "NORMAL", "TANGENT", "TEXCOORD_0"});
+                fields(attrs, {"POSITION", "NORMAL", "TANGENT", "TEXCOORD_0", "COLOR_0"});
                 const auto position_id = integer(get(attrs, "POSITION"));
                 const auto positions = accessor(position_id, "VEC3");
                 if (positions.type != 5126 || positions.normalized)
@@ -867,6 +868,18 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
                 const auto ns = optional_accessor("NORMAL", "VEC3"),
                            ts = optional_accessor("TANGENT", "VEC4"),
                            us = optional_accessor("TEXCOORD_0", "VEC2");
+                // COLOR_0: linear RGB(A), float or normalized unsigned; becomes a
+                // corner-domain color4 layer the native renderer reads as vertex color.
+                std::optional<Accessor> cs;
+                if (auto v = get(attrs, "COLOR_0"); !v.empty()) {
+                    const auto shape = text(get(object(accessors.at(static_cast<std::size_t>(integer(v)))), "type"));
+                    if (shape != "VEC3" && shape != "VEC4")
+                        throw std::runtime_error("COLOR_0 must be VEC3 or VEC4");
+                    cs = optional_accessor("COLOR_0", shape);
+                    if (cs->type != 5126 && !cs->normalized)
+                        throw std::runtime_error("COLOR_0 must be float or normalized unsigned");
+                    any_color = true;
+                }
                 if ((ns && (ns->type != 5126 || ns->normalized)) ||
                     (ts && (ts->type != 5126 || ts->normalized)) ||
                     (us && us->type != 5126 && !us->normalized))
@@ -952,6 +965,16 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
                         normals.push_back(normal);
                         uvs.push_back(us ? core::Vec2d{value(*us, index, 0), value(*us, index, 1)}
                                          : core::Vec2d{});
+                        if (cs) {
+                            const core::Vec4d c{value(*cs, index, 0), value(*cs, index, 1), value(*cs, index, 2),
+                                                cs->components == 4 ? value(*cs, index, 3) : 1.0};
+                            if (!c.finite() || c.x < 0 || c.x > 1 || c.y < 0 || c.y > 1 || c.z < 0 || c.z > 1 ||
+                                c.w < 0 || c.w > 1)
+                                throw std::runtime_error("COLOR_0 components must be finite and in [0, 1]");
+                            colors.push_back(c);
+                        } else {
+                            colors.push_back(core::Vec4d{1.0, 1.0, 1.0, 1.0});
+                        }
                         core::Vec4d tangent{};
                         if (ts) {
                             tangent = {value(*ts, index, 0), value(*ts, index, 1),
@@ -996,6 +1019,8 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
                   attributes::AttributeType::vec3, normals);
             layer("cartographer.material_slot", attributes::AttributeDomain::face,
                   attributes::AttributeType::uint32, slots);
+            if (any_color)
+                layer("gltf.color0", attributes::AttributeDomain::corner, attributes::AttributeType::color4, colors);
             attributes::UvSetTable sets;
             if (any_uv) {
                 if (uv_ids.empty())

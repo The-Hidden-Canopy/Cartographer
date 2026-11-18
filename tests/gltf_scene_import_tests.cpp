@@ -68,6 +68,40 @@ std::vector<std::uint8_t> replace(std::vector<std::uint8_t> bytes, std::string_v
     s.replace(pos, old.size(), text);
     return {s.begin(), s.end()};
 }
+std::vector<std::uint8_t> color_fixture(
+    const std::array<std::array<float, 4>, 3>& colors, unsigned components = 4,
+    bool normalized_bytes = false) {
+    std::vector<std::uint8_t> bytes;
+    for (const auto& p : std::array<std::array<float, 3>, 3>{{{0,0,0},{1,0,0},{0,1,0}}})
+        for (float v : p) append(bytes, std::bit_cast<std::uint32_t>(v));
+    for (const auto& c : colors)
+        for (unsigned i = 0; i < components; ++i)
+            if (normalized_bytes) bytes.push_back(static_cast<std::uint8_t>(c[i]));
+            else append(bytes, std::bit_cast<std::uint32_t>(c[i]));
+    const auto color_bytes = bytes.size() - 36;
+    std::ostringstream json;
+    json << R"({"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],"nodes":[{"mesh":0}],"meshes":[{"primitives":[{"attributes":{"POSITION":0,"COLOR_0":1},"material":0}]}],"materials":[{"doubleSided":true,"pbrMetallicRoughness":{"baseColorFactor":[1,1,1,1],"metallicFactor":0,"roughnessFactor":0.5}}],"buffers":[{"byteLength":)"
+         << bytes.size() << R"(,"uri":"data:application/octet-stream;base64,)" << b64(bytes)
+         << R"("}],"bufferViews":[{"buffer":0,"byteLength":36},{"buffer":0,"byteOffset":36,"byteLength":)"
+         << color_bytes << R"(}],"accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},{"bufferView":1,"componentType":)"
+         << (normalized_bytes ? 5121 : 5126) << R"(,"normalized":)"
+         << (normalized_bytes ? "true" : "false") << R"(,"count":3,"type":"VEC)" << components << R"("}]})";
+    const auto text = json.str();
+    return {text.begin(), text.end()};
+}
+void check_corner_colors(const geometry::EditableMesh& mesh,
+                         const std::array<std::array<float, 4>, 3>& expected) {
+    const auto* layer = mesh.attributes().find("gltf.color0");
+    check(layer && layer->descriptor.domain == attributes::AttributeDomain::corner &&
+          layer->descriptor.type == attributes::AttributeType::color4 && layer->values.size() == 3,
+          "COLOR_0 creates exactly three typed corner colors");
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto actual = std::get<core::Vec4d>(layer->values[i]);
+        check(actual.x == expected[i][0] && actual.y == expected[i][1] &&
+              actual.z == expected[i][2] && actual.w == expected[i][3],
+              "corner RGBA components retain their exact promoted float values");
+    }
+}
 project::ProjectDocument document(application::ApplicationSession &s) {
     return take(s.authoring_viewport_source(s.snapshot().project_revision));
 }
@@ -350,6 +384,62 @@ int main(int argc, char **argv) {
                                                       assets::sha256(bytes)),
                   "general scene path does not weaken botanical provenance fence");
         }
+        // Distinct authored RGBA values, including zero/intermediate alpha,
+        // must survive the real application admission and both export formats.
+        const std::array<std::array<float, 4>, 3> rgba{{
+            {0.125f, 0.25f, 0.5f, 0.0f}, {1.0f, 0.5f, 0.25f, 0.5f},
+            {0.0f, 0.75f, 1.0f, 1.0f}}};
+        const auto colored_bytes = color_fixture(rgba);
+        check_corner_colors(take(io::import_gltf_scene(colored_bytes)).meshes[0], rgba);
+        auto rgb_expected = rgba;
+        for (auto& c : rgb_expected) c[3] = 1.0f;
+        check_corner_colors(take(io::import_gltf_scene(color_fixture(rgba, 3))).meshes[0], rgb_expected);
+        const std::array<std::array<float, 4>, 3> byte_colors{{
+            {0, 51, 102, 153}, {255, 204, 153, 102}, {51, 0, 255, 255}}};
+        const auto normalized = take(io::import_gltf_scene(color_fixture(byte_colors, 4, true)));
+        const auto* normalized_layer = normalized.meshes[0].attributes().find("gltf.color0");
+        check(normalized_layer && normalized_layer->values.size() == 3, "normalized unsigned colors import");
+        for (std::size_t i = 0; i < 3; ++i) {
+            const auto c = std::get<core::Vec4d>(normalized_layer->values[i]);
+            check(c.x == byte_colors[i][0] / 255.0 && c.y == byte_colors[i][1] / 255.0 &&
+                  c.z == byte_colors[i][2] / 255.0 && c.w == byte_colors[i][3] / 255.0,
+                  "normalized unsigned RGBA values decode exactly");
+        }
+        for (bool binary : {false, true}) {
+            application::ApplicationSession session;
+            send(session, application::NewProjectAction{"Vertex color roundtrip"});
+            const auto project_path = root / (binary ? "colors-binary.carto" : "colors-json.carto");
+            send(session, application::SaveProjectAction{project_path});
+            const auto input = root / (binary ? "colors-input-binary.gltf" : "colors-input-json.gltf");
+            { std::ofstream file(input, std::ios::binary);
+              file.write(reinterpret_cast<const char*>(colored_bytes.data()), colored_bytes.size());
+              check(bool(file), "color input written"); }
+            take(carto::testing::import_gltf_scene_file(session, input, true));
+            const auto imported = document(session);
+            check_corner_colors(imported.meshes().begin()->second, rgba);
+            const auto output = root / (binary ? "colors-roundtrip.glb" : "colors-roundtrip.gltf");
+            io::GltfExportOptions options;
+            options.project_path = project_path;
+            if (binary) take(io::export_glb(imported, output, options));
+            else take(io::export_gltf(imported, output, options));
+            const auto encoded = read(output);
+            const auto decoded = take(io::import_gltf_scene({
+                reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size()}));
+            check_corner_colors(decoded.meshes[0], rgba);
+        }
+        auto invalid_colors = rgba;
+        invalid_colors[1][2] = 1.01f;
+        reject(color_fixture(invalid_colors), "color above one is rejected rather than clamped");
+        invalid_colors[1][2] = -0.01f;
+        reject(color_fixture(invalid_colors), "negative color is rejected rather than clamped");
+        invalid_colors[1][2] = std::bit_cast<float>(std::uint32_t{0x7fc00000});
+        reject(color_fixture(invalid_colors), "NaN color is rejected");
+        reject(replace(colored_bytes, "\"type\":\"VEC4\"", "\"type\":\"SCALAR\""),
+               "scalar color shape is rejected");
+        reject(replace(colored_bytes, "\"normalized\":false,\"count\":3", "\"normalized\":false,\"count\":2"),
+               "color accessor shorter than position accessor is rejected");
+        reject(replace(color_fixture(byte_colors, 4, true), "\"normalized\":true", "\"normalized\":false"),
+               "unnormalized integer colors are rejected");
         const auto json = fixture();
         reject(replace(json, "\"count\":3", "\"count\":600001"), "excessive accessor rejected");
         reject(replace(json, "\"byteOffset\":144", "\"byteOffset\":18446744073709551615"),
@@ -367,8 +457,15 @@ int main(int argc, char **argv) {
         check(!animation_result&&animation_result.error().message.find("animations require an explicit compatible adapter")!=std::string::npos,"static scene import reports animation loss as refusal, not rig/animation support");
         reject(replace(json, "\"indices\":4", "\"indices\":4,\"targets\":[{}]"),
                "morph targets rejected");
-        reject(replace(json, "\"POSITION\":0", "\"POSITION\":0,\"COLOR_0\":0"),
-               "unsupported vertex color rejected");
+        {
+            // COLOR_0 imports as the gltf.color0 corner color4 layer; a
+            // malformed (scalar) colour accessor is still refused.
+            const auto colored = io::import_gltf_scene(
+                replace(json, "\"POSITION\":0", "\"POSITION\":0,\"COLOR_0\":0"));
+            check(static_cast<bool>(colored), "VEC3 vertex color imports");
+        }
+        reject(replace(json, "\"POSITION\":0", "\"POSITION\":0,\"COLOR_0\":4"),
+               "scalar vertex color accessor rejected");
         reject(replace(json, "\"componentType\":5121", "\"componentType\":5126"),
                "float indices rejected");
         auto unsafe =

@@ -450,6 +450,10 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
             texture.mips.levels.front().width != current->second.width || texture.mips.levels.front().height != current->second.height)
             return Output::failure({core::ErrorCode::stale_data, "render texture differs from the current project source record"});
     }
+    // One source identity for the whole capture; each mesh compiles once.
+    const auto render_source = production::project_render_source(project_identity, document);
+    if (!render_source) return Output::failure(render_source.error());
+    std::map<std::uint64_t, core::Result<production::RenderMeshArtifact>> compiled_meshes;
     for (const auto& object : document.scene().objects_sorted()) {
         if (!object.visible || !object.mesh_asset.has_value()) continue;
         if (request.objects.size() >= 4096U)
@@ -479,8 +483,15 @@ core::Result<SceneRenderRequest> prepare_project_scene_render(
         options.generate_tangents = has_uv0;
         options.vertex_color_layer = vertex_color_layer;
         options.material_slot_layer = condition_regions ? "condition.material_region" : "cartographer.material_slot";
-        const auto compiled = production::compile_render_mesh_artifact(project_identity, document, *object.mesh_asset, options);
-        if (!compiled) return Output::failure(compiled.error());
+        // Objects placing the same mesh share one compiled artifact: options here
+        // depend only on the mesh, so instanced vegetation compiles once.
+        auto cached = compiled_meshes.find(*object.mesh_asset);
+        if (cached == compiled_meshes.end()) {
+            auto fresh = production::compile_render_mesh_artifact(render_source.value(), mesh, options);
+            if (!fresh) return Output::failure(fresh.error());
+            cached = compiled_meshes.emplace(*object.mesh_asset, std::move(fresh)).first;
+        }
+        const auto& compiled = cached->second;
         SceneRenderObject rendered;
         rendered.object = object.id; rendered.mesh = compiled.value();
         const auto world = document.scene().world_transform(object.id);

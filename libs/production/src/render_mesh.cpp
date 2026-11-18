@@ -1589,43 +1589,49 @@ core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
     return core::Result<RenderMeshArtifact>::success(std::move(artifact));
 }
 
-core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
+core::Result<AuthoritativeSource> project_render_source(
     std::string_view project_identity,
-    const project::ProjectDocument& document,
-    std::uint64_t mesh_asset_id,
-    const RenderMeshCompileOptions& options) {
+    const project::ProjectDocument& document) {
     if (!safe_project_identity(project_identity)) {
-        return core::Result<RenderMeshArtifact>::failure(invalid(
+        return core::Result<AuthoritativeSource>::failure(invalid(
             "project identity must be a bounded non-path identifier"));
     }
-    if (mesh_asset_id == 0U) {
-        return core::Result<RenderMeshArtifact>::failure(invalid(
-            "render-mesh compilation requires a non-zero project mesh asset ID"));
-    }
     if (auto result = document.validate(); !result) {
-        return core::Result<RenderMeshArtifact>::failure(result.error());
+        return core::Result<AuthoritativeSource>::failure(result.error());
     }
-    const auto mesh = document.meshes().find(mesh_asset_id);
-    if (mesh == document.meshes().end()) {
-        return core::Result<RenderMeshArtifact>::failure(not_found(
-            "requested render-mesh asset is not present in the project document"));
-    }
-
     const std::string canonical_document = document.serialize();
     constexpr std::size_t max_project_bytes = 128U * 1024U * 1024U;
     if (canonical_document.empty() || canonical_document.size() > max_project_bytes) {
-        return core::Result<RenderMeshArtifact>::failure(validation(
+        return core::Result<AuthoritativeSource>::failure(validation(
             "canonical project source exceeds the render-mesh source-digest bound"));
     }
     const auto source_digest = assets::sha256(std::span<const std::uint8_t>{
         reinterpret_cast<const std::uint8_t*>(canonical_document.data()),
         canonical_document.size()});
-    const AuthoritativeSource source{
+    return core::Result<AuthoritativeSource>::success(AuthoritativeSource{
         "project/" + std::string(project_identity),
         document.revision(),
         source_digest,
-    };
-    return compile_render_mesh_artifact(source, mesh->second, options);
+    });
+}
+
+core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
+    std::string_view project_identity,
+    const project::ProjectDocument& document,
+    std::uint64_t mesh_asset_id,
+    const RenderMeshCompileOptions& options) {
+    if (mesh_asset_id == 0U) {
+        return core::Result<RenderMeshArtifact>::failure(invalid(
+            "render-mesh compilation requires a non-zero project mesh asset ID"));
+    }
+    const auto source = project_render_source(project_identity, document);
+    if (!source) return core::Result<RenderMeshArtifact>::failure(source.error());
+    const auto mesh = document.meshes().find(mesh_asset_id);
+    if (mesh == document.meshes().end()) {
+        return core::Result<RenderMeshArtifact>::failure(not_found(
+            "requested render-mesh asset is not present in the project document"));
+    }
+    return compile_render_mesh_artifact(source.value(), mesh->second, options);
 }
 
 } // namespace carto::production

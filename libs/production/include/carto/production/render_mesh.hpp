@@ -159,6 +159,13 @@ struct PbrMeshUpload {
     const geometry::EditableMesh& mesh,
     const RenderMeshCompileOptions& options = {});
 
+// Validates the whole ProjectDocument once and derives its source identity
+// (revision and canonical-serialization digest). Callers compiling many meshes
+// from one document reuse it instead of re-serializing per mesh.
+[[nodiscard]] core::Result<AuthoritativeSource> project_render_source(
+    std::string_view project_identity,
+    const project::ProjectDocument& document);
+
 // Saved-document overload: validates the whole ProjectDocument, derives its
 // source digest from canonical project serialization, and selects the mesh by
 // its project asset ID. project_identity must be a stable non-path identifier.

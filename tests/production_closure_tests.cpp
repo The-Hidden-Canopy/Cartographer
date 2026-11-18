@@ -1723,6 +1723,16 @@ void compiled_render_mesh_publishes_through_receipt_store() {
     const auto artifact = compile_render_mesh_artifact(
         "public-fixture", loaded.value(), mesh_asset.value(), options);
     require(static_cast<bool>(artifact), "receipt fixture compiles its source mesh");
+    const auto shared_source = project_render_source("public-fixture", loaded.value());
+    require(shared_source && shared_source.value().revision == source.revision &&
+                shared_source.value().content_digest == source.content_digest,
+            "shared project source retains exact canonical identity");
+    require(!project_render_source("../private/path", loaded.value()),
+            "shared project source rejects path identities");
+    const auto reused = compile_render_mesh_artifact(shared_source.value(),
+        loaded.value().meshes().at(mesh_asset.value()), options);
+    require(reused && reused.value().serialize().value() == artifact.value().serialize().value(),
+            "shared-source compilation exactly matches saved-document compilation");
     require(artifact.value().source_revision == source.revision &&
                 artifact.value().source_digest == source.content_digest,
             "project overload binds canonical saved content and project revision");
