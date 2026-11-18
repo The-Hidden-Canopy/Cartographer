@@ -135,6 +135,28 @@ float3 fresnel_schlick(float cos_theta, float3 f0)
     return f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
 }
 
+#ifdef CARTO_AUTHORING_SURFACE
+// Same shortest-rotation frame transport used by the scene renderer. Directly
+// projecting the old tangent can collapse when a normal map points along it.
+float3 authoring_transport_tangent(float3 geometric, float3 tangent, float3 shading)
+{
+    float3 axis = cross(geometric, shading);
+    const float sine_squared = dot(axis, axis);
+    if (sine_squared > 1e-12) {
+        const float sine = sqrt(sine_squared);
+        axis /= sine;
+        const float cosine = clamp(dot(geometric, shading), -1.0, 1.0);
+        tangent = tangent*cosine + cross(axis,tangent)*sine +
+                  axis*(dot(axis,tangent)*(1.0-cosine));
+    }
+    tangent -= shading*dot(shading,tangent);
+    const float length_squared = dot(tangent,tangent);
+    if (length_squared > 1e-12) return tangent*rsqrt(length_squared);
+    const float3 reference = abs(shading.z) < .999 ? float3(0,0,1) : float3(0,1,0);
+    return normalize(cross(reference,shading));
+}
+#endif
+
 float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID,
               bool front_facing : SV_IsFrontFace) : SV_TARGET
 {
@@ -232,10 +254,12 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID,
     if(anisotropy>0) {
         // glTF KHR_materials_anisotropy: alpha_t = mix(alpha, 1, s^2), alpha_b = alpha,
         // along the mesh tangent rotated by the authored angle.
-        float3 t0=normalize(input.world_tangent-normal*dot(normal,input.world_tangent));
+        const float3 geometric_tangent=normalize(input.world_tangent-
+            geometric_normal*dot(geometric_normal,input.world_tangent));
+        const float3 t0=authoring_transport_tangent(geometric_normal,geometric_tangent,normal);
         float3 b0=cross(normal,t0)*input.tangent_sign;
         const float c=cos(material.anisotropy_rotation),s=sin(material.anisotropy_rotation);
-        const float3 t=normalize(t0*c+b0*s),b=normalize(cross(normal,t));
+        const float3 t=normalize(t0*c+b0*s),b=normalize(cross(normal,t))*input.tangent_sign;
         const float alpha=max(roughness*roughness,0.045*0.045);
         const float at=lerp(alpha,1.0,anisotropy*anisotropy),ab=alpha;
         const float3 h=float3(dot(half_vector,t),dot(half_vector,b),n_dot_h);
@@ -244,7 +268,8 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID,
         // Bent reflection normal for the environment (stretched highlight).
         const float3 anisotropic_tangent=cross(b,view);
         const float3 anisotropic_normal=cross(anisotropic_tangent,b);
-        specular_normal=normalize(lerp(normal,anisotropic_normal,anisotropy*saturate(1.0-roughness*0.5)));
+        const float3 bent=lerp(normal,anisotropic_normal,anisotropy*saturate(1.0-roughness*0.5));
+        if(dot(bent,bent)>1e-12) specular_normal=normalize(bent);
     }
 #endif
     const float geometry = geometry_schlick_ggx(n_dot_l, roughness) *

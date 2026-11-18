@@ -31,10 +31,9 @@ or human visual acceptance. The wider fresh build emitted existing warnings in
 unrelated project, asset, import, application, UI and test sources; they were
 not changed as part of this repair.
 
-Scalar anisotropy without textures or a dynamic graph still bypasses the v5
-surface shader. Correcting that path also requires establishing the authored
-tangent/UV convention; a fabricated fallback tangent is not evidence of
-correct brushed-metal rendering. Scene geometry behind glass remains outside
-the authoring preview's refraction path, and v5 optical texture maps remain
-explicitly unsupported there. Further pipeline integration and actual
-cross-engine visual acceptance remain open.
+At this change, scalar anisotropy without textures or a dynamic graph still
+bypassed the v5 surface shader. The subsequent authoring anisotropy repair is
+recorded in `authoring-scalar-anisotropy-20261118.md`. Scene geometry behind
+glass remains outside the authoring preview's refraction path, and v5 optical
+texture maps remain explicitly unsupported there. Further pipeline integration
+and actual cross-engine visual acceptance remain open.

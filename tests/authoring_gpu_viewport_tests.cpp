@@ -122,6 +122,150 @@ void compare(const production::AuthoringViewportImage &cpu,
     check(std::abs(cpu_count - gpu_count) < long(cpu.width + cpu.height),
           "GPU coverage agrees beyond a center pixel");
 }
+geometry::EditableMesh anisotropy_triangle(bool uv0, bool rotated, bool mirrored, bool uv9,
+                                           bool authored_tangent) {
+    auto mesh = triangle();
+    attributes::AttributeSet attrs(
+        {{attributes::AttributeDomain::face, 1}, {attributes::AttributeDomain::corner, 3}});
+    okay(attrs.add_layer({{"cartographer.material_slot", attributes::AttributeDomain::face,
+                           attributes::AttributeType::uint32}, {std::uint32_t{1}}}));
+    attributes::UvSetTable sets;
+    if (uv0) {
+        std::array<core::Vec2d, 3> values{{{0, 1}, {1, 1}, {.5, 0}}};
+        for (auto &v : values) {
+            if (rotated) v = {v.y, -v.x};
+            if (mirrored) v.y = -v.y;
+        }
+        okay(attrs.add_layer({{"uv.zero", attributes::AttributeDomain::corner,
+                               attributes::AttributeType::vec2},
+                              {values[0], values[1], values[2]}}));
+        okay(sets.add({render::kUv0, "UV0", "uv.zero", true, true, false, 1}));
+    }
+    if (uv9) {
+        okay(attrs.add_layer({{"uv.nine", attributes::AttributeDomain::corner,
+                               attributes::AttributeType::vec2},
+                              {core::Vec2d{1, 0}, core::Vec2d{0, 0}, core::Vec2d{.5, 1}}}));
+        okay(sets.add({9, "UV9", "uv.nine", !uv0, !uv0, false, 1}));
+    }
+    if (authored_tangent) {
+        const core::Vec4d tangent{0, -1, 0, -1};
+        okay(attrs.add_layer({{"cartographer.tangent.1", attributes::AttributeDomain::corner,
+                               attributes::AttributeType::vec4},
+                              {tangent, tangent, tangent}}));
+    }
+    okay(mesh.set_attribute_payload(std::move(attrs), std::move(sets)));
+    return mesh;
+}
+
+void native_scalar_anisotropy_cases(d3d12::AuthoringViewport &renderer) {
+    auto f = fixture();
+    auto r = request(f);
+    r.transform_overrides[f.front] = {{}, {.12, .18, 0, std::sqrt(1 - .12*.12 - .18*.18)}};
+    const auto base_texture = pixels(82, 2, 2,
+        {{240, 32, 16, 255}, {16, 220, 32, 255}, {32, 16, 240, 255}, {240, 220, 16, 255}});
+    const auto normal_texture = pixels(83, 1, 1, {{255, 128, 128, 255}});
+    auto library = std::make_shared<production::AuthoringTextureLibrary>();
+    okay(library->admit(base_texture.record, base_texture.encoded));
+    okay(library->admit(normal_texture.record, normal_texture.encoded));
+    r.textures = library;
+    const auto frame = [&](double strength, double rotation, bool uv0 = true,
+                           bool rotated = false, bool mirrored = false, bool textured = false,
+                           double roughness = .35, unsigned normal_uv = 0,
+                           bool mirrored_object = false, bool authored_tangent = false) {
+        auto scene = f.document;
+        mutate(scene, [&](auto &tx) {
+            okay(tx.replace_mesh(f.front_mesh,
+                anisotropy_triangle(uv0, rotated, mirrored, textured || normal_uv == 9,
+                                    authored_tangent)));
+        });
+        auto catalog = scene.material_catalog();
+        auto material = catalog.materials().at(1);
+        material.revision = material.revision.next();
+        material.definition.base_color_factor = {.8, .7, .6, 1};
+        material.definition.metallic = 1;
+        material.definition.roughness = roughness;
+        material.definition.anisotropy = strength;
+        material.definition.anisotropy_rotation = rotation;
+        if (textured) {
+            okay(catalog.insert_texture(base_texture.record));
+            material.definition.base_color = {82, 9};
+        }
+        if (normal_uv != 0) {
+            okay(catalog.insert_texture(normal_texture.record));
+            material.definition.normal = {83, normal_uv};
+        }
+        okay(catalog.replace_material(material));
+        set_materials(scene, std::move(catalog));
+        auto current_request = r;
+        if (mirrored_object) current_request.transform_overrides[f.front].scale.x = -1;
+        return renderer.render(std::make_shared<const project::ProjectDocument>(scene),
+                               current_request);
+    };
+    const auto missing = frame(.8, 0, false);
+    check(!missing && missing.error().message.find("UV0") != std::string::npos,
+          "anisotropy without UV0 must fail explicitly, not invent a tangent");
+    const auto x = take(frame(.8, 0)).image;
+    const auto y = take(frame(.8, std::numbers::pi / 2)).image;
+    const auto pixel = center(x);
+    check(x.objects[pixel] == f.front && y.objects[pixel] == f.front,
+          "anisotropy test samples the same covered surface");
+    const auto difference = [](core::Vec3d a, core::Vec3d b) {
+        return std::abs(a.x-b.x) + std::abs(a.y-b.y) + std::abs(a.z-b.z);
+    };
+    check(difference(x.linear_hdr[pixel], y.linear_hdr[pixel]) > 1e-3,
+          "untextured authored anisotropy rotation changes the GPU highlight");
+    // Independent scalar expectation for this fixture's direct-light D*G/F
+    // model: orthographic view and directional light both point along +Z.
+    const core::Quaternion orientation{.12, .18, 0, std::sqrt(1 - .12*.12 - .18*.18)};
+    const core::Vec3d direction{0, 0, 1};
+    const double ndot = core::dot(orientation.rotate({0, 0, 1}), direction);
+    const double ht = core::dot(orientation.rotate({1, 0, 0}), direction);
+    const double hb = core::dot(orientation.rotate({0, -1, 0}), direction);
+    const double alpha = .35 * .35;
+    const double at = alpha + (1 - alpha) * .8 * .8;
+    const double ellipse = ht*ht/(at*at) + hb*hb/(alpha*alpha) + ndot*ndot;
+    const double distribution = 1 / (std::numbers::pi * at * alpha * ellipse * ellipse);
+    const double k = (alpha + 1) * (alpha + 1) / 8;
+    const double g = ndot / (ndot * (1-k) + k);
+    const double scale = distribution * g * g * 2 / ndot;
+    const auto measured = x.linear_hdr[pixel];
+    check(std::abs(measured.x - .8*scale) < 1e-3 + .002*scale &&
+              std::abs(measured.y - .7*scale) < 1e-3 + .002*scale &&
+              std::abs(measured.z - .6*scale) < 1e-3 + .002*scale,
+          "GPU anisotropic response agrees with the independent directional expectation");
+    const auto rotated_uv = take(frame(.8, 0, true, true)).image;
+    check(difference(y.linear_hdr[pixel], rotated_uv.linear_hdr[pixel]) < 1e-3,
+          "a quarter-turn of UV0 matches the equivalent authored rotation");
+    const auto authored = take(frame(.8, 0, true, false, false, false, .35, 0, false, true)).image;
+    check(difference(y.linear_hdr[pixel], authored.linear_hdr[pixel]) < 1e-3,
+          "an authored UV0 tangent controls the anisotropy direction");
+    const auto positive = take(frame(.8, .4)).image;
+    const auto mirrored_uv = take(frame(.8, -.4, true, false, true)).image;
+    check(difference(positive.linear_hdr[pixel], mirrored_uv.linear_hdr[pixel]) < 1e-3,
+          "mirrored UV handedness reverses the anisotropy rotation");
+    const auto mirrored_object = take(frame(.8, -.4, true, false, false, false, .35, 0, true)).image;
+    check(mirrored_object.objects[pixel] == f.front &&
+              difference(positive.linear_hdr[pixel], mirrored_object.linear_hdr[pixel]) < 1e-3,
+          "mirrored object transform preserves the tangent-frame handedness");
+    const auto ordinary_texture = take(frame(0, 0, true, false, false, true, 1.)).image;
+    const auto anisotropic_texture = take(frame(.8, 0, true, false, false, true, 1.)).image;
+    std::size_t compared = 0;
+    for (std::size_t i = 0; i < ordinary_texture.objects.size(); ++i)
+        if (ordinary_texture.objects[i] == f.front && anisotropic_texture.objects[i] == f.front) {
+            check(difference(ordinary_texture.linear_hdr[i], anisotropic_texture.linear_hdr[i]) < 1e-3,
+                  "anisotropy retains a different bound texture UV set");
+            ++compared;
+        }
+    check(compared > 50, "texture UV comparison covers the authored surface");
+    const auto tangent_normal = take(frame(.8, 0, true, false, false, false, .35, 1)).image;
+    check(tangent_normal.objects[pixel] == f.front &&
+              tangent_normal.linear_hdr[pixel].finite(),
+          "anisotropy remains finite with a nearly tangent normal map");
+    const auto mismatched_normal = frame(.8, 0, true, false, false, false, .35, 9);
+    check(!mismatched_normal && mismatched_normal.error().message.find("normal") != std::string::npos,
+          "normal map and anisotropy cannot silently share mismatched tangent streams");
+}
+
 void native_glass_fresnel_cases(d3d12::AuthoringViewport &renderer) {
     auto e = asymmetric_environment();
     // A continuous longitude gradient makes both sides of the refracted ray
@@ -809,6 +953,10 @@ int main(int argc, char **argv) {
             take(d3d12::D3D12Device::create({{}, false, true})));
         graphics_table_limits(*test_device);
         auto renderer = take(d3d12::AuthoringViewport::create_on_device(test_device));
+        if (argc == 2 && std::string_view(argv[1]) == "--anisotropy-only") {
+            native_scalar_anisotropy_cases(*renderer);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--glass-fresnel-only") {
             native_glass_fresnel_cases(*renderer);
             return 0;
@@ -893,6 +1041,7 @@ int main(int argc, char **argv) {
         native_environment_cases(*renderer, argc > 1 ? std::filesystem::path(argv[1])
                                                      : std::filesystem::path{});
         native_glass_fresnel_cases(*renderer);
+        native_scalar_anisotropy_cases(*renderer);
         {
             const auto empty = take(project::ProjectDocument::create("Empty GPU viewport"));
             production::AuthoringViewportRequest er;

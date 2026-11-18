@@ -139,6 +139,7 @@ struct Draw {
     std::string geometry_key;
     std::shared_ptr<const production::AuthoringMaterialGpuPacket> surface;
     std::string surface_key;
+    bool material_uv_is_secondary = false;
 };
 struct Prepared {
     assets::Sha256Digest source_digest;
@@ -205,10 +206,11 @@ Prepared prepare(const project::ProjectDocument &document,
         packets;
     std::uint64_t triangles = 0, geometry_bytes = 0;
     const auto artifact_for = [&](std::uint64_t id, std::optional<render::UvSetId> uv,
-                                  bool tangents) {
+                                  bool tangents, std::optional<render::UvSetId> uv1 = {}) {
         const auto &mesh = document.meshes().at(id);
         const auto key = project::canonical_mesh_source_digest(mesh).hex() + "/uv/" +
-                         std::to_string(uv.value_or(0)) + "/t/" + std::to_string(tangents);
+                         std::to_string(uv.value_or(0)) + "/uv1/" +
+                         std::to_string(uv1.value_or(0)) + "/t/" + std::to_string(tangents);
         if (const auto ready = next_cache.find(key); ready != next_cache.end()) {
             // A second source asset may reuse identical content in this frame.
             // Count the successful request, as for retained prior-frame hits.
@@ -227,6 +229,7 @@ Prepared prepare(const project::ProjectDocument &document,
         if (!artifact) {
             production::RenderMeshCompileOptions options;
             options.uv_set = uv;
+            options.uv1_set = uv1;
             options.generate_tangents = tangents;
             options.material_slot_layer = need(production::authoring_material_slot_layer(mesh));
             artifact = std::make_shared<production::RenderMeshArtifact>(
@@ -287,14 +290,31 @@ Prepared prepare(const project::ProjectDocument &document,
                 // The constant shader has no transmission lane. Even a
                 // graph-free, untextured glass material needs the v5 surface
                 // packet so its authored optical factors reach the shader.
-                if (!program.per_fragment() && material.transmission == 0.0)
+                if (!program.per_fragment() && material.transmission == 0.0 &&
+                    material.anisotropy == 0.0)
                     packet.reset();
             }
             auto active = base;
             auto range = submesh;
-            if (program.uv_set()) {
+            const bool anisotropic = material.anisotropy != 0.0;
+            const auto material_uv = program.uv_set();
+            bool material_uv_is_secondary = false;
+            if (anisotropic) {
+                const auto &mesh = document.meshes().at(*object.mesh_asset);
+                if (!mesh.uv_sets().find(render::kUv0))
+                    throw std::runtime_error("GPU anisotropy requires authored UV0 tangents");
+                if (program.normal_mapping() && material_uv != render::kUv0)
+                    throw std::runtime_error(
+                        "GPU anisotropy requires UV0 tangents; a normal map cannot use a different tangent UV set");
+                const auto secondary = material_uv && *material_uv != render::kUv0
+                    ? material_uv : std::optional<render::UvSetId>{};
+                active = artifact_for(*object.mesh_asset, render::kUv0, true, secondary);
+                material_uv_is_secondary = secondary.has_value();
+            } else if (material_uv) {
                 active =
-                    artifact_for(*object.mesh_asset, program.uv_set(), program.normal_mapping());
+                    artifact_for(*object.mesh_asset, material_uv, program.normal_mapping());
+            }
+            if (anisotropic || material_uv) {
                 const auto region = std::find_if(
                     active->submeshes.begin(), active->submeshes.end(),
                     [&](const auto &r) { return r.material_slot == submesh.material_slot; });
@@ -302,14 +322,18 @@ Prepared prepare(const project::ProjectDocument &document,
                     throw std::runtime_error("GPU textured material region missing");
                 range = *region;
             }
-            if (program.normal_mapping())
+            if (program.normal_mapping() || anisotropic)
                 for (std::size_t i = range.first_index; i < range.first_index + range.index_count;
                      i += 3) {
+                    if (!active->vertices[active->indices[i]].tangent ||
+                        !active->vertices[active->indices[i + 1]].tangent ||
+                        !active->vertices[active->indices[i + 2]].tangent)
+                        throw std::runtime_error("GPU material requires authored-UV tangents");
                     const auto sign = active->vertices[active->indices[i]].tangent->w;
                     if (active->vertices[active->indices[i + 1]].tangent->w != sign ||
                         active->vertices[active->indices[i + 2]].tangent->w != sign)
                         throw std::runtime_error(
-                            "GPU normal-map tangent handedness changes within a primitive");
+                            "GPU material tangent handedness changes within a primitive");
                 }
             if (out.draws.size() == 256)
                 throw std::runtime_error("GPU viewport draw budget exceeded");
@@ -320,7 +344,8 @@ Prepared prepare(const project::ProjectDocument &document,
                                  t,
                                  {},
                                  packet,
-                                 packet ? packet->digest.hex() : std::string{}});
+                                 packet ? packet->digest.hex() : std::string{},
+                                 material_uv_is_secondary});
             timing.prepare_materials_ms += elapsed(phase);
         }
     }
@@ -1311,8 +1336,11 @@ struct AuthoringViewport::Impl {
                 packed.position = {narrow(v.position.x), narrow(v.position.y), narrow(v.position.z),
                                    1};
                 packed.normal = {narrow(v.normal.x), narrow(v.normal.y), narrow(v.normal.z)};
-                if (v.uv)
-                    packed.uv0 = {narrow(v.uv->x), narrow(v.uv->y)};
+                const auto &material_uv = draw.material_uv_is_secondary ? v.uv1 : v.uv;
+                if (draw.material_uv_is_secondary && !material_uv)
+                    throw std::runtime_error("GPU material secondary UV stream is missing");
+                if (material_uv)
+                    packed.uv0 = {narrow(material_uv->x), narrow(material_uv->y)};
                 const auto tangent =
                     core::cross(v.normal,
                                 std::abs(v.normal.z) < .9 ? Vec3d{0, 0, 1} : Vec3d{0, 1, 0})
