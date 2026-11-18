@@ -27,6 +27,7 @@ static_assert(!production::authoring_material_bake_fits_budget(
 void near(double a, double b, const char *s) {
     check(std::isfinite(a) && std::abs(a - b) < 2e-6, s);
 }
+
 double scalar(std::string_view o, std::string_view key) {
     return std::stod(std::string(member(o, key)));
 }
@@ -393,6 +394,99 @@ void material_v5_round_trips_through_gltf(const std::filesystem::path &root) {
     }
 }
 
+void lossless_2k_images_fit_default_budget(const std::filesystem::path& root) {
+    std::filesystem::create_directories(root);
+    const auto source = [](unsigned index) {
+        auto bytes = source_tga(2048, 2048);
+        for (unsigned y = 0; y < 2048; ++y)
+            for (unsigned x = 0; x < 2048; ++x) {
+                const auto p = 18 + (std::size_t(y) * 2048 + x) * 4;
+                // Distinct, structured RGBA/normal-like images with long runs,
+                // repeated scanlines, and varied values. No private art inputs.
+                bytes[p] = std::uint8_t(128 + ((x / 8 + y / 8 + index * 17) % 128));
+                bytes[p + 1] = std::uint8_t((y / 8 + index * 29) % 256);
+                bytes[p + 2] = std::uint8_t((x / 8 + index * 43) % 256);
+                bytes[p + 3] = 255;
+            }
+        return bytes;
+    };
+    auto textures = std::make_shared<production::AuthoringTextureLibrary>();
+    project::MaterialCatalog materials;
+    for (unsigned i = 0; i < 4; ++i) {
+        const auto bytes = source(i);
+        project::TextureSourceRecord record{100 + i, "Independent 2K pixels",
+            "unused/independent.tga", assets::sha256(bytes),
+            assets::TextureSourceFormat::tga, 2048, 2048,
+            "Synthetic lossless compression regression", {}};
+        okay(textures->admit(record, bytes));
+        okay(materials.insert_texture(record));
+    }
+    for (unsigned i = 0; i < 2; ++i) {
+        render::StandardMaterial material;
+        material.base_color = {100 + 2 * i, 7, 0};
+        material.normal = {101 + 2 * i, 7, 0};
+        material.normal.normal_convention = render::NormalConvention::opengl_y_plus;
+        material.roughness = .7;
+        okay(materials.insert_material({10 + i, "Independent 2K pair", material, {}}));
+        okay(materials.insert_assignment({{1, 1 + i}, 10 + i, {}}));
+    }
+    auto doc = material_scene(std::move(materials), root / "source.carto");
+    const auto unchanged = doc.serialize();
+    io::GltfExportOptions options;
+    options.textures = textures;
+    check(options.embedded_image_byte_limit == 64ULL * 1024 * 1024,
+          "lossless compression must not raise the default encoded-image bound");
+    const auto gltf = root / "four-2k.gltf", glb = root / "four-2k.glb";
+    const auto exported = take(io::export_gltf(doc, gltf, options));
+    const auto binary = take(io::export_glb(doc, glb, options));
+    check(exported.images == 4 && binary.images == 4 &&
+          exported.embedded_image_bytes == binary.embedded_image_bytes &&
+          exported.embedded_image_bytes < options.embedded_image_byte_limit,
+          "four distinct full-resolution 2K RGBA images fit the unchanged encoded-image budget");
+    Payload p(gltf), b(glb);
+    const auto mats = array(member(p.json, "materials"));
+    const auto binary_mats = array(member(b.json, "materials"));
+    check(mats.size() == 2 && binary_mats.size() == 2, "both explicit materials survive export");
+    for (unsigned i = 0; i < 2; ++i) {
+        for (unsigned channel = 0; channel < 2; ++channel) {
+            const auto expected = take(assets::decode_tga_rgba8(source(2 * i + channel))).pixels;
+            const auto info = channel == 0 ? member(member(mats[i], "pbrMetallicRoughness"), "baseColorTexture")
+                                           : member(mats[i], "normalTexture");
+            const auto bin_info = channel == 0 ? member(member(binary_mats[i], "pbrMetallicRoughness"), "baseColorTexture")
+                                               : member(binary_mats[i], "normalTexture");
+            check(pixels(p, info, 2048) == expected && pixels(b, bin_info, 2048) == expected,
+                  "lossless fixed-Huffman PNG preserves every RGBA byte in glTF and GLB");
+        }
+    }
+    const auto before_gltf = read(gltf), before_glb = read(glb);
+    for (unsigned boundary = 0; boundary < 2; ++boundary) {
+        auto limited = options;
+        if (boundary == 0) limited.embedded_image_byte_limit = exported.embedded_image_bytes - 1;
+        else limited.embedded_image_limit = 3;
+        check(!io::export_gltf(doc, gltf, limited) && !io::export_glb(doc, glb, limited),
+              "actual encoded byte/count boundaries still reject overflow");
+        check(read(gltf) == before_gltf && read(glb) == before_glb && doc.serialize() == unchanged,
+              "budget rejection preserves the previous good artifacts and audited source");
+    }
+    static_cast<void>(take(io::export_gltf(doc, gltf, options)));
+    static_cast<void>(take(io::export_glb(doc, glb, options)));
+    check(read(gltf) == before_gltf && read(glb) == before_glb && doc.serialize() == unchanged,
+          "valid export recovers after rejection with deterministic bytes and no source mutation");
+}
+
+std::vector<std::uint8_t> budget_source_tga(unsigned index) {
+    // Budget fixtures must remain incompressible when the PNG encoder improves.
+    auto bytes = source_tga(1024, 1024);
+    std::uint32_t state = 0x9e3779b9U ^ (index * 0x85ebca6bU);
+    for (std::size_t p = 18; p < bytes.size(); ++p) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        bytes[p] = static_cast<std::uint8_t>(state);
+    }
+    return bytes;
+}
+
 int main(int argc, char **argv) {
     try {
         auto root = std::filesystem::temp_directory_path() /
@@ -433,6 +527,7 @@ int main(int argc, char **argv) {
             std::cout << "material fixture ready\n";
             return 0;
         }
+        lossless_2k_images_fit_default_budget(root / "lossless-2k");
         {
             auto sculpt_doc = material_scene(c, root / "sculpt-material.carto");
             auto stack = take(production::make_sculpt_stack(sculpt_doc, 1));
@@ -881,8 +976,7 @@ int main(int argc, char **argv) {
             auto tx = take(project::ProjectTransaction::begin(rich, rich_journal, "whole.scene.fixture"));
             assets::BlobStore blobs(root / ".carto-assets" / "source-blobs");
             for (unsigned index = 0; index < 17; ++index) {
-                auto bytes = source_tga(1024, 1024);
-                bytes[18] = static_cast<std::uint8_t>(index);
+                auto bytes = budget_source_tga(index);
                 auto source = record;
                 source.id = 1000 + index;
                 source.name = "Whole-scene texture " + std::to_string(index);
@@ -925,8 +1019,7 @@ int main(int argc, char **argv) {
                 return candidate.find("\"baseColorTexture\"") != std::string_view::npos;
             });
             check(textured != materials.end(), "whole-scene glTF must contain a textured material");
-            auto expected_tga = source_tga(1024, 1024);
-            expected_tga[18] = 0;
+            auto expected_tga = budget_source_tga(0);
             check(pixels(whole, member(member(*textured, "pbrMetallicRoughness"), "baseColorTexture")) ==
                 take(assets::decode_tga_rgba8(expected_tga)).pixels,
                   "per-material cache release must preserve exact source pixels");

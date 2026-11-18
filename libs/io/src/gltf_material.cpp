@@ -66,7 +66,89 @@ void chunk(std::vector<std::uint8_t> &o, const char *tag, std::span<const std::u
     }
     be32(o, ~crc);
 }
-// Bounded independent RGBA8 encoder: filter 0, stored DEFLATE, no gamma or
+// One-candidate LZ77 search: a 32-KiB history window, <=258-byte matches, and
+// one dictionary update per input byte. Fixed Huffman codes keep both memory
+// and matching work bounded without an external compression dependency.
+std::vector<std::uint8_t> fixed_deflate(std::span<const std::uint8_t> raw) {
+    struct Bits {
+        std::vector<std::uint8_t> bytes;
+        std::uint32_t pending = 0;
+        unsigned count = 0;
+        void put(std::uint32_t value, unsigned width) {
+            pending |= value << count;
+            count += width;
+            while (count >= 8) {
+                bytes.push_back(static_cast<std::uint8_t>(pending));
+                pending >>= 8;
+                count -= 8;
+            }
+        }
+        void code(std::uint32_t value, unsigned width) {
+            std::uint32_t reversed = 0;
+            for (unsigned i = 0; i < width; ++i) {
+                reversed = (reversed << 1) | (value & 1U);
+                value >>= 1;
+            }
+            put(reversed, width);
+        }
+        void literal(unsigned symbol) {
+            if (symbol <= 143) code(0x30U + symbol, 8);
+            else if (symbol <= 255) code(0x190U + symbol - 144, 9);
+            else if (symbol <= 279) code(symbol - 256, 7);
+            else code(0xc0U + symbol - 280, 8);
+        }
+    } bits;
+    constexpr std::array<unsigned, 29> length_base{
+        3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
+    constexpr std::array<unsigned, 29> length_extra{
+        0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+    constexpr std::array<unsigned, 30> distance_base{
+        1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,
+        1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+    constexpr std::array<unsigned, 30> distance_extra{
+        0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
+    constexpr auto missing = static_cast<std::size_t>(-1);
+    std::vector<std::size_t> last(65536, missing);
+    const auto hash = [&](std::size_t i) {
+        return ((std::uint32_t(raw[i]) * 251U + raw[i + 1]) * 251U + raw[i + 2]) & 65535U;
+    };
+    bits.put(3, 3); // Final block, fixed Huffman coding.
+    for (std::size_t i = 0; i < raw.size();) {
+        std::size_t previous = missing;
+        if (raw.size() - i >= 3) {
+            auto& entry = last[hash(i)];
+            previous = entry;
+            entry = i;
+        }
+        unsigned length = 0;
+        if (previous != missing && i - previous <= 32768 &&
+            raw[previous] == raw[i] && raw[previous + 1] == raw[i + 1] &&
+            raw[previous + 2] == raw[i + 2]) {
+            const auto bound = std::min<std::size_t>(258, raw.size() - i);
+            length = 3;
+            while (length < bound && raw[previous + length] == raw[i + length]) ++length;
+        }
+        if (length < 3) {
+            bits.literal(raw[i++]);
+            continue;
+        }
+        unsigned l = 0, d = 0;
+        while (l + 1 < length_base.size() && length >= length_base[l + 1]) ++l;
+        const auto distance = static_cast<unsigned>(i - previous);
+        while (d + 1 < distance_base.size() && distance >= distance_base[d + 1]) ++d;
+        bits.literal(257 + l);
+        bits.put(length - length_base[l], length_extra[l]);
+        bits.code(d, 5);
+        bits.put(distance - distance_base[d], distance_extra[d]);
+        for (unsigned j = 1; j < length && raw.size() - (i + j) >= 3; ++j)
+            last[hash(i + j)] = i + j;
+        i += length;
+    }
+    bits.literal(256);
+    if (bits.count) bits.bytes.push_back(static_cast<std::uint8_t>(bits.pending));
+    return std::move(bits.bytes);
+}
+// Bounded independent RGBA8 encoder: filter 0, lossless DEFLATE, no gamma or
 // premultiplication metadata. glTF texture usage owns color interpretation.
 std::vector<std::uint8_t> png(const assets::Rgba8MipLevel &p) {
     std::vector<std::uint8_t> raw;
@@ -77,15 +159,21 @@ std::vector<std::uint8_t> png(const assets::Rgba8MipLevel &p) {
         raw.insert(raw.end(), p.pixels.data() + y * stride, p.pixels.data() + (y + 1) * stride);
     }
     std::vector<std::uint8_t> z{0x78, 0x01};
-    for (std::size_t i = 0; i < raw.size();) {
-        const auto n = static_cast<std::uint16_t>(std::min<std::size_t>(65535, raw.size() - i));
-        z.push_back(i + n == raw.size() ? 1 : 0);
-        z.push_back(std::uint8_t(n));
-        z.push_back(std::uint8_t(n >> 8));
-        z.push_back(std::uint8_t(~n));
-        z.push_back(std::uint8_t((~n) >> 8));
-        z.insert(z.end(), raw.data() + i, raw.data() + i + n);
-        i += n;
+    auto compressed = fixed_deflate(raw);
+    if (compressed.size() < raw.size() + ((raw.size() + 65534) / 65535) * 5) {
+        z.insert(z.end(), compressed.begin(), compressed.end());
+    } else {
+        // Incompressible images retain the old bounded stored-block path.
+        for (std::size_t i = 0; i < raw.size();) {
+            const auto n = static_cast<std::uint16_t>(std::min<std::size_t>(65535, raw.size() - i));
+            z.push_back(i + n == raw.size() ? 1 : 0);
+            z.push_back(std::uint8_t(n));
+            z.push_back(std::uint8_t(n >> 8));
+            z.push_back(std::uint8_t(~n));
+            z.push_back(std::uint8_t((~n) >> 8));
+            z.insert(z.end(), raw.data() + i, raw.data() + i + n);
+            i += n;
+        }
     }
     std::uint32_t a = 1, b = 0;
     for (auto v : raw) {
