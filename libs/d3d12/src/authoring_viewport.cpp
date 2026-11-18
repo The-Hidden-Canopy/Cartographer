@@ -205,8 +205,22 @@ Prepared prepare(const project::ProjectDocument &document,
              std::shared_ptr<const production::AuthoringMaterialGpuPacket>>
         packets;
     std::uint64_t triangles = 0, geometry_bytes = 0;
+    const auto compile_artifact = [&](std::uint64_t id, std::optional<render::UvSetId> uv,
+                                      bool tangents, std::optional<render::UvSetId> uv1 = {}) {
+        const auto &mesh = document.meshes().at(id);
+        production::RenderMeshCompileOptions options;
+        options.uv_set = uv;
+        options.uv1_set = uv1;
+        options.generate_tangents = tangents;
+        options.material_slot_layer = need(production::authoring_material_slot_layer(mesh));
+        auto artifact = std::make_shared<production::RenderMeshArtifact>(
+            need(production::compile_render_mesh_artifact(source, mesh, options)));
+        ++timing.mesh_compile_count;
+        return artifact;
+    };
     const auto artifact_for = [&](std::uint64_t id, std::optional<render::UvSetId> uv,
-                                  bool tangents, std::optional<render::UvSetId> uv1 = {}) {
+                                  bool tangents, std::optional<render::UvSetId> uv1 = {},
+                                  std::shared_ptr<const production::RenderMeshArtifact> candidate = {}) {
         const auto &mesh = document.meshes().at(id);
         const auto key = project::canonical_mesh_source_digest(mesh).hex() + "/uv/" +
                          std::to_string(uv.value_or(0)) + "/uv1/" +
@@ -226,16 +240,8 @@ Prepared prepare(const project::ProjectDocument &document,
                 artifact = std::move(rebound);
                 ++timing.mesh_cache_hits;
             }
-        if (!artifact) {
-            production::RenderMeshCompileOptions options;
-            options.uv_set = uv;
-            options.uv1_set = uv1;
-            options.generate_tangents = tangents;
-            options.material_slot_layer = need(production::authoring_material_slot_layer(mesh));
-            artifact = std::make_shared<production::RenderMeshArtifact>(
-                need(production::compile_render_mesh_artifact(source, mesh, options)));
-            ++timing.mesh_compile_count;
-        }
+        if (!artifact)
+            artifact = candidate ? std::move(candidate) : compile_artifact(id, uv, tangents, uv1);
         geometry_bytes += artifact->vertices.size() * sizeof(production::RenderMeshVertex) +
                           artifact->indices.size() * 4;
         if (geometry_bytes > 64U * 1024U * 1024U)
@@ -254,7 +260,26 @@ Prepared prepare(const project::ProjectDocument &document,
             std::abs(t.scale.z) < 1e-12)
             throw std::runtime_error("GPU viewport transform is singular");
         phase = Clock::now();
-        const auto base = artifact_for(*object.mesh_asset, {}, false);
+        // Submesh slots and triangle count are independent of UV/tangent options.
+        // Reuse any matching artifact for layout; only draw-selected artifacts
+        // enter next_cache and its byte budget. A cold untextured layout can
+        // still become a draw artifact without compiling it a second time.
+        const auto prefix =
+            project::canonical_mesh_source_digest(document.meshes().at(*object.mesh_asset)).hex() +
+            "/uv/";
+        std::shared_ptr<const production::RenderMeshArtifact> base;
+        bool cold_untextured_layout = false;
+        const auto find_layout = [&](const MeshArtifactCache &artifacts) {
+            const auto it = artifacts.lower_bound(prefix);
+            return it != artifacts.end() && it->first.starts_with(prefix) ? it->second : nullptr;
+        };
+        base = find_layout(next_cache);
+        if (!base && cache)
+            base = find_layout(*cache);
+        if (!base) {
+            base = compile_artifact(*object.mesh_asset, {}, false);
+            cold_untextured_layout = true;
+        }
         timing.prepare_meshes_ms += elapsed(phase);
         triangles += base->indices.size() / 3;
         if (triangles > production::kAuthoringMaxSceneTriangles)
@@ -310,11 +335,11 @@ Prepared prepare(const project::ProjectDocument &document,
                     ? material_uv : std::optional<render::UvSetId>{};
                 active = artifact_for(*object.mesh_asset, render::kUv0, true, secondary);
                 material_uv_is_secondary = secondary.has_value();
-            } else if (material_uv) {
-                active =
-                    artifact_for(*object.mesh_asset, material_uv, program.normal_mapping());
+            } else {
+                active = artifact_for(*object.mesh_asset, material_uv, program.normal_mapping(), {},
+                                      !material_uv && cold_untextured_layout ? base : nullptr);
             }
-            if (anisotropic || material_uv) {
+            if (active != base) {
                 const auto region = std::find_if(
                     active->submeshes.begin(), active->submeshes.end(),
                     [&](const auto &r) { return r.material_slot == submesh.material_slot; });
