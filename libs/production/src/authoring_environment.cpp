@@ -56,14 +56,14 @@ Vec3d to_world(Vec3d n, Vec3d p) {
 }
 Vec3d ggx(unsigned i, unsigned count, double roughness) {
     // Match the current direct-light GGX alpha convention, including its floor.
-    const double alpha = std::max(.045, roughness * roughness), u = (i + .5) / count,
+    const double alpha = std::max(.045 * .045, roughness * roughness), u = (i + .5) / count,
                  v = radical(i);
-    const double z = std::sqrt((1 - v) / (1 + (alpha * alpha - 1) * v)),
+    const double z = std::sqrt((1 - v) / ((1 - v) + alpha * alpha * v)),
                  s = std::sqrt(std::max(0., 1 - z * z)), p = 2 * pi * u;
     return {s * std::cos(p), s * std::sin(p), z};
 }
 double smith(double nv, double roughness) {
-    const double a = std::max(.045, roughness * roughness), k = (a + 1) * (a + 1) / 8;
+    const double a = std::max(.045 * .045, roughness * roughness), k = (a + 1) * (a + 1) / 8;
     return nv / std::max(nv * (1 - k) + k, 1e-12);
 }
 std::array<float, 4> lut_value(double nv, double roughness) {
@@ -102,7 +102,7 @@ environment_content_digest(const project::AuthoredEnvironment &e) {
     };
     // Algorithm version is part of the derived identity. Source metadata that
     // changes orientation/power does not force rebuilding all convolutions.
-    append(1);
+    append(2);
     append(e.width);
     append(e.height);
     for (const auto c : e.linear_radiance)

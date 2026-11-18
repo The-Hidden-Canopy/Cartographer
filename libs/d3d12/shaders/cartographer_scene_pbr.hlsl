@@ -147,9 +147,11 @@ float mapped_channel(float4 sample_value, float selector)
 
 float distribution_ggx(float n_dot_h, float roughness)
 {
-    const float alpha = max(0.045, roughness * roughness);
+    const float alpha = max(0.045 * 0.045, roughness * roughness);
     const float alpha_squared = alpha * alpha;
-    const float denominator = n_dot_h * n_dot_h * (alpha_squared - 1.0) + 1.0;
+    const float cosine = saturate(n_dot_h);
+    const float cosine_squared = cosine * cosine;
+    precise float denominator = (1.0 - cosine_squared) + alpha_squared * cosine_squared;
     return alpha_squared / (3.14159265 * denominator * denominator);
 }
 
@@ -384,7 +386,7 @@ float anisotropic_ggx_kernel(float roughness, float strength, float3 normal,
     if (n_dot_l <= 0.0 || n_dot_v <= 0.0)
         return 0.0;
     const float3 half_vector = normalize_or(view + light, normal);
-    const float alpha = max(0.045, roughness * roughness);
+    const float alpha = max(0.045 * 0.045, roughness * roughness);
     const float aspect = sqrt(1.0 - 0.9 * abs(strength));
     const float2 axes = strength < 0.0
         ? float2(alpha * aspect, alpha / aspect)

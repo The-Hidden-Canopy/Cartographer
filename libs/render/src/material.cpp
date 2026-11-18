@@ -235,11 +235,12 @@ core::Result<PbrEvaluation> evaluate_pbr_reference(
             return core::Result<PbrEvaluation>::failure(
                 validation("PBR reference half-vector is non-degenerate"));
         }
-        const double n_dot_h = std::max(0.0, core::dot(normal, half_vector));
+        const double n_dot_h = std::clamp(core::dot(normal, half_vector), 0.0, 1.0);
         const double v_dot_h = std::max(0.0, core::dot(view, half_vector));
-        const double alpha = std::max(0.045, material.roughness * material.roughness);
+        // Apply the 0.045 floor to perceptual roughness before squaring.
+        const double alpha = std::max(0.045 * 0.045, material.roughness * material.roughness);
         const double alpha_squared = alpha * alpha;
-        const double denominator = n_dot_h * n_dot_h * (alpha_squared - 1.0) + 1.0;
+        const double denominator = (1.0 - n_dot_h * n_dot_h) + alpha_squared * n_dot_h * n_dot_h;
         const double distribution = alpha_squared / (kPi * denominator * denominator);
         const auto smith_term = [alpha](double n_dot_x) {
             const double k = (alpha + 1.0) * (alpha + 1.0) / 8.0;
@@ -264,10 +265,10 @@ core::Result<PbrEvaluation> evaluate_pbr_reference(
             base_attenuation * distribution * geometry * n_dot_l /
                 std::max(1e-12, 4.0 * n_dot_l * n_dot_v));
         const double clearcoat_alpha = std::max(
-            0.045, material.clearcoat_roughness * material.clearcoat_roughness);
+            0.045 * 0.045, material.clearcoat_roughness * material.clearcoat_roughness);
         const double clearcoat_alpha_squared = clearcoat_alpha * clearcoat_alpha;
         const double clearcoat_denominator =
-            n_dot_h * n_dot_h * (clearcoat_alpha_squared - 1.0) + 1.0;
+            (1.0 - n_dot_h * n_dot_h) + clearcoat_alpha_squared * n_dot_h * n_dot_h;
         const double clearcoat_distribution = clearcoat_alpha_squared /
             (kPi * clearcoat_denominator * clearcoat_denominator);
         const auto clearcoat_smith = [clearcoat_alpha](double n_dot_x) {

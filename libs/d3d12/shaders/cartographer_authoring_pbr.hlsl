@@ -110,15 +110,17 @@ VertexOutput VSMain(VertexInput input)
 
 float distribution_ggx(float n_dot_h, float roughness)
 {
-    const float alpha = max(0.045, roughness * roughness);
+    const float alpha = max(0.045 * 0.045, roughness * roughness);
     const float alpha_squared = alpha * alpha;
-    const float denominator = n_dot_h * n_dot_h * (alpha_squared - 1.0) + 1.0;
+    const float cosine = saturate(n_dot_h);
+    const float cosine_squared = cosine * cosine;
+    precise float denominator = (1.0 - cosine_squared) + alpha_squared * cosine_squared;
     return alpha_squared / (3.14159265 * denominator * denominator);
 }
 
 float geometry_schlick_ggx(float n_dot_x, float roughness)
 {
-    const float alpha = max(0.045, roughness * roughness);
+    const float alpha = max(0.045 * 0.045, roughness * roughness);
     const float k = ((alpha + 1.0) * (alpha + 1.0)) / 8.0;
     return n_dot_x / max(n_dot_x * (1.0 - k) + k, 1e-12);
 }
@@ -229,7 +231,7 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID,
         float3 b0=cross(normal,t0)*input.tangent_sign;
         const float c=cos(material.anisotropy_rotation),s=sin(material.anisotropy_rotation);
         const float3 t=normalize(t0*c+b0*s),b=normalize(cross(normal,t));
-        const float alpha=max(roughness*roughness,1e-3);
+        const float alpha=max(roughness*roughness,0.045*0.045);
         const float at=lerp(alpha,1.0,anisotropy*anisotropy),ab=alpha;
         const float3 h=float3(dot(half_vector,t),dot(half_vector,b),n_dot_h);
         const float d=h.x*h.x/(at*at)+h.y*h.y/(ab*ab)+h.z*h.z;
