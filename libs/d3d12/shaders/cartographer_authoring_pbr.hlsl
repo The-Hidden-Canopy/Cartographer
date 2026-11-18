@@ -311,8 +311,11 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID,
         const float path=material.thickness/cos_t;
         const float3 absorption=material.attenuation_distance>0
             ? pow(max(material.attenuation_color,1e-4),path/material.attenuation_distance) : 1.0;
-        const float r0=pow((material.ior-1.0)/(material.ior+1.0),2.0);
-        const float dielectric=r0+(1-r0)*pow(1-saturate(dot(normal,view)),5.0);
+        // IOR controls the bend; the material's independent dielectric F0
+        // controls reflection. Use the same F0 for the complementary
+        // transmitted share so reflection and transmission cannot both take
+        // the same energy when those authored values differ.
+        const float dielectric=dielectric_f0+(1-dielectric_f0)*pow(1-saturate(dot(normal,view)),5.0);
         hdr+=environment_direction(refracted,roughness,light_word(7))*base_color*absorption*
             (transmission*(1.0-dielectric)*environment_ao);
     }

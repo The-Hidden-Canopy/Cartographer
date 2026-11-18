@@ -284,7 +284,10 @@ Prepared prepare(const project::ProjectDocument &document,
                 program = ready->second;
                 packet = packets.at(key);
                 material = packet->material;
-                if (!program.per_fragment())
+                // The constant shader has no transmission lane. Even a
+                // graph-free, untextured glass material needs the v5 surface
+                // packet so its authored optical factors reach the shader.
+                if (!program.per_fragment() && material.transmission == 0.0)
                     packet.reset();
             }
             auto active = base;

@@ -122,6 +122,89 @@ void compare(const production::AuthoringViewportImage &cpu,
     check(std::abs(cpu_count - gpu_count) < long(cpu.width + cpu.height),
           "GPU coverage agrees beyond a center pixel");
 }
+void native_glass_fresnel_cases(d3d12::AuthoringViewport &renderer) {
+    auto e = asymmetric_environment();
+    // A continuous longitude gradient makes both sides of the refracted ray
+    // distinguishable, including the negative-X half of the environment.
+    for (unsigned y = 0; y < e.height; ++y)
+        for (unsigned x = 0; x < e.width; ++x) {
+            const double phi = 2 * std::numbers::pi * ((x + .5) / e.width - .5);
+            e.linear_radiance[y * e.width + x].x += 2 * (1 + std::cos(phi));
+        }
+    auto f = environment_fixture(e);
+    auto r = request(f);
+    r.environment_lighting = take(production::compile_environment_lighting(e));
+    // A perfectly reflecting dielectric cannot also transmit environment
+    // energy, regardless of the separate authored refraction IOR. Compare the
+    // same physical surface with transmission switched on and off; at F0=1
+    // both its diffuse and transmission shares must be zero.
+    const auto glass_frame = [&](double reflectance, double transmission, double ior = 1.5,
+                                 double thickness = 0., double distance = 0.,
+                                 bool tilt = false, bool reopen = false, double metallic = 0.) {
+        auto scene = f.document;
+        auto catalog = scene.material_catalog();
+        auto material = catalog.materials().at(1);
+        material.revision = material.revision.next();
+        material.definition.metallic = metallic;
+        material.definition.roughness = .1;
+        material.definition.dielectric_f0 = reflectance;
+        material.definition.transmission = transmission;
+        material.definition.ior = ior;
+        material.definition.thickness = thickness;
+        material.definition.attenuation_distance = distance;
+        material.definition.attenuation_color = {.25, .55, .8};
+        material.definition.clearcoat = 0;
+        okay(catalog.replace_material(material));
+        set_materials(scene, std::move(catalog));
+        const auto source = reopen
+            ? std::make_shared<const project::ProjectDocument>(
+                  take(project::ProjectDocument::deserialize(scene.serialize())))
+            : std::make_shared<const project::ProjectDocument>(scene);
+        auto current_request = r;
+        if (tilt) current_request.transform_overrides[f.front] =
+            {{}, {0, std::sin(.2), 0, std::cos(.2)}};
+        return take(renderer.render(source, current_request)).image;
+    };
+    const auto reflecting = glass_frame(1., 0.);
+    const auto reflecting_glass = glass_frame(1., 1.);
+    const auto clear = glass_frame(0., 1.);
+    const auto diffuse = glass_frame(0., 0.);
+    const auto pixel = center(reflecting);
+    check(reflecting.objects[pixel] == f.front && reflecting_glass.objects[pixel] == f.front,
+          "Fresnel test compares the same covered glass surface");
+    const auto a = reflecting.linear_hdr[pixel];
+    const auto b = reflecting_glass.linear_hdr[pixel];
+    check(std::abs(a.x - b.x) < 1e-4 && std::abs(a.y - b.y) < 1e-4 &&
+              std::abs(a.z - b.z) < 1e-4,
+          "fully reflective dielectric does not add transmitted environment energy");
+    const auto c = clear.linear_hdr[pixel];
+    const auto d = diffuse.linear_hdr[pixel];
+    check(std::abs(c.x - d.x) + std::abs(c.y - d.y) + std::abs(c.z - d.z) > 1e-3,
+          "untextured transmission changes the native surface response");
+    check(std::abs(b.x - c.x) + std::abs(b.y - c.y) + std::abs(b.z - c.z) > 1e-3,
+          "Fresnel control changes with authored dielectric reflectance");
+    const auto absorbed = glass_frame(0., 1., 1.5, .01, .01);
+    const auto absorbed_color = absorbed.linear_hdr[pixel];
+    check(absorbed_color.x < c.x - 1e-3 && absorbed_color.y < c.y - 1e-3 &&
+              absorbed_color.z < c.z - 1e-3,
+          "untextured glass attenuation reduces transmitted radiance");
+    const auto reopened = glass_frame(0., 1., 1.5, .01, .01, false, true);
+    check(reopened.display_rgba8 == absorbed.display_rgba8,
+          "untextured glass appearance survives save and reopen");
+    const auto unbent = glass_frame(0., 1., 1., 0., 0., true);
+    const auto bent = glass_frame(0., 1., 1.8, 0., 0., true);
+    check(unbent.objects[pixel] == f.front && bent.objects[pixel] == f.front,
+          "IOR test compares covered samples on the same tilted surface");
+    const auto u = unbent.linear_hdr[pixel], v = bent.linear_hdr[pixel];
+    check(std::abs(u.x - v.x) + std::abs(u.y - v.y) + std::abs(u.z - v.z) > 1e-3,
+          "authored IOR changes the refracted environment direction");
+    const auto metal = glass_frame(.04, 0., 1.5, 0., 0., false, false, 1.);
+    const auto metal_with_transmission = glass_frame(.04, 1., 1.5, 0., 0., false, false, 1.);
+    const auto m = metal.linear_hdr[pixel], mt = metal_with_transmission.linear_hdr[pixel];
+    check(std::abs(m.x - mt.x) < 1e-4 && std::abs(m.y - mt.y) < 1e-4 &&
+              std::abs(m.z - mt.z) < 1e-4,
+          "a fully metallic surface does not gain dielectric transmission");
+}
 void native_environment_cases(d3d12::AuthoringViewport &renderer,
                               const std::filesystem::path &output) {
     const auto e = asymmetric_environment();
@@ -726,6 +809,10 @@ int main(int argc, char **argv) {
             take(d3d12::D3D12Device::create({{}, false, true})));
         graphics_table_limits(*test_device);
         auto renderer = take(d3d12::AuthoringViewport::create_on_device(test_device));
+        if (argc == 2 && std::string_view(argv[1]) == "--glass-fresnel-only") {
+            native_glass_fresnel_cases(*renderer);
+            return 0;
+        }
         {
             const auto bounded = triangle_budget_fixture();
             const auto original = bounded.document.serialize();
@@ -805,6 +892,7 @@ int main(int argc, char **argv) {
                             argc > 1 ? std::filesystem::path(argv[1]) : std::filesystem::path{});
         native_environment_cases(*renderer, argc > 1 ? std::filesystem::path(argv[1])
                                                      : std::filesystem::path{});
+        native_glass_fresnel_cases(*renderer);
         {
             const auto empty = take(project::ProjectDocument::create("Empty GPU viewport"));
             production::AuthoringViewportRequest er;
