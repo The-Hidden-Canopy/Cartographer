@@ -380,6 +380,19 @@ void native_environment_cases(d3d12::AuthoringViewport &renderer,
     check(high_warm.environment_upload_bytes == 0 &&
               high_warm.image.display_rgba8 == high_gpu.image.display_rgba8,
           "warm high-quality environment is stable and reused");
+    auto ultra_request = r;
+    ultra_request.environment_lighting = take(production::compile_environment_lighting(
+        e, production::EnvironmentLightingQuality::ultra));
+    const auto ultra_cpu = take(production::render_authoring_viewport(f.document, ultra_request));
+    const auto ultra_gpu = take(renderer.render(source, ultra_request));
+    compare(ultra_cpu, ultra_gpu.image);
+    check(ultra_gpu.environment_upload_bytes == 512U * 591U * 16U &&
+              ultra_gpu.environment_resident_bytes == ultra_gpu.environment_upload_bytes,
+          "ultra quality uploads and accounts for the 512-wide environment atlas");
+    const auto ultra_warm = take(renderer.render(source, ultra_request));
+    check(ultra_warm.environment_upload_bytes == 0 &&
+              ultra_warm.image.display_rgba8 == ultra_gpu.image.display_rgba8,
+          "warm ultra-quality environment is stable and reused");
     auto automatic = r;
     automatic.environment_lighting.reset();
     const auto restored = take(renderer.render(source, automatic));
@@ -511,6 +524,53 @@ void native_environment_cases(d3d12::AuthoringViewport &renderer,
               << "; upload_bytes=" << detail_gpu.environment_upload_bytes
               << "; upload_gpu_ms=" << detail_gpu.environment_gpu_upload_milliseconds
               << "; raster_gpu_ms=" << detail_gpu.gpu_milliseconds << '\n';
+    auto finer = e;
+    finer.width = 512; finer.height = 256;
+    finer.linear_radiance.assign(std::size_t(finer.width)*finer.height, core::Vec3d{.4,.8,1.2});
+    finer.linear_radiance[128U*512U+384U] = {100,100,100};
+    auto finer_fixture = environment_fixture(finer);
+    auto finer_materials = finer_fixture.document.material_catalog();
+    auto finer_metal = finer_materials.materials().at(1);
+    finer_metal.revision = finer_metal.revision.next();
+    finer_metal.definition.roughness = 0;
+    okay(finer_materials.replace_material(finer_metal));
+    set_materials(finer_fixture.document, std::move(finer_materials));
+    auto finer_request = request(finer_fixture);
+    auto finer_cpu_request = finer_request;
+    finer_cpu_request.environment_lighting = take(production::compile_environment_lighting(
+        finer, production::EnvironmentLightingQuality::ultra));
+    const auto finer_cpu = take(production::render_authoring_viewport(finer_fixture.document,
+                                                                      finer_cpu_request));
+    auto finer_source = std::make_shared<const project::ProjectDocument>(finer_fixture.document);
+    const auto finer_gpu = take(renderer.render(finer_source, finer_request));
+    compare(finer_cpu, finer_gpu.image);
+    check(finer_gpu.environment_upload_bytes == 512U*591U*16U &&
+              finer_gpu.environment_resident_bytes == finer_gpu.environment_upload_bytes &&
+              finer_gpu.environment_compile_milliseconds > 0,
+          "512-wide source automatically compiles and accounts for the ultra atlas");
+    const auto finer_warm = take(renderer.render(finer_source, finer_request));
+    check(finer_warm.environment_upload_bytes == 0 &&
+              finer_warm.image.display_rgba8 == finer_gpu.image.display_rgba8,
+          "automatic ultra atlas remains warm and stable");
+    auto finer_fallback_request = finer_request;
+    finer_fallback_request.environment_lighting = take(production::compile_environment_lighting(
+        finer, production::EnvironmentLightingQuality::standard));
+    const auto finer_fallback_cpu = take(production::render_authoring_viewport(
+        finer_fixture.document, finer_fallback_request));
+    const auto finer_fallback = take(renderer.render(finer_source, finer_fallback_request));
+    compare(finer_fallback_cpu, finer_fallback.image);
+    check(finer_fallback.environment_upload_bytes == 128U*207U*16U,
+          "512-wide sources support an explicit lower-memory atlas fallback");
+    const auto finer_pixel = center(finer_gpu.image);
+    check(finer_gpu.image.objects[finer_pixel] == finer_fixture.front &&
+              finer_fallback.image.objects[finer_pixel] == finer_fixture.front &&
+              finer_gpu.image.linear_hdr[finer_pixel].x >
+                  finer_fallback.image.linear_hdr[finer_pixel].x * 1.05,
+          "ultra GPU reflections retain a narrow bright source feature beyond the standard tier");
+    std::cout << "ultra native environment: compile_ms=" << finer_gpu.environment_compile_milliseconds
+              << "; upload_bytes=" << finer_gpu.environment_upload_bytes
+              << "; upload_gpu_ms=" << finer_gpu.environment_gpu_upload_milliseconds
+              << "; raster_gpu_ms=" << finer_gpu.gpu_milliseconds << '\n';
     if (!output.empty()) {
         std::filesystem::create_directories(output);
         static_cast<void>(take(f.document.save_atomic(output / "environment-gpu.carto")));

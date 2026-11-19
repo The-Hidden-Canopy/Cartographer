@@ -687,7 +687,8 @@ struct AuthoringViewport::Impl {
             auto product = request.environment_lighting;
             if (product && product->source_digest() != digest)
                 throw std::runtime_error("GPU environment product is stale");
-            const auto default_width = e->width > production::EnvironmentLighting::width ? 256U : 128U;
+            const auto default_width = e->width > 256U ? 512U
+                : (e->width > production::EnvironmentLighting::width ? 256U : 128U);
             if (!product && environment_product && environment_product->source_digest() == digest &&
                 environment_product->atlas_width() == default_width)
                 product = environment_product;

@@ -50,8 +50,11 @@ template<std::size_t N> std::array<double,N> numbers(const std::string& text, bo
 }
 }
 
-core::Result<HdrEnvironmentImage> decode_hdr_environment(std::span<const std::uint8_t> bytes) {
+core::Result<HdrEnvironmentImage> decode_hdr_environment_with_quality(
+    std::span<const std::uint8_t> bytes, HdrLightingQuality quality) {
     try {
+        if (quality != HdrLightingQuality::standard && quality != HdrLightingQuality::high)
+            throw std::runtime_error("unknown HDR lighting quality");
         if(bytes.empty()||bytes.size()>32U*1024U*1024U)throw std::runtime_error("HDR source exceeds 32 MiB or is empty");
         std::size_t offset=0;
         const auto line=[&]() {
@@ -127,7 +130,8 @@ core::Result<HdrEnvironmentImage> decode_hdr_environment(std::span<const std::ui
         }
         if(offset!=bytes.size())throw std::runtime_error("trailing data after HDR image");
         HdrEnvironmentImage result;result.source_digest=sha256(bytes);result.source_width=w;result.source_height=h;
-        result.height=std::min(h,128U);result.width=2*result.height;result.linear_radiance.resize(std::size_t(result.width)*result.height);
+        const unsigned max_height = quality == HdrLightingQuality::high ? 256U : 128U;
+        result.height=std::min(h,max_height);result.width=2*result.height;result.linear_radiance.resize(std::size_t(result.width)*result.height);
         const double scale=double(h)/result.height;
         for(unsigned y=0;y<result.height;++y)for(unsigned x=0;x<result.width;++x) {
             core::Vec3d sum{};double weight=0;
@@ -145,5 +149,8 @@ core::Result<HdrEnvironmentImage> decode_hdr_environment(std::span<const std::ui
     } catch(const std::exception& e) {
         return core::Result<HdrEnvironmentImage>::failure(core::Diagnostic(core::ErrorCode::invalid_argument,e.what()));
     }
+}
+core::Result<HdrEnvironmentImage> decode_hdr_environment(std::span<const std::uint8_t> bytes) {
+    return decode_hdr_environment_with_quality(bytes, HdrLightingQuality::standard);
 }
 } // namespace carto::assets

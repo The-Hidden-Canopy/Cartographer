@@ -36,7 +36,8 @@ double rendered_radiance(application::ApplicationSession& s) {
 }
 int main(){try {
     const auto flat=image(8,4),rle=image(8,4,true);
-    const auto a=take(assets::decode_hdr_environment(flat)),b=take(assets::decode_hdr_environment(rle));
+    const auto legacy_decoder = &assets::decode_hdr_environment;
+    const auto a=take(legacy_decoder(flat)),b=take(assets::decode_hdr_environment(rle));
     {
         struct CommaDecimal final : std::numpunct<char> {
             char do_decimal_point() const override { return ','; }
@@ -136,6 +137,68 @@ int main(){try {
         check(!project::PresentationCatalog::deserialize(forged),
               "old catalog versions cannot smuggle a newer oversized environment");
     }
+    {
+        auto sharp_source = image(512,256);
+        const auto sharp_pixel_start = sharp_source.size() - 512U*256U*4U;
+        const auto bright = sharp_pixel_start + (128U*512U + 256U)*4U;
+        sharp_source[bright] = sharp_source[bright+1] = sharp_source[bright+2] = 255;
+        const auto standard = take(assets::decode_hdr_environment(sharp_source));
+        const auto high = take(assets::decode_hdr_environment_with_quality(
+            sharp_source, assets::HdrLightingQuality::high));
+        check(standard.width == 256 && standard.height == 128 &&
+                  high.width == 512 && high.height == 256 &&
+                  high.source_digest == standard.source_digest,
+              "explicit high-detail HDR import retains the native 512x256 source grid");
+        check(high.linear_radiance[128U*512U+256U].x >
+                  standard.linear_radiance[64U*256U+128U].x * 1.5,
+              "high-detail HDR import preserves a narrow bright feature lost by downsampling");
+        check(!assets::decode_hdr_environment_with_quality(sharp_source,
+                  static_cast<assets::HdrLightingQuality>(99)),
+              "unknown HDR import quality fails explicitly");
+        const auto filtered = take(assets::decode_hdr_environment_with_quality(
+            image(1024,512,true), assets::HdrLightingQuality::high));
+        check(filtered.width == 512 && filtered.height == 256,
+              "high-detail HDR imports larger sources within their bounded grid");
+        double source_energy = 0, filtered_energy = 0;
+        for (unsigned y=0; y<512; ++y)
+            source_energy += (1+double(y%128)/64) *
+                (std::cos(y*std::numbers::pi/512)-std::cos((y+1)*std::numbers::pi/512));
+        for (unsigned y=0; y<256; ++y)
+            filtered_energy += filtered.linear_radiance[y*512].x *
+                (std::cos(y*std::numbers::pi/256)-std::cos((y+1)*std::numbers::pi/256));
+        near(source_energy, filtered_energy,
+             "high-detail HDR downsampling conserves solid-angle weighted energy");
+        project::AuthoredEnvironment source;
+        source.identity = "hdr.high-detail";
+        source.width = high.width;
+        source.height = high.height;
+        source.linear_radiance = high.linear_radiance;
+        project::PresentationCatalog catalog;
+        okay(catalog.set_environment(source));
+        const auto serialized = catalog.serialize();
+        check(serialized.starts_with("CARTOGRAPHER_PRESENTATION_CATALOG 7\n") &&
+                  take(project::PresentationCatalog::deserialize(serialized)).serialize() == serialized,
+              "512x256 HDR grids use v7 and survive exact catalog reload");
+        auto forged = serialized;
+        forged.replace(forged.find("CATALOG 7"),9,"CATALOG 6");
+        check(!project::PresentationCatalog::deserialize(forged),
+              "v6 cannot smuggle a v7-sized environment grid");
+        application::ApplicationSession session;
+        const auto snapshot = session.snapshot();
+        send(session, application::SetPresentationCatalogAction{
+            snapshot.project_generation, snapshot.project_revision, catalog});
+        send(session, application::UndoAction{});
+        check(!session.snapshot().presentation_catalog.environment(),
+              "undo removes the high-detail HDR source");
+        send(session, application::RedoAction{});
+        check(session.snapshot().presentation_catalog.serialize() == serialized,
+              "redo restores the exact high-detail HDR source");
+        const auto path = std::filesystem::temp_directory_path() /
+            ("cartographer-hdr-v7-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".carto");
+        send(session, application::SaveProjectAction{path, std::nullopt, {}, {}, false});
+        check(take(project::ProjectDocument::load(path)).presentation_catalog().serialize() == serialized,
+              "high-detail HDR survives the real project save and reload path");
+    }
 
     // Exercise the same preparation used by the desktop import button.
     {
@@ -167,8 +230,8 @@ int main(){try {
         check(replaced.environment()->enabled && replaced.environment()->rotation_radians==0 &&
               replaced.environment()->intensity==1 && replaced.environment()->revision==core::Revision{1},
               "different HDR identity uses replacement defaults");
-        auto invalid=changed;invalid.linear_radiance[0].x=-1;
-        check(!studio::prepare_environment_import(refreshed,invalid) &&
+        auto invalid_environment=changed;invalid_environment.linear_radiance[0].x=-1;
+        check(!studio::prepare_environment_import(refreshed,invalid_environment) &&
               session.snapshot().presentation_catalog.serialize()==refreshed.serialize(),
               "invalid reimport leaves existing lighting unchanged");
         auto exhausted=*refreshed.environment();exhausted.revision=core::Revision{core::Revision::max_value()};
@@ -179,7 +242,7 @@ int main(){try {
     }
 
     const auto root=std::filesystem::temp_directory_path()/("environment-edit-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));std::filesystem::create_directories(root);
-    application::ApplicationSession s;send(s,application::SaveProjectAction{root/"scene.carto"});
+    application::ApplicationSession s;send(s,application::SaveProjectAction{root/"scene.carto", {}, {}, {}, false});
     geometry::EditableMesh mesh;okay(mesh.insert_bulk({{{1},{0,0,0}},{{2},{1,0,0}},{{3},{1,1,0}},{{4},{0,1,0}}},{{{1},{{1},{2},{3}}},{{2},{{1},{3},{4}}}}));
     send(s,application::CreateMeshObjectAction{"HDR-lit authored quad",std::move(mesh)});
     project::AuthoredEnvironment env;env.identity="hdr."+a.source_digest.hex();env.width=a.width;env.height=a.height;env.linear_radiance=a.linear_radiance;
@@ -195,7 +258,7 @@ int main(){try {
     send(s,application::RedoAction{});near(s.snapshot().presentation_catalog.environment()->intensity,2,"redo environment edit");
     snap=s.snapshot();catalog=snap.presentation_catalog;env.rotation_radians=.7;env.revision=env.revision.next();
     okay(catalog.set_environment(env));send(s,application::SetPresentationCatalogAction{snap.project_generation,snap.project_revision,catalog});
-    send(s,application::SaveProjectAction{std::nullopt});const auto loaded=take(project::ProjectDocument::load(root/"scene.carto"));
+    send(s,application::SaveProjectAction{});const auto loaded=take(project::ProjectDocument::load(root/"scene.carto"));
     check(loaded.presentation_catalog().serialize()==s.snapshot().presentation_catalog.serialize(),"HDR source, controls and identity survive reopen");
     const auto exported=take(io::export_glb(loaded,root/"lit.glb"));
     check(std::any_of(exported.warnings.begin(),exported.warnings.end(),[](const auto& warning){return warning.find("HDR environment lighting")!=std::string::npos;}),"export explicitly reports consumer lighting boundary");

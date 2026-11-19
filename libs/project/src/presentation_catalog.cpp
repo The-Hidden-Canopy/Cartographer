@@ -529,7 +529,7 @@ core::Result<void> PresentationCatalog::insert_light(AuthoredLight light) {
 
 core::Result<void> AuthoredEnvironment::validate() const {
     if (!safe_identifier(identity, 128) || revision == core::Revision{} || height < 2 ||
-        height > 128 || width != height * 2 ||
+        height > 256 || width != height * 2 ||
         linear_radiance.size() != std::size_t(width) * height || !std::isfinite(rotation_radians) ||
         std::abs(rotation_radians) > 1e6 || !std::isfinite(intensity) || intensity < 0 ||
         intensity > 1e4)
@@ -613,7 +613,9 @@ core::Result<void> PresentationCatalog::validate() const {
         if (mask != 0b111U) return core::Result<void>::failure(validation(
             "reference-image view set requires exactly one front, side, and top plane"));
     }
-    if (serialize().size() > kMaxSerializedBytes) {
+    const auto limit = environment_ && environment_->height > 128
+        ? kMaxHighDetailSerializedBytes : kMaxSerializedBytes;
+    if (serialize().size() > limit) {
         return core::Result<void>::failure(validation(
             "presentation catalog exceeds its serialized size bound"));
     }
@@ -625,8 +627,9 @@ std::string PresentationCatalog::serialize() const {
     out.imbue(std::locale::classic());
     out << std::setprecision(std::numeric_limits<double>::max_digits10);
     // Keep the existing byte identity for catalogs that old readers support.
-    // Larger environment grids require v6 so older readers reject explicitly.
-    const auto version = environment_ && environment_->height > 64 ? kSchemaVersion : 5U;
+    // Larger environment grids require a new version so older readers reject explicitly.
+    const auto version = environment_ && environment_->height > 128 ? 7U
+        : (environment_ && environment_->height > 64 ? 6U : 5U);
     out << kMagic << ' ' << version << '\n';
     out << "CAMERAS " << cameras_.size() << '\n';
     for (const auto& [identity, camera] : cameras_) {
@@ -706,7 +709,7 @@ core::Result<assets::Sha256Digest> PresentationCatalog::canonical_digest() const
 }
 
 core::Result<PresentationCatalog> PresentationCatalog::deserialize(std::string_view text) {
-    if (text.empty() || text.size() > kMaxSerializedBytes) {
+    if (text.empty() || text.size() > kMaxHighDetailSerializedBytes) {
         return core::Result<PresentationCatalog>::failure(invalid(
             "presentation catalog is empty or exceeds its serialized size bound"));
     }
@@ -718,6 +721,10 @@ core::Result<PresentationCatalog> PresentationCatalog::deserialize(std::string_v
         (version < 1U || version > kSchemaVersion)) {
         return core::Result<PresentationCatalog>::failure({
             core::ErrorCode::version_mismatch, "presentation catalog version is unsupported"});
+    }
+    if (version < 7U && text.size() > kMaxSerializedBytes) {
+        return core::Result<PresentationCatalog>::failure(invalid(
+            "legacy presentation catalog exceeds its serialized size bound"));
     }
     PresentationCatalog catalog;
     std::size_t count = 0U;
@@ -878,7 +885,7 @@ core::Result<PresentationCatalog> PresentationCatalog::deserialize(std::string_v
                 !read_unsigned(input, revision) || !read_unsigned(input, e.width) ||
                 !read_unsigned(input, e.height) || !(input >> e.rotation_radians >> e.intensity) ||
                 !read_bool(input, e.enabled) || e.height < 2 ||
-                e.height > (version >= 6 ? 128U : 64U) ||
+                e.height > (version >= 7 ? 256U : (version >= 6 ? 128U : 64U)) ||
                 e.width != 2 * e.height)
                 return core::Result<PresentationCatalog>::failure(
                     validation("environment source record is invalid"));

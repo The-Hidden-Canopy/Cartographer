@@ -7624,7 +7624,7 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
         }
         std::string encoded_presentation_catalog;
         if (!(input >> std::quoted(encoded_presentation_catalog)) ||
-            encoded_presentation_catalog.size() > PresentationCatalog::kMaxSerializedBytes) {
+            encoded_presentation_catalog.size() > PresentationCatalog::kMaxHighDetailSerializedBytes) {
             return core::Result<ProjectDocument>::failure(parse_error(
                 "project presentation catalog record is invalid or oversized"));
         }

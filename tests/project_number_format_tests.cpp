@@ -60,7 +60,7 @@ int main() {
         std::filesystem::create_directories(root);
         const auto path = root / "numbers.carto";
         require(bool(carto::application::HumanApplicationAccess::dispatch(
-            session, carto::application::SaveProjectAction{path})), "saved");
+            session, carto::application::SaveProjectAction{path, {}, {}, {}, false})), "saved");
 
         const auto text = read_text(path);
         require(text.find("0.1 0.2 0.3") != std::string::npos, "short decimals are written as authored");

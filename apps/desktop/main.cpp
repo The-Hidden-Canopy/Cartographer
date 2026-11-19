@@ -10918,7 +10918,11 @@ struct DesktopState {
     void draw_environment_controls(const UiSnapshot& snapshot) {
         if (!ImGui::BeginPopup("Environment lighting")) return;
         ImGui::TextUnformatted("Scene-linear environment lighting");
-        ImGui::TextDisabled("HDR imports are filtered to a lighting grid of at most 128 x 64.");
+        static bool high_detail_hdr = false;
+        ImGui::Checkbox("High-detail HDR import", &high_detail_hdr);
+        ImGui::TextDisabled(high_detail_hdr
+            ? "Up to 512 x 256; about 4.6 MiB for the GPU atlas. Larger saved grids require newer readers."
+            : "Up to 256 x 128; lower memory and faster environment preparation.");
         if (ImGui::Button("Import Radiance HDR...")) {
             const auto path = choose_file(false, FileDialogKind::hdr_environment);
             if (path) {
@@ -10931,7 +10935,9 @@ struct DesktopState {
                     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(length));
                     input.seekg(0);
                     input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-                    auto decoded = carto::assets::decode_hdr_environment(bytes);
+                    auto decoded = carto::assets::decode_hdr_environment_with_quality(bytes, high_detail_hdr
+                        ? carto::assets::HdrLightingQuality::high
+                        : carto::assets::HdrLightingQuality::standard);
                     if (!input || !decoded) {
                         action_feedback = !input ? "HDR read failed; existing lighting retained." : decoded.error().message;
                         action_feedback_error = true;

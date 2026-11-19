@@ -112,20 +112,23 @@ environment_content_digest(const project::AuthoredEnvironment &e) {
 }
 core::Result<std::shared_ptr<const EnvironmentLighting>>
 compile_environment_lighting(const project::AuthoredEnvironment &e) {
-    return compile_environment_lighting(e, e.width > EnvironmentLighting::width
-        ? EnvironmentLightingQuality::high : EnvironmentLightingQuality::standard);
+    return compile_environment_lighting(e, e.width > 256U ? EnvironmentLightingQuality::ultra
+        : (e.width > EnvironmentLighting::width ? EnvironmentLightingQuality::high
+                                                : EnvironmentLightingQuality::standard));
 }
 core::Result<std::shared_ptr<const EnvironmentLighting>>
 compile_environment_lighting(const project::AuthoredEnvironment &e, EnvironmentLightingQuality quality) {
     using Result = core::Result<std::shared_ptr<const EnvironmentLighting>>;
-    if (quality != EnvironmentLightingQuality::standard && quality != EnvironmentLightingQuality::high)
+    if (quality != EnvironmentLightingQuality::standard && quality != EnvironmentLightingQuality::high &&
+        quality != EnvironmentLightingQuality::ultra)
         return Result::failure(invalid("unknown environment lighting quality"));
     auto digest = environment_content_digest(e);
     if (!digest)
         return Result::failure(digest.error());
     auto product = std::shared_ptr<EnvironmentLighting>(new EnvironmentLighting);
     product->source_digest_ = digest.value();
-    product->atlas_width_ = quality == EnvironmentLightingQuality::high ? 256U : product->width;
+    product->atlas_width_ = quality == EnvironmentLightingQuality::ultra ? 512U
+        : (quality == EnvironmentLightingQuality::high ? 256U : product->width);
     const unsigned atlas_width = product->atlas_width();
     product->atlas_.resize(std::size_t(atlas_width) * product->atlas_height());
     const auto store = [&](unsigned x, unsigned y, Vec3d c) {

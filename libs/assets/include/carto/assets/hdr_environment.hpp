@@ -6,6 +6,8 @@
 #include <vector>
 
 namespace carto::assets {
+enum class HdrLightingQuality { standard, high };
+
 struct HdrEnvironmentImage {
     Sha256Digest source_digest;
     std::uint32_t source_width = 0, source_height = 0;
@@ -14,8 +16,11 @@ struct HdrEnvironmentImage {
 };
 // Bounded Radiance RGBE lat-long import, including planar RLE and axis flips.
 // EXPOSURE/COLORCORR are removed, primaries adapted to linear Rec.709/D65.
-// The persisted lighting grid is explicitly solid-angle filtered to <=256x128.
+// The persisted lighting grid is solid-angle filtered to <=256x128 by default,
+// or <=512x256 when high quality is explicitly requested.
 // Unsupported encodings, out-of-gamut radiance and malformed input fail atomically.
 [[nodiscard]] core::Result<HdrEnvironmentImage> decode_hdr_environment(
     std::span<const std::uint8_t> bytes);
+[[nodiscard]] core::Result<HdrEnvironmentImage> decode_hdr_environment_with_quality(
+    std::span<const std::uint8_t> bytes, HdrLightingQuality quality);
 } // namespace carto::assets

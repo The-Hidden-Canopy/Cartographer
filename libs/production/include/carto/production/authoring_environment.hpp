@@ -8,12 +8,12 @@ namespace carto::production {
 [[nodiscard]] core::Result<assets::Sha256Digest>
 environment_content_digest(const project::AuthoredEnvironment &);
 
-enum class EnvironmentLightingQuality { standard, high };
+enum class EnvironmentLightingQuality { standard, high, ultra };
 
 // Immutable disposable lighting, compiled from one saved environment source.
 // One bounded linear RGBA32F atlas with seven specular levels, a 32x16
 // diffuse E/pi region, and a 64x64 split-sum BRDF region. High quality uses
-// a 256-wide atlas; the legacy standard layout remains 128-wide.
+// a 256-wide atlas, ultra uses 512, and standard remains 128-wide.
 // No exposure, source rotation/intensity or GPU handle is baked into the atlas.
 class EnvironmentLighting final {
   public:

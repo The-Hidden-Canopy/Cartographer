@@ -189,8 +189,9 @@ read_reference_image_source_bytes(
 // radiance, switch state, and runtime light simulation are derived/external.
 class PresentationCatalog final {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 6U;
+    static constexpr std::uint32_t kSchemaVersion = 7U;
     static constexpr std::size_t kMaxSerializedBytes = 8U * 1024U * 1024U;
+    static constexpr std::size_t kMaxHighDetailSerializedBytes = 16U * 1024U * 1024U;
     static constexpr std::size_t kMaxRecords = 4'096U;
 
   [[nodiscard]] core::Result<void> insert_camera(AuthoredCamera camera);
