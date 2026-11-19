@@ -6582,11 +6582,11 @@ ProjectDiff ProjectDiff::between(
             change.removed = removed;
             if (!added) {
                 change.before = ProjectEditReceiptSummary{
-                    before[index].bytes.size(), before[index].digest};
+                    before[index].bytes.size(), before[index].digest, 0U, {}, {}};
             }
             if (!removed) {
                 change.after = ProjectEditReceiptSummary{
-                    after[index].bytes.size(), after[index].digest};
+                    after[index].bytes.size(), after[index].digest, 0U, {}, {}};
             }
             edit_receipt_change.records.push_back(std::move(change));
         }
