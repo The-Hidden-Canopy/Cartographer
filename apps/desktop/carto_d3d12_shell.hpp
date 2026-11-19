@@ -819,7 +819,8 @@ private:
     bool texture_frame_open_ = false, texture_shutdown_sealed_ = false;
     Clock::time_point entry_ = Clock::now(); std::array<double,9> phases_{};
     ViewportTiming viewport_;
-    unsigned trace_remaining_ = 0, traced_rows_ = 0;
+    unsigned trace_remaining_ = 0;
+    [[maybe_unused]] unsigned traced_rows_ = 0;
     unsigned font_updates_ = 0;
     std::uint64_t uploaded_bytes_ = 0;
     double startup_ms_ = 0;

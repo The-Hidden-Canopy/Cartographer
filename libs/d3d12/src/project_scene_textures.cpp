@@ -272,7 +272,8 @@ core::Result<std::vector<SceneRenderTexture>> load_project_scene_textures(
                 "generated material texture mip payload differs from its bounded extent"});
         }
         aggregate_mip_bytes += mip_bytes.value();
-        loaded.push_back({identity, source->second.content_digest, std::move(mips.value())});
+        loaded.push_back({identity, source->second.content_digest, std::move(mips.value()),
+                          {}, assets::TextureSemantic::emissive});
     }
     return Output::success(std::move(loaded));
 }

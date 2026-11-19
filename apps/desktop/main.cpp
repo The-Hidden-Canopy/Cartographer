@@ -7062,7 +7062,7 @@ struct DesktopState {
                 static_cast<double>(intervals.value());
             std::string sample_diagnostic;
             if (!viewport_surface_frontmost_at(
-                    start + (end - start) * along, expected_object,
+                    start + delta * along, expected_object,
                     expected_generation, expected_revision,
                     expected_viewport, sample_diagnostic)) {
                 diagnostic = std::move(sample_diagnostic);
@@ -7112,14 +7112,14 @@ struct DesktopState {
             carto::core::dot(screen_position - edge.first, delta) / length_squared,
             0.0, 1.0);
         const carto::core::Vec2d surface_point = edge.first + delta * along;
-        const auto surface = carto::ui::resolve_frontmost_viewport_surface(
+        const auto surface_hit = carto::ui::resolve_frontmost_viewport_surface(
             native_viewport_hits.sculpt_triangles, surface_point, true);
-        if (!surface) {
-            diagnostic = surface.error().message;
+        if (!surface_hit) {
+            diagnostic = surface_hit.error().message;
             return false;
         }
-        if (surface.value().status != carto::ui::ProjectedSurfaceHitStatus::hit ||
-            surface.value().object != edge.object) {
+        if (surface_hit.value().status != carto::ui::ProjectedSurfaceHitStatus::hit ||
+            surface_hit.value().object != edge.object) {
             diagnostic = "The selected edge is not on the frontmost visible surface.";
             return false;
         }
@@ -7131,7 +7131,7 @@ struct DesktopState {
             return false;
         }
         const auto frontmost = carto::studio::perspective_edge_is_frontmost(
-            edge_depth.value(), surface.value().camera_depth);
+            edge_depth.value(), surface_hit.value().camera_depth);
         if (!frontmost) {
             diagnostic = frontmost.error().message;
             return false;
@@ -8873,20 +8873,20 @@ struct DesktopState {
                             second_x * second_x + second_y * second_y;
                     });
                 for (const auto* candidate : candidates) {
-                    const auto surface = carto::ui::resolve_frontmost_viewport_surface(
+                    const auto surface_hit = carto::ui::resolve_frontmost_viewport_surface(
                         native_viewport_hits.sculpt_triangles,
                         {static_cast<double>(candidate->point.x),
                          static_cast<double>(candidate->point.y)}, true);
-                    if (!surface || surface.value().status !=
+                    if (!surface_hit || surface_hit.value().status !=
                             carto::ui::ProjectedSurfaceHitStatus::hit ||
-                        surface.value().object != candidate->object) {
+                        surface_hit.value().object != candidate->object) {
                         continue;
                     }
                     const double depth_tolerance = 1.0e-8 * std::max({
                         1.0, std::abs(candidate->camera_depth),
-                        std::abs(surface.value().camera_depth)});
+                        std::abs(surface_hit.value().camera_depth)});
                     if (candidate->camera_depth + depth_tolerance <
-                        surface.value().camera_depth) {
+                        surface_hit.value().camera_depth) {
                         continue;
                     }
                     static_cast<void>(dispatch(SelectVertexAction{
@@ -9006,9 +9006,10 @@ struct DesktopState {
             return;
         }
         carto::io::GltfExportOptions options{*snapshot.project_path, {},
-            export_bake_graphs ? export_bake_resolution : 0U, {}};
+            export_bake_graphs ? export_bake_resolution : 0U, {},
+            64ULL * 1024ULL * 1024ULL, false, {}};
         const auto source_bytes = document.value().serialize();
-        const auto source_digest = carto::assets::sha256({
+        [[maybe_unused]] const auto source_digest = carto::assets::sha256({
             reinterpret_cast<const std::uint8_t*>(source_bytes.data()), source_bytes.size()});
         for (const auto& [mesh_id, stored] : document.value().sculpt_stacks()) {
 #ifdef CARTO_HAS_SCULPT_PREVIEW_PROVIDER
@@ -9196,6 +9197,7 @@ struct DesktopState {
             .output_root = output_root,
             .expected_selected_digest = expected,
             .stop_token = {},
+            .coordinate_override = {},
         };
         auto started = carto::production::PreparationJob::start(
             document.value(), request);
@@ -19614,25 +19616,25 @@ struct DesktopState {
                         "Unknown", "Curvature", "Thickness", "Contact", "Weathering",
                         "Edge process", "Surface domain", "Material stratigraphy",
                         "Authored mask"};
-                    for (const auto& [surface, type] : required_surface_inputs) {
-                        const auto surface_index = static_cast<std::size_t>(surface);
+                    for (const auto& [surface_input, type] : required_surface_inputs) {
+                        const auto surface_index = static_cast<std::size_t>(surface_input);
                         const char* surface_name = surface_index < surface_names.size()
                             ? surface_names[surface_index] : "Unknown";
-                        ImGui::PushID(static_cast<int>(surface));
+                        ImGui::PushID(static_cast<int>(surface_input));
                         ImGui::Text("%s (%s)", surface_name, value_type_name(type));
-                        auto found = material_graph_cpu_inputs.surface_inputs.find(surface);
+                        auto found = material_graph_cpu_inputs.surface_inputs.find(surface_input);
                         bool provided = found != material_graph_cpu_inputs.surface_inputs.end();
                         if (ImGui::Checkbox("Supply explicitly", &provided)) {
                             cpu_inputs_changed = true;
                             if (!provided) {
-                                material_graph_cpu_inputs.surface_inputs.erase(surface);
+                                material_graph_cpu_inputs.surface_inputs.erase(surface_input);
                             } else if (found == material_graph_cpu_inputs.surface_inputs.end()) {
                                 carto::project::MaterialGraphValue value;
                                 value.type = type;
-                                material_graph_cpu_inputs.surface_inputs.emplace(surface, value);
+                                material_graph_cpu_inputs.surface_inputs.emplace(surface_input, value);
                             }
                         }
-                        found = material_graph_cpu_inputs.surface_inputs.find(surface);
+                        found = material_graph_cpu_inputs.surface_inputs.find(surface_input);
                         if (provided && found != material_graph_cpu_inputs.surface_inputs.end()) {
                             if (found->second.type != type) {
                                 found->second = {};
