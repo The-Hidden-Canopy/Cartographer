@@ -6816,9 +6816,9 @@ void project_diff_reports_material_and_texture_source_changes() {
     }
     REQUIRE(rebuilt_catalog.insert_sampler(
         sampler(core::Revision{2U}, project::SamplerAddressMode::clamp_to_edge)));
-    for (const auto& [id, material] : with_graph.material_catalog().materials()) {
+    for (const auto& [id, catalog_material] : with_graph.material_catalog().materials()) {
         static_cast<void>(id);
-        REQUIRE(rebuilt_catalog.insert_material(material));
+        REQUIRE(rebuilt_catalog.insert_material(catalog_material));
     }
     for (const auto& [id, value] : with_graph.material_catalog().variants()) {
         static_cast<void>(id);
