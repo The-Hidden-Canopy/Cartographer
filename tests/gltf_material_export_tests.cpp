@@ -9,6 +9,7 @@
 #include <carto/io/gltf_scene_import.hpp>
 #include <limits>
 #include "application_access.hpp"
+#include "../apps/desktop/interchange_export_options.hpp"
 namespace {
 static_assert(production::authoring_material_bake_fits_budget(4));
 static_assert(production::authoring_material_bake_fits_budget(256));
@@ -521,6 +522,17 @@ int main(int argc, char **argv) {
               "material/image accounting");
         check(a.warnings == b.warnings && a.embedded_image_bytes == b.embedded_image_bytes,
               "container reports agree");
+        {
+            auto desktop_options = carto::desktop::interchange_export_options(path, false, 256U);
+            desktop_options.textures = library;
+            const auto desktop_gltf = take(io::export_gltf(d, root / "desktop-options.gltf", desktop_options));
+            const auto desktop_glb = take(io::export_glb(d, root / "desktop-options.glb", desktop_options));
+            check(desktop_gltf.images == a.images && desktop_glb.images == b.images,
+                  "desktop options preserve the textured glTF and GLB exports");
+            inspect(Payload(root / "desktop-options.gltf"), decoded.pixels);
+            inspect(Payload(root / "desktop-options.glb"), decoded.pixels);
+            check(d.serialize() == before, "desktop export options leave the source unchanged");
+        }
         if (argc == 3 && std::string_view(argv[1]) == "--fixture") {
             assets::BlobStore store(root / ".carto-assets" / "source-blobs");
             take(store.put(tga, "image/x-tga"));

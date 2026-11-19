@@ -29,6 +29,7 @@
 #include "bake_workflow.hpp"
 #include "carto_studio_dock.hpp"
 #include "interchange_export_feedback.hpp"
+#include "interchange_export_options.hpp"
 #include "prepared_publication_feedback.hpp"
 #ifdef CARTO_HAS_SCULPT_PREVIEW_PROVIDER
 #include <carto/sculpt_preview_provider_factory.hpp>
@@ -9005,9 +9006,8 @@ struct DesktopState {
                         L"Cartographer export failed", MB_OK | MB_ICONERROR);
             return;
         }
-        carto::io::GltfExportOptions options{*snapshot.project_path, {},
-            export_bake_graphs ? export_bake_resolution : 0U, {},
-            64ULL * 1024ULL * 1024ULL, false, {}};
+        auto options = carto::desktop::interchange_export_options(
+            *snapshot.project_path, export_bake_graphs, export_bake_resolution);
         const auto source_bytes = document.value().serialize();
         [[maybe_unused]] const auto source_digest = carto::assets::sha256({
             reinterpret_cast<const std::uint8_t*>(source_bytes.data()), source_bytes.size()});
