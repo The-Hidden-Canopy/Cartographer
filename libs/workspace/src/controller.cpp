@@ -357,7 +357,7 @@ core::Result<void> validate_referential(
             return core::Result<void>::failure(not_found(
                 "workspace attachment joint is not present in the character graph"));
         }
-        const AttachmentBinding key{payload.joint, payload.mesh};
+        const AttachmentBinding key{payload.joint, payload.mesh, core::Transform::identity(), {}};
         if (std::binary_search(bundle.attachments.begin(), bundle.attachments.end(), key)) {
             return core::Result<void>::failure(validation(
                 "workspace attachment is already recorded on the character"));
