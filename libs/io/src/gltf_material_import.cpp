@@ -623,8 +623,8 @@ core::Result<ImportedGltfMaterials> import_gltf_materials(std::span<const std::u
                 fields(e, {"thicknessFactor", "thicknessTexture", "attenuationDistance",
                            "attenuationColor"});
                 v.thickness = number(get(e, "thicknessFactor", "0"));
-                const auto color = vector(get(e, "attenuationColor", "[1,1,1]"), 3);
-                v.attenuation_color = {color[0], color[1], color[2]};
+                const auto attenuation = vector(get(e, "attenuationColor", "[1,1,1]"), 3);
+                v.attenuation_color = {attenuation[0], attenuation[1], attenuation[2]};
                 // glTF's default (absent) distance is infinity: no absorption.
                 v.attenuation_distance = number(get(e, "attenuationDistance", "0"));
                 put(e, "thicknessTexture", v.thickness_map);
