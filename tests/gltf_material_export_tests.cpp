@@ -698,7 +698,8 @@ int main(int argc, char **argv) {
               "reopened material export deterministic");
         assets::BlobStore store(root / ".carto-assets" / "source-blobs");
         take(store.put(tga, "image/x-tga"));
-        io::GltfExportOptions stored{path, {}};
+        io::GltfExportOptions stored{};
+        stored.project_path = path;
         take(io::export_gltf(reopened, root / "store.gltf", stored));
         check(read(root / "store.gltf") == read(root / "material.gltf"),
               "digest-addressed reopen pixel hydration");
@@ -1002,7 +1003,8 @@ int main(int argc, char **argv) {
             static_cast<void>(take(tx.commit("whole.scene.materials")));
             static_cast<void>(take(rich.save_atomic(rich_path)));
             const auto unchanged = rich.serialize();
-            io::GltfExportOptions budget{rich_path};
+            io::GltfExportOptions budget{};
+            budget.project_path = rich_path;
             auto refused = io::export_gltf(rich, root / "whole-scene-default.gltf", budget);
             std::cerr << "default whole-scene result: " << (refused ? "exported" : refused.error().message) << '\n';
             check(!refused && refused.error().message.find("embedded images exceed 64-image/64-MiB bound") !=
