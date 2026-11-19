@@ -34,7 +34,7 @@ def main():
     hdr_digest = hashlib.sha256(args.hdr.read_bytes()).hexdigest()
 
     def invoke(name, width="160", height="90", frames="4", temporal="off", camera=None,
-               refraction=None, hidden=None):
+               refraction=None, hidden=None, high_hdr=False):
         root = args.new_parent / name
         command = [str(args.executable), str(args.project), str(args.hdr), str(root), width, height,
                    *(camera or args.camera), frames, temporal]
@@ -42,6 +42,8 @@ def main():
             command.append(refraction or "scene")
         if hidden is not None:
             command.append(str(hidden))
+        if high_hdr:
+            command.append("--hdr-high")
         return root, subprocess.run(command, capture_output=True, text=True, check=False)
 
     root, result = invoke("off")
@@ -49,6 +51,7 @@ def main():
     receipt = (root / "receipt.txt").read_text()
     require(f"source_sha256={before}" in receipt and f"hdr_source_sha256={hdr_digest}" in receipt and
             "source_project=unchanged" in receipt and "review_presentation=journaled_copy" in receipt and
+            "hdr_lighting_quality=standard" in receipt and
             "transmission=environment_only" in receipt and "temporal_history=off" in receipt and
             (root / "review.journal").stat().st_size > 0, "capture receipt lost a source or limitation")
     rows = [line for line in receipt.splitlines() if line.startswith("frame=")]
@@ -85,6 +88,16 @@ def main():
     on_root, enabled = invoke("on", frames="4", temporal="on")
     require(enabled.returncode == 0 and "temporal_history=on" in (on_root / "receipt.txt").read_text(),
             f"temporal review failed: {enabled.stdout}\n{enabled.stderr}")
+    high_root, high = invoke("high-hdr", frames="1", refraction="scene", high_hdr=True)
+    require(high.returncode == 0, f"high-detail HDR review failed: {high.stdout}\n{high.stderr}")
+    high_receipt = (high_root / "receipt.txt").read_text()
+    require("hdr_lighting_quality=high" in high_receipt and f"hdr_source_sha256={hdr_digest}" in high_receipt
+            and "transmission=scene_requested" in high_receipt, "high-detail HDR receipt is incomplete")
+    standard_grid = re.search(r"hdr_lighting_grid=(\d+)x(\d+)", receipt)
+    high_grid = re.search(r"hdr_lighting_grid=(\d+)x(\d+)", high_receipt)
+    require(standard_grid and high_grid and int(high_grid[1]) >= int(standard_grid[1]) and
+            int(high_grid[2]) >= int(standard_grid[2]) and int(high_grid[1]) <= 512 and
+            int(high_grid[2]) <= 256, "high-detail HDR grid is missing or outside its bounds")
     if args.displaced_object is not None:
         invalid_root, invalid = invoke("scene-invalid-object", frames="1", hidden=0)
         require(invalid.returncode != 0 and not invalid_root.exists(),
@@ -100,7 +113,7 @@ def main():
     require(hashlib.sha256(args.project.read_bytes()).hexdigest() == before,
             "review altered the authoritative project")
     print(f"authoring GPU review passed: frames=4 hdr_preview_max_error={maximum_error} "
-          "source_unchanged=true temporal_modes=2 refusal_boundaries=4")
+          "source_unchanged=true temporal_modes=2 hdr_quality_modes=2 refusal_boundaries=4")
 
 
 if __name__ == "__main__":

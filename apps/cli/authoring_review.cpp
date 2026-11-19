@@ -97,9 +97,11 @@ void write_image(const std::filesystem::path& root,
 int main(int argc, char** argv) {
     using namespace carto;
     try {
+        const bool high_detail_hdr = argc > 1 && std::string_view(argv[argc - 1]) == "--hdr-high";
+        if (high_detail_hdr) --argc;
         if (argc != 13 && argc != 15 && argc != 16 && argc != 17) throw std::runtime_error(
             "usage: cartographer_authoring_review PROJECT HDR NEW_DIRECTORY WIDTH HEIGHT "
-            "TARGET_X TARGET_Y TARGET_Z DISTANCE YAW PITCH VERTICAL_FOV [FRAMES off|on [environment|scene [DISPLACED_OBJECT_ID]]]");
+            "TARGET_X TARGET_Y TARGET_Z DISTANCE YAW PITCH VERTICAL_FOV [FRAMES off|on [environment|scene [DISPLACED_OBJECT_ID]]] [--hdr-high]");
         const std::filesystem::path project_path = argv[1], hdr_path = argv[2], root = argv[3];
         production::AuthoringViewportRequest request;
         request.width = number<std::uint32_t>(argv[4]);
@@ -120,9 +122,11 @@ int main(int argc, char** argv) {
             pixels * (3ULL * frames + 12ULL) + 8192ULL > 1024ULL * 1024ULL * 1024ULL)
             throw std::runtime_error("review extent or perspective camera is outside its bounds");
         const auto source_bytes = read_bounded(project_path, 128U * 1024U * 1024U);
-        const auto hdr_bytes = read_bounded(hdr_path, 32U * 1024U * 1024U);
+        const auto hdr_bytes = read_bounded(hdr_path, assets::kMaxHdrEnvironmentSourceBytes);
         const auto source_digest = assets::sha256(source_bytes);
-        const auto decoded = take(assets::decode_hdr_environment(hdr_bytes));
+        const auto decoded = high_detail_hdr
+            ? take(assets::decode_hdr_environment_with_quality(hdr_bytes, assets::HdrLightingQuality::high))
+            : take(assets::decode_hdr_environment(hdr_bytes));
         auto document = take(project::ProjectDocument::deserialize(std::string_view(
             reinterpret_cast<const char*>(source_bytes.data()), source_bytes.size())));
         if (argc == 17) {
@@ -175,6 +179,7 @@ int main(int argc, char** argv) {
                 << "source_sha256=" << source_digest.hex() << "\nhdr_source_sha256=" << decoded.source_digest.hex()
                 << "\nhdr_source_extent=" << decoded.source_width << 'x' << decoded.source_height
                 << "\nhdr_lighting_grid=" << decoded.width << 'x' << decoded.height
+                << "\nhdr_lighting_quality=" << (high_detail_hdr ? "high" : "standard")
                 << "\nhdr_decode=solid_angle_filtered_rec709\nreview_direct_lights=suppressed_in_memory"
                 << "\nsource_project=unchanged\nreview_presentation=journaled_copy\nexposure_ev=0\ntone_map=reinhard_srgb"
                 << "\ntransmission=" << (refraction == "environment" ? "environment_only" : "scene_requested")
