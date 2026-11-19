@@ -840,7 +840,7 @@ void ui_imports_and_binds_private_pathless_material_texture_sources() {
     const auto missing_blob = ui.dispatch(
         carto::application::ImportMaterialTextureSourceAction{
             before_missing_blob.project_revision, missing_digest,
-            carto::assets::TextureSourceFormat::tga, 2U, 1U});
+            carto::assets::TextureSourceFormat::tga, 2U, 1U, {}});
     REQUIRE(!missing_blob);
     REQUIRE(ui.snapshot().project_revision == before_missing_blob.project_revision);
     REQUIRE(ui.snapshot().texture_sources.empty());
@@ -854,7 +854,7 @@ void ui_imports_and_binds_private_pathless_material_texture_sources() {
     const auto mismatched_metadata = ui.dispatch(
         carto::application::ImportMaterialTextureSourceAction{
             before_mismatched_metadata.project_revision, tga_digest,
-            carto::assets::TextureSourceFormat::png, 2U, 1U});
+            carto::assets::TextureSourceFormat::png, 2U, 1U, {}});
     REQUIRE(!mismatched_metadata);
     REQUIRE(ui.snapshot().project_revision == before_mismatched_metadata.project_revision);
     REQUIRE(ui.snapshot().texture_sources.empty());
@@ -911,21 +911,21 @@ void ui_imports_and_binds_private_pathless_material_texture_sources() {
     const auto stale_action = ui.dispatch(
         carto::application::ImportMaterialTextureSourceAction{
             source_revision_before_import, texture.content_digest,
-            texture.format, texture.width, texture.height});
+            texture.format, texture.width, texture.height, {}});
     REQUIRE(!stale_action);
     REQUIRE(stale_action.error().code == carto::core::ErrorCode::stale_data);
     REQUIRE(ui.snapshot().texture_sources.size() == 1U);
     const auto duplicate_action = ui.dispatch(
         carto::application::ImportMaterialTextureSourceAction{
             imported_snapshot.project_revision, texture.content_digest,
-            texture.format, texture.width, texture.height});
+            texture.format, texture.width, texture.height, {}});
     REQUIRE(!duplicate_action);
     REQUIRE(ui.snapshot().project_revision == imported_snapshot.project_revision);
     REQUIRE(ui.snapshot().texture_sources.size() == 1U);
     const auto ai_attempt = ui.submit_ai_proposal(
         carto::application::ImportMaterialTextureSourceAction{
             imported_snapshot.project_revision, texture.content_digest,
-            texture.format, texture.width, texture.height});
+            texture.format, texture.width, texture.height, {}});
     REQUIRE(!ai_attempt);
     REQUIRE(ui.snapshot().project_revision == imported_snapshot.project_revision);
     REQUIRE(ui.snapshot().texture_sources.size() == 1U);
