@@ -460,7 +460,7 @@ int demo(const std::filesystem::path& path) {
         return EXIT_FAILURE;
     }
     auto baseline = carto::application::HumanApplicationAccess::dispatch(
-        session, carto::application::SaveProjectAction{path});
+        session, carto::application::SaveProjectAction{path, {}, {}, {}, false});
     if (!baseline) {
         print_error(baseline.error());
         return EXIT_FAILURE;
@@ -472,7 +472,7 @@ int demo(const std::filesystem::path& path) {
         return EXIT_FAILURE;
     }
     auto receipt = carto::application::HumanApplicationAccess::dispatch(
-        session, carto::application::SaveProjectAction{std::nullopt});
+        session, carto::application::SaveProjectAction{});
     if (!receipt) {
         print_error(receipt.error());
         return EXIT_FAILURE;
@@ -2785,7 +2785,7 @@ int import_mesh_to_project(
         return EXIT_FAILURE;
     }
     auto baseline = carto::application::HumanApplicationAccess::dispatch(
-        session, carto::application::SaveProjectAction{.path = project_path, .require_new_target = true});
+        session, carto::application::SaveProjectAction{project_path, {}, {}, {}, true});
     if (!baseline) {
         print_error(baseline.error());
         return EXIT_FAILURE;
@@ -2797,7 +2797,7 @@ int import_mesh_to_project(
         return EXIT_FAILURE;
     }
     auto receipt = carto::application::HumanApplicationAccess::dispatch(
-        session, carto::application::SaveProjectAction{std::nullopt});
+        session, carto::application::SaveProjectAction{});
     if (!receipt) {
         print_error(receipt.error());
         return EXIT_FAILURE;
@@ -2818,13 +2818,13 @@ int import_gltf_scene(const std::filesystem::path& path,const std::filesystem::p
     auto parsed=carto::io::import_gltf_scene(captured.value());if(!parsed){print_error(parsed.error());return EXIT_FAILURE;}
     carto::application::ApplicationSession session;
     const auto send=[&](const carto::application::ApplicationAction& action){auto r=carto::application::HumanApplicationAccess::dispatch(session,action);if(!r)print_error(r.error());return bool(r);};
-    if(!send(carto::application::NewProjectAction{path.stem().string()})||!send(carto::application::SaveProjectAction{.path = output, .require_new_target = true}))return EXIT_FAILURE;
+    if(!send(carto::application::NewProjectAction{path.stem().string()})||!send(carto::application::SaveProjectAction{output, {}, {}, {}, true}))return EXIT_FAILURE;
     carto::ui::UiController controller(session);
     const auto snapshot=controller.snapshot();
     auto imported=controller.import_static_gltf_scene(path,snapshot.project_generation,
         snapshot.project_revision,snapshot.source_namespace,true,"CLI confirmed source reuse");
     if(!imported){print_error(imported.error());return EXIT_FAILURE;}
-    if(!send(carto::application::SaveProjectAction{std::nullopt}))return EXIT_FAILURE;
+    if(!send(carto::application::SaveProjectAction{}))return EXIT_FAILURE;
     const auto admitted=session.snapshot();
     if(admitted.source_assets.size()!=1U){std::cerr<<"imported source mapping is unavailable\n";return EXIT_FAILURE;}
     const auto& products=admitted.source_assets.front().document_products;
@@ -2928,8 +2928,8 @@ int export_interchange(
     const std::size_t image_limit = whole_scene_materials ? 256U : 64U;
     const std::uint64_t image_bytes = whole_scene_materials ? 512ULL * 1024ULL * 1024ULL : 64ULL * 1024ULL * 1024ULL;
     auto report = binary_container
-        ? carto::io::export_glb(document.value(), output_path, carto::io::GltfExportOptions{project_path,{},graph_bake_resolution,image_limit,image_bytes,source_z_up})
-        : carto::io::export_gltf(document.value(), output_path, carto::io::GltfExportOptions{project_path,{},graph_bake_resolution,image_limit,image_bytes,source_z_up});
+        ? carto::io::export_glb(document.value(), output_path, carto::io::GltfExportOptions{project_path,{},graph_bake_resolution,image_limit,image_bytes,source_z_up,{}})
+        : carto::io::export_gltf(document.value(), output_path, carto::io::GltfExportOptions{project_path,{},graph_bake_resolution,image_limit,image_bytes,source_z_up,{}});
     if (!report) {
         print_error(report.error());
         return EXIT_FAILURE;
@@ -3163,6 +3163,7 @@ int prepare_project(int argc, char** argv) {
         .output_root = output_root,
         .expected_selected_digest = expected,
         .stop_token = {},
+        .coordinate_override = {},
     };
     if (source_z_up) {
         request.coordinate_override = production::PreparedCoordinateConvention{
