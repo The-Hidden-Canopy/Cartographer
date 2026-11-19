@@ -524,6 +524,12 @@ int main(int argc, char **argv) {
               "container reports agree");
         {
             auto desktop_options = carto::desktop::interchange_export_options(path, false, 256U);
+            const auto desktop_baked = carto::desktop::interchange_export_options(path, true, 256U);
+            check(desktop_options.project_path == path && desktop_options.graph_bake_resolution == 0U &&
+                  desktop_baked.graph_bake_resolution == 256U &&
+                  desktop_options.embedded_image_limit == io::GltfExportOptions{}.embedded_image_limit &&
+                  desktop_options.embedded_image_byte_limit == io::GltfExportOptions{}.embedded_image_byte_limit,
+                  "desktop export preserves source, bake choice and default image budgets");
             desktop_options.textures = library;
             const auto desktop_gltf = take(io::export_gltf(d, root / "desktop-options.gltf", desktop_options));
             const auto desktop_glb = take(io::export_glb(d, root / "desktop-options.glb", desktop_options));
