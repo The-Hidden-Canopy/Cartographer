@@ -9896,7 +9896,8 @@ core::Result<application::DispatchReceipt> UiController::import_material_texture
         inspected.value().source.digest,
         inspected.value().format,
         inspected.value().width,
-        inspected.value().height});
+        inspected.value().height,
+        {}});
     if (!imported) return fail(imported.error());
     return imported;
 }
@@ -12003,7 +12004,7 @@ core::Result<void> UiController::handle_shortcut(Shortcut shortcut) {
     switch (shortcut) {
     case Shortcut::save: {
         const auto result = dispatch_with_category(
-            application::SaveProjectAction{std::nullopt}, OperationCategory::project);
+            application::SaveProjectAction{}, OperationCategory::project);
         return result ? core::Result<void>::success() : core::Result<void>::failure(result.error());
     }
     case Shortcut::undo: {
