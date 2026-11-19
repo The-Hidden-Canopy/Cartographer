@@ -629,14 +629,14 @@ core::Result<SourceImportRecord> SourceImportRecord::deserialize(std::string_vie
         }
         result.document_products.reserve(static_cast<std::size_t>(number));
         for (std::uint64_t index = 0U; index < number; ++index) {
-            std::uint64_t kind_value = 0U, source_index = 0U, product_id = 0U;
-            if (!(input >> token) || token != "PRODUCT" || !read_unsigned(input, kind_value) ||
-                kind_value > static_cast<std::uint64_t>(SourceDocumentProductKind::sampler) ||
+            std::uint64_t product_kind = 0U, source_index = 0U, product_id = 0U;
+            if (!(input >> token) || token != "PRODUCT" || !read_unsigned(input, product_kind) ||
+                product_kind > static_cast<std::uint64_t>(SourceDocumentProductKind::sampler) ||
                 !read_unsigned(input, source_index) || !read_unsigned(input, product_id)) {
                 return core::Result<SourceImportRecord>::failure(validation(
                     "source document product record is malformed"));
             }
-            result.document_products.push_back({static_cast<SourceDocumentProductKind>(kind_value),
+            result.document_products.push_back({static_cast<SourceDocumentProductKind>(product_kind),
                                                 source_index, product_id});
         }
     }

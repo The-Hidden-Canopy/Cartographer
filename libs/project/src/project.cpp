@@ -9181,8 +9181,8 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
             std::string identity, hex, bytes, checked_namespace, checked_rig, rig_hex, envelope_hex;
             if (!(input >> std::quoted(identity)) || !valid_kinematic_graph_identity(identity))
                 return core::Result<ProjectDocument>::failure(parse_error("invalid unadmitted mode-key draft identity"));
-            const auto revision = read_uint(input, "unadmitted mode-key draft revision");
-            if (!revision || revision.value() != 1U || !(input >> hex >> std::quoted(checked_namespace)) ||
+            const auto draft_revision = read_uint(input, "unadmitted mode-key draft revision");
+            if (!draft_revision || draft_revision.value() != 1U || !(input >> hex >> std::quoted(checked_namespace)) ||
                 !valid_source_namespace(checked_namespace))
                 return core::Result<ProjectDocument>::failure(parse_error("invalid historical mode-key draft pins"));
             const auto project_revision = read_uint(input, "mode-key draft project revision");
@@ -9229,9 +9229,9 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
         if (count.value()) {
             if (auto line = require_line(input, "CONTROL_WORKSPACE_SNAPSHOT"); !line)
                 return core::Result<ProjectDocument>::failure(line.error());
-            const auto revision = read_uint(input, "control workspace revision");
+            const auto workspace_revision = read_uint(input, "control workspace revision");
             std::string source_namespace, rig_identity, rig_hex, hex, envelope_hex, bytes;
-            if (!revision || revision.value() == 0U || !(input >> std::quoted(source_namespace) >> std::quoted(rig_identity)))
+            if (!workspace_revision || workspace_revision.value() == 0U || !(input >> std::quoted(source_namespace) >> std::quoted(rig_identity)))
                 return core::Result<ProjectDocument>::failure(parse_error("invalid control workspace binding"));
             const auto rig_revision = read_uint(input, "control workspace rig revision");
             if (!rig_revision || !(input >> rig_hex >> hex >> envelope_hex >> std::quoted(bytes)) ||
@@ -9244,7 +9244,7 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
                 !envelope || envelope.value().is_zero() ||
                 !bind_opaque_record(bytes, digest.value(), "control workspace"))
                 return core::Result<ProjectDocument>::failure(parse_error("invalid control workspace digest"));
-            SerializedControlWorkspace entry{core::Revision{revision.value()}, std::move(source_namespace),
+            SerializedControlWorkspace entry{core::Revision{workspace_revision.value()}, std::move(source_namespace),
                 std::move(rig_identity), core::Revision{rig_revision.value()}, rig_digest.value(),
                 std::move(bytes), digest.value(), envelope.value()};
             if (entry.envelope_digest != control_workspace_envelope_digest(entry))
