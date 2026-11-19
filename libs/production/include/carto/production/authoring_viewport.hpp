@@ -83,6 +83,15 @@ struct AuthoringViewportRequest {
     // Optional immutable derived product; its content digest must match the
     // saved environment. Never overrides the catalog's source or orientation.
     std::shared_ptr<const EnvironmentLighting> environment_lighting;
+    // Bounded opaque-scene refraction for the native authoring viewport.
+    // A zero snapshot budget explicitly selects the environment-only fallback.
+    struct Refraction {
+        bool enabled = true;
+        std::uint32_t steps = 32;
+        double max_distance = 10.0, max_screen_offset = 0.25;
+        std::uint64_t snapshot_budget_bytes = 256ULL * 1024ULL * 1024ULL;
+        [[nodiscard]] core::Result<void> validate() const;
+    } refraction;
     // Disposable native history quality. The stateless CPU renderer remains a
     // current-frame oracle; AuthoringTemporalHistory is its explicit companion.
     struct Temporal {

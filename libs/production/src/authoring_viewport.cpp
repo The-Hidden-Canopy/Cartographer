@@ -95,6 +95,15 @@ core::Result<AuthoringDisplay> resolve_authoring_display(const project::ProjectD
     return core::Result<AuthoringDisplay>::success(display);
 }
 
+core::Result<void> AuthoringViewportRequest::Refraction::validate() const {
+    if (steps < 4 || steps > 64 || !std::isfinite(max_distance) ||
+        max_distance < .01 || max_distance > 100 || !std::isfinite(max_screen_offset) ||
+        max_screen_offset < 0 || max_screen_offset > 1 ||
+        snapshot_budget_bytes > 256ULL * 1024ULL * 1024ULL)
+        return core::Result<void>::failure(invalid("authoring refraction settings exceed their bounded limits"));
+    return core::Result<void>::success();
+}
+
 core::Result<void> AuthoringView::validate() const {
     if (!position.finite() || !rotation.normalizable() || !std::isfinite(near_plane) ||
         !std::isfinite(far_plane) || near_plane <= 0.0 || far_plane <= near_plane ||

@@ -66,6 +66,7 @@ struct AuthoringGpuFrame {
            gpu_temporal_history_ms = -1;
     double temporal_prepare_ms=0,temporal_palette_prepare_ms=0;
     std::uint64_t temporal_upload_bytes = 0, temporal_resident_bytes = 0;
+    std::uint64_t refraction_resident_bytes = 0;
     bool temporal_history_eligible = false;
     unsigned temporal_reset = 0;
     double prepare_validate_ms = 0, prepare_identity_ms = 0, prepare_meshes_ms = 0;

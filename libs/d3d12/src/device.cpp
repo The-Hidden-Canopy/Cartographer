@@ -1474,9 +1474,9 @@ core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
         return core::Result<gpu::PipelineHandle>::failure(unsupported(
             "D3D12 reference pipeline creation currently requires one sample"));
     }
-    if (descriptor.sampled_texture_count > 9U) {
+    if (descriptor.sampled_texture_count > 11U) {
         return core::Result<gpu::PipelineHandle>::failure(unsupported(
-            "D3D12 graphics resource tables support at most nine sampled textures"));
+            "D3D12 graphics resource tables support at most eleven sampled textures"));
     }
     const bool has_multi_sampled_bindings = descriptor.sampled_texture_count != 0U;
     const bool has_compute_shader = resolved_stages.size() == 1U &&
@@ -1692,11 +1692,11 @@ core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
     }
     Impl::PipelineResource value{};
     value.descriptor = descriptor;
-    // Nine SRV tables, seven sampler tables, and optional root constants fit
+    // Eleven SRV tables, seven sampler tables, and optional root constants fit
     // in these bounded arrays. Each sampler table maps one texture slot to its
     // matching shader sampler register.
-    std::array<D3D12_ROOT_PARAMETER, 17U> root_parameters{};
-    std::array<D3D12_DESCRIPTOR_RANGE, 16U> descriptor_ranges{};
+    std::array<D3D12_ROOT_PARAMETER, 19U> root_parameters{};
+    std::array<D3D12_DESCRIPTOR_RANGE, 18U> descriptor_ranges{};
     UINT root_parameter_count = 0U;
     D3D12_ROOT_SIGNATURE_DESC root_descriptor{};
     if (descriptor.push_constant_bytes != 0U) {

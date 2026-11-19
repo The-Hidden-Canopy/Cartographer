@@ -18,10 +18,11 @@ int main(int argc, char **argv) {
             std::cout << "missing paired DXC validator rejected\n";
             return 0;
         }
-        for (unsigned mode = 0; mode < 3; ++mode) {
+        for (unsigned mode = 0; mode < 4; ++mode) {
             const auto code =
                 (mode ? std::string("#define CARTO_FUSED_IDENTITY 1\n") : std::string{}) +
-                (mode == 2 ? std::string("#define CARTO_AUTHORING_SURFACE 1\n") +
+                (mode == 3 ? std::string("#define CARTO_SCENE_REFRACTION 1\n") : std::string{}) +
+                (mode >= 2 ? std::string("#define CARTO_AUTHORING_SURFACE 1\n") +
                                  carto_authoring_surface_source
                            : std::string{}) +
                 carto_authoring_pbr_source;

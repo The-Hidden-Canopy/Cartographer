@@ -485,11 +485,16 @@ struct AuthoringViewport::Impl {
     std::unique_ptr<Resources> defaults;
     std::shared_ptr<Resources> targets;
     bool display_shader_read = false;
-    gpu::PipelineHandle pbr, identity, display_pipeline, surface_pbr, shadow_pbr, shadow_surface;
+    gpu::PipelineHandle pbr, identity, display_pipeline, surface_pbr, shadow_pbr, shadow_surface,
+        refraction_pbr;
     gpu::SamplerHandle sampler;
     gpu::BufferHandle timestamps;
     std::array<std::shared_ptr<ResidentTimingReceipt::Impl>, 4> timing_slots;
     gpu::TextureHandle hdr, depth, ids, display_target;
+    std::shared_ptr<Resources> refraction_targets;
+    gpu::TextureHandle refraction_color, refraction_depth;
+    std::uint32_t refraction_width = 0, refraction_height = 0;
+    bool refraction_shader_read = false;
     std::array<gpu::TextureHandle, 5> textures{};
     std::uint32_t width = 0, height = 0;
     std::uint64_t generation = 0;
@@ -815,6 +820,9 @@ struct AuthoringViewport::Impl {
                     narrow(request.shadows.slope_bias)};
         words[6][0] = float(request.shadows.radius);
         if(fit) words[6][1]=narrow(fit->view.orthographic_height/(fit->view.far_plane-fit->view.near_plane));
+        words[4][3] = narrow(request.refraction.max_screen_offset);
+        words[6][2] = narrow(request.refraction.max_distance);
+        words[6][3] = float(request.refraction.steps);
         if (const auto &e = source.presentation_catalog().environment(); e)
             words[7] = {narrow(std::cos(e->rotation_radians)),
                         narrow(std::sin(e->rotation_radians)), narrow(e->intensity),
@@ -1003,6 +1011,60 @@ struct AuthoringViewport::Impl {
             surface_pipeline_error = error.what();
             throw;
         }
+    }
+    void ensure_refraction_pipeline(AuthoringGpuFrame &frame) {
+        if (refraction_pbr) return;
+        const auto started = Clock::now();
+        const auto code = std::string("#define CARTO_FUSED_IDENTITY 1\n"
+                                      "#define CARTO_AUTHORING_SURFACE 1\n"
+                                      "#define CARTO_SCENE_REFRACTION 1\n") +
+                          carto_authoring_surface_source + carto_authoring_pbr_source;
+        const auto shader = [&](gpu::ShaderStage stage, const char *entry) {
+            return need(device->create_shader(cached_shader(
+                {"authoring.refraction", stage, entry, "authoring_refraction.hlsl",
+                 code, true, false}, &frame)));
+        };
+        gpu::PipelineDesc desc;
+        desc.debug_name = "authoring.refraction.hdr";
+        desc.shaders = {shader(gpu::ShaderStage::vertex, "VSMain"),
+                        shader(gpu::ShaderStage::fragment, "PSMain")};
+        desc.sampled_texture_count = 11;
+        for (std::uint32_t i = 0; i < 11; ++i)
+            desc.descriptor_bindings.push_back({0, i, gpu::ShaderStage::fragment});
+        desc.cull_mode = gpu::CullMode::none;
+        desc.color_format = gpu::Format::rgba32_float;
+        desc.depth_format = gpu::Format::depth32_float;
+        desc.depth_test = desc.depth_write = true;
+        desc.depth_compare = gpu::CompareOp::less;
+        desc.push_constant_bytes = 208;
+        desc.vertex_stride_bytes = sizeof(AuthoringUploadVertex);
+        desc.vertex_attributes = {{"POSITION", 0, gpu::VertexFormat::float4, 0, 0},
+                                  {"NORMAL", 0, gpu::VertexFormat::float3, 16, 0},
+                                  {"TEXCOORD", 0, gpu::VertexFormat::float2, 28, 0},
+                                  {"TANGENT", 0, gpu::VertexFormat::float4, 36, 0},
+                                  {"COLOR", 0, gpu::VertexFormat::float4, 52, 0}};
+        refraction_pbr = need(device->create_pipeline(desc));
+        frame.material_shader_compile_milliseconds += elapsed(started);
+    }
+    void ensure_refraction_targets(std::uint32_t w, std::uint32_t h) {
+        if (refraction_targets && refraction_width == w && refraction_height == h) return;
+        auto candidate = std::make_shared<Resources>(device);
+        const auto usage = gpu::TextureUsage::sampled | gpu::TextureUsage::transfer_destination;
+        const auto color = candidate->texture({w, h, 1, 1, 1, gpu::Format::rgba32_float,
+            gpu::TextureDimension::texture_2d, usage});
+        const auto depth_copy = candidate->texture({w, h, 1, 1, 1, gpu::Format::depth32_float,
+            gpu::TextureDimension::texture_2d, usage});
+        device_ir::DeviceCommandStream commands;
+        for (auto target : {color, depth_copy})
+            commands.append(device_ir::CmdTransitionResource{{target},
+                device_ir::ResourceState::undefined, device_ir::ResourceState::copy_destination});
+        need(device->wait(need(device->submit(commands))));
+        refraction_targets = std::move(candidate);
+        refraction_color = color;
+        refraction_depth = depth_copy;
+        refraction_width = w;
+        refraction_height = h;
+        refraction_shader_read = false;
     }
     void materials(const Prepared &scene, AuthoringGpuFrame &frame) {
         const auto started = Clock::now();
@@ -1940,6 +2002,7 @@ core::Result<AuthoringGpuFrame> AuthoringViewport::render_impl(
             return core::Result<AuthoringGpuFrame>::success(std::move(frame));
         }
         const auto display = need(production::resolve_authoring_display(source, request));
+        need(request.refraction.validate());
         if (!production::valid_authoring_native_extent(request.width, request.height))
             throw std::runtime_error("GPU viewport extent/display budget invalid");
         if(request.temporal.enabled) {
@@ -2002,6 +2065,26 @@ core::Result<AuthoringGpuFrame> AuthoringViewport::render_impl(
             scene.casts_shadows = scene.directional_lights.front().casts_shadows;
         }
         image.view = scene.view;
+        const bool has_transmission = std::any_of(scene.draws.begin(), scene.draws.end(),
+            [](const auto &draw) { return draw.material.transmission > 0; });
+        const std::uint64_t refraction_bytes = std::uint64_t(request.width) * request.height * 20U;
+        const bool scene_refraction = impl_->optimized && has_transmission &&
+            request.refraction.enabled && refraction_bytes <= request.refraction.snapshot_budget_bytes;
+        if (impl_->refraction_targets && (!scene_refraction ||
+            std::uint64_t(impl_->refraction_width) * impl_->refraction_height * 20U >
+                request.refraction.snapshot_budget_bytes)) {
+            impl_->refraction_targets.reset();
+            impl_->refraction_color = {};
+            impl_->refraction_depth = {};
+            impl_->refraction_width = impl_->refraction_height = 0;
+            impl_->refraction_shader_read = false;
+        }
+        if (has_transmission && !scene_refraction)
+            image.diagnostics.push_back("Scene refraction unavailable under the current renderer or snapshot budget; using environment-only transmission");
+        if (has_transmission)
+            image.diagnostics.push_back("Transmissive materials do not cast transparent shadows");
+        if (scene_refraction)
+            image.diagnostics.push_back("Scene refraction uses an opaque screen snapshot; off-screen and other transparent layers use the environment fallback");
         if (std::any_of(scene.draws.begin(), scene.draws.end(),
                         [](const auto &draw) { return bool(draw.surface); }))
             image.diagnostics.push_back("Numeric material errors display magenta and fail picking; "
@@ -2009,6 +2092,10 @@ core::Result<AuthoringGpuFrame> AuthoringViewport::render_impl(
         frame.cpu_prepare_milliseconds = elapsed(started);
         frame.host_timeline.prepared = elapsed(entry);
         impl_->resize(request.width, request.height, !resident);
+        if (scene_refraction) {
+            impl_->ensure_refraction_pipeline(frame);
+            impl_->ensure_refraction_targets(request.width, request.height);
+        }
         frame.host_timeline.resources_ready = elapsed(entry);
         const auto geometry_started = Clock::now();
         impl_->geometry(scene, frame);
@@ -2031,6 +2118,11 @@ core::Result<AuthoringGpuFrame> AuthoringViewport::render_impl(
         frame.logical_resident_bytes +=
             std::uint64_t(image.width) * image.height * (impl_->optimized ? 24U : 36U) +
             impl_->readback_bytes + 140U; // 120 timestamp bytes + five white RGBA8 texels
+        if (impl_->refraction_targets) {
+            frame.refraction_resident_bytes = std::uint64_t(impl_->refraction_width) *
+                impl_->refraction_height * 20U;
+            frame.logical_resident_bytes += frame.refraction_resident_bytes;
+        }
         const double aspect = scene.view.aspect_ratio > 0 ? scene.view.aspect_ratio
                                                           : double(image.width) / image.height;
         const auto vp = camera_matrix(scene.view, aspect);
@@ -2046,7 +2138,8 @@ core::Result<AuthoringGpuFrame> AuthoringViewport::render_impl(
                 temporal_draws.push_back(
                     {draw.object.value, draw.transform,
                      std::span(draw.mesh->triangle_faces)
-                         .subspan(draw.submesh.first_index / 3, draw.submesh.index_count / 3)});
+                         .subspan(draw.submesh.first_index / 3, draw.submesh.index_count / 3),
+                     draw.material.transmission == 0.0});
             auto lighting_bytes = bytes(impl_->lighting_words);
             const auto direction = bytes(std::array<double, 3>{scene.light.direction_to_light.x,
                                                                scene.light.direction_to_light.y,
@@ -2122,15 +2215,16 @@ core::Result<AuthoringGpuFrame> AuthoringViewport::render_impl(
                                                  device_ir::ResourceState::copy_destination});
         commands.append(device_ir::CmdWriteTimestamp{0});
         commands.append(device_ir::CmdWriteTimestamp{7});
-        for (unsigned stage = 0; stage < (impl_->optimized ? 2U : 3U); ++stage) {
+        for (unsigned stage = 0; stage < (impl_->optimized ? (scene_refraction ? 3U : 2U) : 3U); ++stage) {
             const bool shadow_pass = stage == 0;
             if (shadow_pass && !impl_->shadow_dirty) {
                 commands.append(device_ir::CmdWriteTimestamp{8});
                 continue;
             }
             const unsigned pass = stage ? stage - 1 : 0;
+            const bool refraction_pass = scene_refraction && stage == 2;
             const auto target =
-                shadow_pass ? impl_->shadow_map : (pass == 0 ? impl_->hdr : impl_->ids);
+                shadow_pass ? impl_->shadow_map : (pass == 0 || refraction_pass ? impl_->hdr : impl_->ids);
             const auto depth_target = shadow_pass ? impl_->shadow_depth : impl_->depth;
             const auto w = shadow_pass ? impl_->shadow_extent : image.width;
             const auto h = shadow_pass ? impl_->shadow_extent : image.height;
@@ -2139,14 +2233,32 @@ core::Result<AuthoringGpuFrame> AuthoringViewport::render_impl(
                     device_ir::CmdTransitionResource{{impl_->shadow_map},
                                                      device_ir::ResourceState::shader_read,
                                                      device_ir::ResourceState::render_target});
+            if (refraction_pass) {
+                using S = device_ir::ResourceState;
+                if (impl_->refraction_shader_read) {
+                    for (auto copy : {impl_->refraction_color, impl_->refraction_depth})
+                        commands.append(device_ir::CmdTransitionResource{{copy}, S::shader_read, S::copy_destination});
+                }
+                commands.append(device_ir::CmdTransitionResource{{impl_->hdr}, S::render_target, S::copy_source});
+                commands.append(device_ir::CmdTransitionResource{{impl_->depth}, S::depth_write, S::copy_source});
+                commands.append(device_ir::CmdCopyTexture{impl_->hdr, impl_->refraction_color});
+                commands.append(device_ir::CmdCopyTexture{impl_->depth, impl_->refraction_depth});
+                commands.append(device_ir::CmdTransitionResource{{impl_->hdr}, S::copy_source, S::render_target});
+                commands.append(device_ir::CmdTransitionResource{{impl_->depth}, S::copy_source, S::depth_write});
+                for (auto copy : {impl_->refraction_color, impl_->refraction_depth})
+                    commands.append(device_ir::CmdTransitionResource{{copy}, S::copy_destination, S::shader_read});
+            }
             commands.append(device_ir::CmdBeginRendering{target, depth_target});
-            commands.append(device_ir::CmdClearColor{
-                target, {shadow_pass ? 1.F : 0.F, 0, 0, shadow_pass ? 1.F : 0.F}});
-            commands.append(device_ir::CmdClearDepth{depth_target, 1});
+            if (!refraction_pass) {
+                commands.append(device_ir::CmdClearColor{
+                    target, {shadow_pass ? 1.F : 0.F, 0, 0, shadow_pass ? 1.F : 0.F}});
+                commands.append(device_ir::CmdClearDepth{depth_target, 1});
+            }
             commands.append(device_ir::CmdSetViewport{0, 0, float(w), float(h), 0, 1});
             commands.append(device_ir::CmdSetScissor{0, 0, w, h});
             const auto base_pipeline =
-                shadow_pass ? impl_->shadow_pbr : (pass == 0 ? impl_->pbr : impl_->identity);
+                shadow_pass ? impl_->shadow_pbr : (refraction_pass ? impl_->refraction_pbr :
+                    (pass == 0 ? impl_->pbr : impl_->identity));
             commands.append(device_ir::CmdBindPipeline{base_pipeline});
             auto bound_pipeline = base_pipeline;
             std::string bound_surface;
@@ -2154,8 +2266,13 @@ core::Result<AuthoringGpuFrame> AuthoringViewport::render_impl(
                 const auto &draw = scene.draws[d];
                 const auto &mesh = *impl_->meshes.at(draw.geometry_key);
                 const auto &m = draw.material;
+                const bool transparent = m.transmission > 0;
+                if (shadow_pass && transparent) continue;
+                if (!shadow_pass && scene_refraction &&
+                    (refraction_pass ? !transparent : transparent)) continue;
                 const auto desired_pipeline =
-                    draw.surface ? (shadow_pass ? impl_->shadow_surface : impl_->surface_pbr)
+                    draw.surface ? (shadow_pass ? impl_->shadow_surface :
+                        (refraction_pass ? impl_->refraction_pbr : impl_->surface_pbr))
                                  : base_pipeline;
                 if (bound_pipeline != desired_pipeline) {
                     commands.append(device_ir::CmdBindPipeline{desired_pipeline});
@@ -2190,6 +2307,10 @@ core::Result<AuthoringGpuFrame> AuthoringViewport::render_impl(
                          8,
                          {impl_->environment_atlas ? impl_->environment_atlas : impl_->textures[0]},
                          std::nullopt});
+                    if (refraction_pass) {
+                        surface_bindings.bindings.push_back({0, 9, {impl_->refraction_color}, std::nullopt});
+                        surface_bindings.bindings.push_back({0, 10, {impl_->refraction_depth}, std::nullopt});
+                    }
                     commands.append(std::move(surface_bindings));
                     bound_surface = binding_key;
                 }
@@ -2334,6 +2455,10 @@ core::Result<AuthoringGpuFrame> AuthoringViewport::render_impl(
             }
         }
         impl_->targets->last_use = serial;
+        if (scene_refraction) {
+            impl_->refraction_targets->last_use = serial;
+            impl_->refraction_shader_read = true;
+        }
         impl_->lighting->last_use = impl_->shadow_targets->last_use = serial;
         if (impl_->environment_resources)
             impl_->environment_resources->last_use = serial;

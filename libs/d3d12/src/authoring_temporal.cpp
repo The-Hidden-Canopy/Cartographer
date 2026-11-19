@@ -310,7 +310,8 @@ AuthoringTemporalHostState::prepare(const AuthoringTemporalHostInput &in) const 
                                     static_cast<std::uint32_t>(draw.faces.size())});
             for (auto f : motion)
                 plan.draw_words.push_back(std::bit_cast<std::uint32_t>(f));
-            plan.draw_words.insert(plan.draw_words.end(), {supported ? 1U : 0U, 0, 0, 0});
+            plan.draw_words.insert(plan.draw_words.end(),
+                                   {supported && draw.allow_reprojection ? 1U : 0U, 0, 0, 0});
             next->draws.emplace_back(draw.object, draw.transform);
         }
         // Bind per-draw ranges as well as shared table contents. Rebinding a

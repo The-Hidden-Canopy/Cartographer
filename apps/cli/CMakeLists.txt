@@ -35,6 +35,13 @@ if(TARGET carto_d3d12_scene)
     install(TARGETS cartographer_scene_render RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
+if(TARGET carto_d3d12_viewport)
+    add_executable(cartographer_authoring_review authoring_review.cpp)
+    target_link_libraries(cartographer_authoring_review PRIVATE carto_d3d12_viewport)
+    carto_target(cartographer_authoring_review)
+    install(TARGETS cartographer_authoring_review RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
 # Explicit opt-in private linked-scene provider (CARTO_LINKED_SCENE_PROVIDER_ROOT,
 # defined at the top level); without it linked scenes refuse.
 if(TARGET carto_linked_scene_provider)

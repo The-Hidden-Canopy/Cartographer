@@ -38,6 +38,10 @@ SamplerState linear_clamp_sampler : register(s0);
 // data out of per-draw constants leaves the full surface root signature <=64.
 Texture2D<float4> authoring_lighting : register(t6);
 Texture2D<float> authoring_shadow : register(t7);
+#ifdef CARTO_SCENE_REFRACTION
+Texture2D<float4> refraction_color : register(t9);
+Texture2D<float> refraction_depth : register(t10);
+#endif
 float4 light_word(uint x) { return authoring_lighting.Load(int3(x,0,0)); }
 float shadow_visibility(float3 world,float3 normal,float3 light) {
     float4 settings=light_word(5);
@@ -63,6 +67,128 @@ float shadow_visibility(float3 world,float3 normal,float3 light) {
         visible+=(receiver<0 || receiver>1 || receiver-bias<=depth)?1:0;++taps;
     }
     return visible/taps;
+}
+#endif
+
+#if defined(CARTO_AUTHORING_VIEWPORT) && defined(CARTO_AUTHORING_SURFACE)
+float attenuation_channel(float color, float exponent) {
+    // A zero wall distance has no absorption, including for a zero color.
+    // For a positive path, an exactly zero channel must remain fully blocked.
+    if (exponent <= 0) return 1;
+    if (color <= 0) return 0;
+    return pow(color, exponent);
+}
+#endif
+
+#ifdef CARTO_SCENE_REFRACTION
+// The snapshot contains opaque geometry only. A bounded ray never admits a
+// foreground sample; unavailable geometry falls back to the environment.
+// Fused identities are positive normal float bit patterns, not numeric IDs.
+// Zero is background, and negative or nonfinite alpha indicates a failure.
+bool authoring_snapshot_has_identity(float alpha) {
+    const uint bits = asuint(alpha);
+    return bits > 0x00800000u && bits < 0x7f800000u;
+}
+uint authoring_snapshot_draw(float alpha) {
+    // The fused identity stores draw ordinal and primitive ordinal together.
+    // Crossing a primitive edge is fine; crossing into a different draw is
+    // not evidence that the same visible surface was intersected.
+    return (asuint(alpha) - 0x00800000u - 1u) / 65536u;
+}
+bool authoring_scene_refraction(float3 origin, float3 direction, float surface_depth,
+                                float2 surface_pixel, float roughness, out float3 color) {
+    color = 0;
+    uint width, height;
+    refraction_color.GetDimensions(width,height);
+    const float2 extent = float2(width,height);
+    const float max_distance = light_word(6).z;
+    const uint steps = uint(light_word(6).w);
+    const float max_offset = light_word(4).w;
+    const float depth_epsilon = 1e-7;
+    bool bracket_valid = false;
+    uint bracket_draw = 0;
+    float bracket_distance = 0;
+    [loop] for (uint i=0; i<steps; ++i) {
+        const float fraction = float(i+1)/float(steps);
+        const float distance = max(1e-4,max_distance*fraction*fraction*fraction);
+        const float4 clip = mul(view_projection,float4(origin+direction*distance,1));
+        if (!all(isfinite(clip)) || clip.w<=1e-8 || clip.z<0 || clip.z>clip.w) break;
+        const float3 ndc = clip.xyz/clip.w;
+        const float2 pixel = (ndc.xy*float2(.5,-.5)+.5)*extent;
+        if (any(pixel<0) || any(pixel>=extent) ||
+            any(abs((pixel-surface_pixel)/extent)>max_offset)) break;
+        int2 location = int2(pixel);
+        float depth = refraction_depth.Load(int3(location,0));
+        float4 hit = refraction_color.Load(int3(location,0));
+        if (authoring_snapshot_has_identity(hit.a) && isfinite(depth) && depth<=surface_depth+depth_epsilon)
+            return false; // An opaque foreground hides the snapshot's background.
+        if (!isfinite(depth) || depth>=1 || !authoring_snapshot_has_identity(hit.a)) {
+            bracket_valid = false;
+            continue;
+        }
+        const uint draw = authoring_snapshot_draw(hit.a);
+        if (ndc.z+depth_epsilon<depth) {
+            bracket_valid = true;
+            bracket_draw = draw;
+            bracket_distance = distance;
+            continue;
+        }
+        // Entering a silhouette after the ray has passed its depth is not an
+        // intersection. Only refine a proven front-to-back depth crossing on
+        // the same visible draw; otherwise keep looking or use the fallback.
+        if (!bracket_valid || bracket_draw != draw) {
+            bracket_valid = false;
+            continue;
+        }
+        float lower = bracket_distance;
+        float upper = distance;
+        [unroll] for (uint refinement=0;refinement<5;++refinement) {
+            const float middle=(lower+upper)*.5;
+            const float4 candidate=mul(view_projection,float4(origin+direction*middle,1));
+            if (!all(isfinite(candidate)) || candidate.w<=1e-8) { lower=middle; continue; }
+            const float3 candidate_ndc=candidate.xyz/candidate.w;
+            const float2 candidate_pixel=(candidate_ndc.xy*float2(.5,-.5)+.5)*extent;
+            if (any(candidate_pixel<0) || any(candidate_pixel>=extent) || candidate_ndc.z<0 ||
+                candidate_ndc.z>1 || any(abs((candidate_pixel-surface_pixel)/extent)>max_offset)) {
+                lower=middle; continue;
+            }
+            const int2 candidate_location=int2(candidate_pixel);
+            const float candidate_depth=refraction_depth.Load(int3(candidate_location,0));
+            const float4 candidate_hit=refraction_color.Load(int3(candidate_location,0));
+            if (authoring_snapshot_has_identity(candidate_hit.a) && isfinite(candidate_depth) &&
+                candidate_depth<=surface_depth+depth_epsilon) return false;
+            if (!authoring_snapshot_has_identity(candidate_hit.a) || !isfinite(candidate_depth) ||
+                candidate_depth>=1 || authoring_snapshot_draw(candidate_hit.a)!=draw) return false;
+            if (candidate_ndc.z+depth_epsilon>=candidate_depth) {
+                upper=middle; location=candidate_location; depth=candidate_depth; hit=candidate_hit;
+            } else lower=middle;
+        }
+        color = hit.rgb;
+        // Five bounded taps blur rough transmission without admitting a
+        // foreground texel or crossing a large depth discontinuity.
+        const int radius = int(round(saturate(roughness)*saturate(roughness)*6));
+        if (radius>0) {
+            float3 sum = color;
+            float count = 1;
+            const int2 offsets[4] = {int2(radius,0),int2(-radius,0),
+                                     int2(0,radius),int2(0,-radius)};
+            [unroll] for (uint j=0;j<4;++j) {
+                const int2 q=location+offsets[j];
+                if (any(q<0) || q.x>=int(width) || q.y>=int(height) ||
+                    any(abs((float2(q)+.5-surface_pixel)/extent)>max_offset)) continue;
+                const float sample_depth=refraction_depth.Load(int3(q,0));
+                const float4 sample_color=refraction_color.Load(int3(q,0));
+                if (isfinite(sample_depth) && sample_depth>surface_depth+depth_epsilon &&
+                    abs(sample_depth-depth)<max(2e-7,.1*(depth-surface_depth)) &&
+                    authoring_snapshot_has_identity(sample_color.a)) {
+                    sum+=sample_color.rgb; count+=1;
+                }
+            }
+            color=sum/count;
+        }
+        return all(isfinite(color));
+    }
+    return false;
 }
 #endif
 
@@ -390,23 +516,34 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID,
         clearcoat_roughness,environment_ao,light_word(7));
 #ifdef CARTO_AUTHORING_SURFACE
     if(transmission>0) {
-        // Glass preview: the refracted environment, tinted by base colour and
-        // by Beer-Lambert absorption over the authored wall thickness, behind
-        // the dielectric Fresnel. Scene geometry behind the glass is not
-        // refracted in this raster preview.
+        // Glass preview: use the refracted environment, or an admitted opaque
+        // scene-snapshot hit, with authored Beer-Lambert wall absorption and
+        // dielectric Fresnel. Off-screen and layered geometry are not traced.
         const float eta=1.0/material.ior;
         float3 refracted=refract(-view,normal,eta);
         if(dot(refracted,refracted)<1e-8) refracted=reflect(-view,normal);
         const float cos_t=max(abs(dot(refracted,normal)),0.2);
         const float path=material.thickness/cos_t;
-        const float3 absorption=material.attenuation_distance>0
-            ? pow(max(material.attenuation_color,1e-4),path/material.attenuation_distance) : 1.0;
+        float3 absorption=1;
+        if (material.attenuation_distance>0 && path>0) {
+            const float exponent=path/material.attenuation_distance;
+            absorption=float3(attenuation_channel(material.attenuation_color.x,exponent),
+                              attenuation_channel(material.attenuation_color.y,exponent),
+                              attenuation_channel(material.attenuation_color.z,exponent));
+        }
         // IOR controls the bend; the material's independent dielectric F0
         // controls reflection. Use the same F0 for the complementary
         // transmitted share so reflection and transmission cannot both take
         // the same energy when those authored values differ.
         const float dielectric=dielectric_f0+(1-dielectric_f0)*pow(1-saturate(dot(normal,view)),5.0);
-        hdr+=environment_direction(refracted,roughness,light_word(7))*base_color*absorption*
+        float3 transmitted=environment_direction(refracted,roughness,light_word(7));
+#ifdef CARTO_SCENE_REFRACTION
+        float3 scene_color;
+        if (authoring_scene_refraction(input.world_position,refracted,input.position.z,
+                                       input.position.xy,roughness,scene_color))
+            transmitted=scene_color;
+#endif
+        hdr+=transmitted*base_color*absorption*
             (transmission*(1.0-dielectric)*environment_ao);
     }
 #endif

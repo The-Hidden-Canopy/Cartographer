@@ -45,6 +45,15 @@ void host_lifecycle() {
     check(stable.reset == Reset::none && stable.resolve.constants.extent_flags[2] &&
               stable.face_words == first.face_words,
           "stable history and topology palette reuse");
+    check(stable.draw_words[20] == 1, "ordinary stable surface allows per-draw reprojection");
+    draws[0].allow_reprojection = false;
+    in.draws = draws;
+    const auto refractive = take(state.prepare(in));
+    check(refractive.reset == Reset::none && refractive.resolve.constants.extent_flags[2] &&
+              refractive.draw_words[20] == 0 && refractive.draw_digest != stable.draw_digest,
+          "refractive draw disables only its own reprojection and changes the palette identity");
+    draws[0].allow_reprojection = true;
+    in.draws = draws;
     auto failed = in;
     failed.epoch.width = 0;
     check(!state.prepare(failed), "bad preparation rejected");
@@ -151,6 +160,16 @@ void shared_instance_palettes() {
     check(accepted.draw_words.size()==4096*24 && accepted.face_words->size()==2,
           "4096 transformed draws share exact identity64 faces within the unchanged palette byte bound");
     check(bool(state.commit(accepted)),"shared face plan commits");
+    draws[257].allow_reprojection = false;
+    input.draws = draws;
+    const auto refractive = take(state.prepare(input));
+    check(refractive.face_words == accepted.face_words &&
+              refractive.draw_words[257*24+20] == 0 &&
+              refractive.draw_words[256*24+20] == 1 &&
+              refractive.reset == d3d12::AuthoringTemporalReset::none,
+          "a high-ordinal refractive instance disables only its own reprojection while sharing the face palette");
+    draws[257].allow_reprojection = true;
+    input.draws = draws;
     draws.push_back({4097,{},faces});input.draws=draws;
     check(!state.prepare(input),"one draw above the bounded instance count rejects");
     draws.pop_back();input.draws=draws;

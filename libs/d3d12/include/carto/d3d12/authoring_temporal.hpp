@@ -43,6 +43,9 @@ struct AuthoringTemporalDraw {
     std::uint64_t object = 0;
     core::Transform transform;
     std::span<const geometry::FaceId> faces;
+    // Refraction samples other geometry, so its front-surface motion alone
+    // cannot safely reproject the resulting color.
+    bool allow_reprojection = true;
 };
 struct alignas(16) AuthoringMotionConstants {
     AuthoringMatrix inverse_view_projection{}, previous_view_projection{};

@@ -69,13 +69,112 @@ void graphics_table_limits(d3d12::D3D12Device &device) {
     check(!overflow && overflow.error().message.find("64 DWORDs") != std::string::npos,
           "nine-table graphics pipelines still reject root cost above64 DWORDs");
     desc.push_constant_bytes = 0;
-    desc.sampled_texture_count = 10;
     desc.descriptor_bindings.push_back({0, 9, gpu::ShaderStage::fragment});
+    desc.descriptor_bindings.push_back({0, 10, gpu::ShaderStage::fragment});
+    desc.sampled_texture_count = 11;
+    desc.push_constant_bytes = 208;
+    const auto full_refraction_root = take(device.create_pipeline(desc));
+    okay(device.destroy_pipeline(full_refraction_root));
+    auto many_samplers = desc;
+    many_samplers.sampled_sampler_count = 7;
+    many_samplers.push_constant_bytes = 184;
+    const auto full_sampler_root = take(device.create_pipeline(many_samplers));
+    okay(device.destroy_pipeline(full_sampler_root));
+    desc.push_constant_bytes = 212;
+    const auto refraction_overflow = device.create_pipeline(desc);
+    check(!refraction_overflow && refraction_overflow.error().message.find("64 DWORDs") != std::string::npos,
+          "eleven-table graphics pipelines enforce the root-signature DWORD limit");
+    desc.push_constant_bytes = 0;
+    desc.sampled_texture_count = 12;
+    desc.descriptor_bindings.push_back({0, 11, gpu::ShaderStage::fragment});
     const auto too_many = device.create_pipeline(desc);
-    check(!too_many && too_many.error().message.find("at most nine") != std::string::npos,
-          "graphics table extension remains bounded to nine textures");
+    check(!too_many && too_many.error().message.find("at most eleven") != std::string::npos,
+          "graphics table extension remains bounded to eleven textures");
     for (auto shader : shaders)
         okay(device.destroy_shader(shader));
+}
+void graphics_eleven_texture_readback(d3d12::D3D12Device &device) {
+    const std::string source = R"(
+        Texture2D<float4> first_texture : register(t0);
+        Texture2D<float4> scene_color : register(t9);
+        Texture2D<float4> scene_depth : register(t10);
+        float4 VSMain(uint v : SV_VertexID) : SV_POSITION {
+            float2 p = float2((v << 1) & 2, v & 2);
+            return float4(p * float2(2,-2) + float2(-1,1), 0, 1);
+        }
+        float4 PSMain() : SV_TARGET {
+            return float4(first_texture.Load(int3(0,0,0)).r,
+                          scene_color.Load(int3(0,0,0)).g,
+                          scene_depth.Load(int3(0,0,0)).b, 1);
+        })";
+    std::vector<gpu::ShaderHandle> shaders;
+    for (auto [stage, entry] : {std::pair{gpu::ShaderStage::vertex, "VSMain"},
+                                std::pair{gpu::ShaderStage::fragment, "PSMain"}})
+        shaders.push_back(take(device.create_shader(take(d3d12::compile_hlsl(
+            {"eleven.table.readback", stage, entry, "eleven_table.hlsl", source, true, false})))));
+    gpu::PipelineDesc desc;
+    desc.debug_name = "eleven.table.readback";
+    desc.shaders = shaders;
+    desc.cull_mode = gpu::CullMode::none;
+    desc.color_format = gpu::Format::rgba32_float;
+    desc.depth_format = gpu::Format::unknown;
+    desc.depth_test = desc.depth_write = false;
+    desc.sampled_texture_count = 11;
+    desc.push_constant_bytes = 208;
+    for (unsigned i = 0; i < 11; ++i)
+        desc.descriptor_bindings.push_back({0, i, gpu::ShaderStage::fragment});
+    const auto pipeline = take(device.create_pipeline(desc));
+    const auto sampler = take(device.create_sampler({}));
+    const auto target = take(device.create_texture(
+        {1, 1, 1, 1, 1, gpu::Format::rgba32_float, gpu::TextureDimension::texture_2d,
+         gpu::TextureUsage::color_attachment | gpu::TextureUsage::transfer_source}));
+    std::array<gpu::TextureHandle, 3> textures;
+    std::array<gpu::BufferHandle, 3> uploads;
+    device_ir::DeviceCommandStream commands;
+    const std::array<std::array<std::uint8_t, 4>, 3> colors{{
+        {{51, 0, 0, 255}}, {{0, 102, 0, 255}}, {{0, 0, 204, 255}}}};
+    for (unsigned i = 0; i < textures.size(); ++i) {
+        textures[i] = take(device.create_texture(
+            {1, 1, 1, 1, 1, gpu::Format::rgba8_unorm, gpu::TextureDimension::texture_2d,
+             gpu::TextureUsage::sampled | gpu::TextureUsage::transfer_destination}));
+        uploads[i] = take(device.create_buffer(
+            {256, gpu::MemoryClass::upload, gpu::BufferUsage::transfer_source}));
+        std::vector<std::uint8_t> row(256);
+        std::copy(colors[i].begin(), colors[i].end(), row.begin());
+        okay(device.write_buffer(uploads[i], 0, row));
+        commands.append(device_ir::CmdTransitionResource{{uploads[i]},
+            device_ir::ResourceState::undefined, device_ir::ResourceState::copy_source});
+        commands.append(device_ir::CmdTransitionResource{{textures[i]},
+            device_ir::ResourceState::undefined, device_ir::ResourceState::copy_destination});
+        commands.append(device_ir::CmdCopyBufferToTexture{uploads[i], textures[i], 0});
+        commands.append(device_ir::CmdTransitionResource{{textures[i]},
+            device_ir::ResourceState::copy_destination, device_ir::ResourceState::shader_read});
+    }
+    commands.append(device_ir::CmdTransitionResource{{target},
+        device_ir::ResourceState::undefined, device_ir::ResourceState::render_target});
+    commands.append(device_ir::CmdBeginRendering{target, std::nullopt});
+    commands.append(device_ir::CmdSetViewport{0, 0, 1, 1, 0, 1});
+    commands.append(device_ir::CmdSetScissor{0, 0, 1, 1});
+    commands.append(device_ir::CmdBindPipeline{pipeline});
+    device_ir::CmdBindResources bindings;
+    for (unsigned i = 0; i < 11; ++i)
+        bindings.bindings.push_back({0, i, {textures[i == 9 ? 1 : i == 10 ? 2 : 0]},
+                                     i == 0 ? std::optional{sampler} : std::nullopt});
+    commands.append(std::move(bindings));
+    commands.append(device_ir::CmdPushConstants{std::vector<std::uint8_t>(208)});
+    commands.append(device_ir::CmdDraw{3});
+    commands.append(device_ir::CmdEndRendering{});
+    okay(device.wait(take(device.submit(commands))));
+    const auto result = take(device.read_texture_rgba32f(target));
+    check(result.size() == 4 && std::abs(result[0] - .2F) < 1e-5F &&
+              std::abs(result[1] - .4F) < 1e-5F && std::abs(result[2] - .8F) < 1e-5F,
+          "eleven-table shader reads distinct first, tenth and eleventh textures");
+    okay(device.destroy_texture(target));
+    for (const auto texture : textures) okay(device.destroy_texture(texture));
+    for (const auto upload : uploads) okay(device.destroy_buffer(upload));
+    okay(device.destroy_sampler(sampler));
+    okay(device.destroy_pipeline(pipeline));
+    for (const auto shader : shaders) okay(device.destroy_shader(shader));
 }
 std::vector<std::uint8_t> resident_pixels(d3d12::D3D12Device &device,
                                           const d3d12::ResidentViewportImage &image,
@@ -283,6 +382,332 @@ void native_scalar_anisotropy_cases(d3d12::AuthoringViewport &renderer) {
           "normal map and anisotropy cannot silently share mismatched tangent streams");
 }
 
+void native_scene_refraction_cases(d3d12::AuthoringViewport &renderer) {
+    auto f = fixture();
+    auto materials = f.document.material_catalog();
+    auto glass = materials.materials().at(1);
+    glass.revision = glass.revision.next();
+    glass.definition.base_color_factor = {1, 1, 1, 1};
+    glass.definition.metallic = 0;
+    glass.definition.roughness = 0;
+    glass.definition.dielectric_f0 = 0;
+    glass.definition.transmission = 1;
+    glass.definition.ior = 1;
+    okay(materials.replace_material(glass));
+    auto label = materials.materials().at(2);
+    label.revision = label.revision.next();
+    label.definition.base_color_factor = {0, 0, 0, 1};
+    label.definition.dielectric_f0 = 0;
+    label.definition.emissive_factor = {.2, .8, .4};
+    label.definition.emissive_strength = 1;
+    okay(materials.replace_material(label));
+    set_materials(f.document, std::move(materials));
+    auto source = std::make_shared<const project::ProjectDocument>(f.document);
+    auto r = request(f);
+    auto background_request = r;
+    background_request.transform_overrides[f.front] = {{100, 0, 0}};
+    const auto background = take(renderer.render(source, background_request)).image;
+    const auto glass_frame = take(renderer.render(source, r));
+    const auto through_glass = glass_frame.image;
+    const auto p = center(background);
+    check(background.objects[p] == f.back && through_glass.objects[p] == f.front,
+          "scene refraction retains front glass picking and sees the background fixture");
+    const auto a = background.linear_hdr[p], b = through_glass.linear_hdr[p];
+    check(std::abs(a.x-b.x) < 1e-3 && std::abs(a.y-b.y) < 1e-3 &&
+              std::abs(a.z-b.z) < 1e-3,
+          "clear IOR-one glass transmits the actual scene color behind it");
+    auto tinted_scene = f.document;
+    auto tinted_mesh = triangle();
+    auto tinted_payload = tinted_mesh.attributes();
+    okay(tinted_payload.set_domain_count(attributes::AttributeDomain::corner, 3));
+    const core::Vec4d tint{.25, .5, .75, 1};
+    okay(tinted_payload.add_layer({{"glass.color", attributes::AttributeDomain::corner,
+                                    attributes::AttributeType::color4}, {tint, tint, tint}}));
+    okay(tinted_mesh.set_attribute_payload(std::move(tinted_payload), {}));
+    mutate(tinted_scene, [&](auto &tx) { okay(tx.replace_mesh(f.front_mesh, tinted_mesh)); });
+    const auto tinted_image = take(renderer.render(tinted_scene, r)).image;
+    const auto tinted = tinted_image.linear_hdr[p];
+    check(tinted_image.objects[p] == f.front && std::abs(tinted.x-a.x*.25) < 1e-3 &&
+              std::abs(tinted.y-a.y*.5) < 1e-3 && std::abs(tinted.z-a.z*.75) < 1e-3,
+          "scene transmission applies authored linear vertex color to the background");
+    auto amber_scene = f.document;
+    auto amber_catalog = amber_scene.material_catalog();
+    auto amber = amber_catalog.materials().at(1);
+    amber.revision = amber.revision.next();
+    amber.definition.thickness = .0022;
+    amber.definition.attenuation_distance = .02;
+    amber.definition.attenuation_color = {.66, .3, .09};
+    okay(amber_catalog.replace_material(amber));
+    set_materials(amber_scene, std::move(amber_catalog));
+    const auto amber_image = take(renderer.render(
+        std::make_shared<const project::ProjectDocument>(amber_scene), r)).image;
+    const auto amber_pixel = amber_image.linear_hdr[p];
+    check(amber_image.objects[p] == f.front &&
+              std::abs(amber_pixel.x - a.x*std::pow(.66, .11)) < 1e-3 &&
+              std::abs(amber_pixel.y - a.y*std::pow(.3, .11)) < 1e-3 &&
+              std::abs(amber_pixel.z - a.z*std::pow(.09, .11)) < 1e-3,
+          "scene transmission preserves the authored amber Beer-Lambert color");
+    for (unsigned channel = 0; channel < 3; ++channel) {
+        auto blocked_scene = f.document;
+        auto blocked_catalog = blocked_scene.material_catalog();
+        auto blocked = blocked_catalog.materials().at(1);
+        blocked.revision = blocked.revision.next();
+        blocked.definition.thickness = .0022;
+        blocked.definition.attenuation_distance = .02;
+        blocked.definition.attenuation_color = {1, 1, 1};
+        if (channel == 0) blocked.definition.attenuation_color.x = 0;
+        if (channel == 1) blocked.definition.attenuation_color.y = 0;
+        if (channel == 2) blocked.definition.attenuation_color.z = 0;
+        okay(blocked_catalog.replace_material(blocked));
+        set_materials(blocked_scene, std::move(blocked_catalog));
+        const auto blocked_frame = take(renderer.render(
+            std::make_shared<const project::ProjectDocument>(blocked_scene), r)).image;
+        const auto pixel = blocked_frame.linear_hdr[p];
+        check(blocked_frame.objects[p] == f.front &&
+                  std::abs(pixel.x - (channel == 0 ? 0 : a.x)) < 1e-4 &&
+                  std::abs(pixel.y - (channel == 1 ? 0 : a.y)) < 1e-4 &&
+                  std::abs(pixel.z - (channel == 2 ? 0 : a.z)) < 1e-4,
+              "zero attenuation blocks only its authored color channel through a thin wall");
+        auto zero_wall_catalog = blocked_scene.material_catalog();
+        auto zero_wall = zero_wall_catalog.materials().at(1);
+        zero_wall.revision = zero_wall.revision.next();
+        zero_wall.definition.thickness = 0;
+        okay(zero_wall_catalog.replace_material(zero_wall));
+        set_materials(blocked_scene, std::move(zero_wall_catalog));
+        const auto zero_wall_image = take(renderer.render(
+            std::make_shared<const project::ProjectDocument>(blocked_scene), r)).image;
+        const auto clear = zero_wall_image.linear_hdr[p];
+        check(std::abs(clear.x-a.x) < 1e-3 && std::abs(clear.y-a.y) < 1e-3 &&
+                  std::abs(clear.z-a.z) < 1e-3,
+              "zero thickness does not absorb even with a zero attenuation channel");
+    }
+    auto small_color_scene = f.document;
+    auto small_color_catalog = small_color_scene.material_catalog();
+    auto small_color = small_color_catalog.materials().at(1);
+    small_color.revision = small_color.revision.next();
+    small_color.definition.thickness = .0022;
+    small_color.definition.attenuation_distance = .02;
+    small_color.definition.attenuation_color = {1e-8, .25, 1};
+    okay(small_color_catalog.replace_material(small_color));
+    set_materials(small_color_scene, std::move(small_color_catalog));
+    const auto small_color_image = take(renderer.render(
+        std::make_shared<const project::ProjectDocument>(small_color_scene), r)).image;
+    const auto small_pixel = small_color_image.linear_hdr[p];
+    check(std::abs(small_pixel.x-a.x*std::pow(1e-8,.11)) < 1e-4 &&
+              std::abs(small_pixel.y-a.y*std::pow(.25,.11)) < 1e-4 &&
+              std::abs(small_pixel.z-a.z) < 1e-4,
+          "positive attenuation below the old clamp retains its authored value");
+    auto unlimited_catalog = small_color_scene.material_catalog();
+    auto unlimited = unlimited_catalog.materials().at(1);
+    unlimited.revision = unlimited.revision.next();
+    unlimited.definition.attenuation_distance = 0;
+    okay(unlimited_catalog.replace_material(unlimited));
+    set_materials(small_color_scene, std::move(unlimited_catalog));
+    const auto unlimited_image = take(renderer.render(
+        std::make_shared<const project::ProjectDocument>(small_color_scene), r)).image;
+    const auto unlimited_pixel = unlimited_image.linear_hdr[p];
+    check(std::abs(unlimited_pixel.x-a.x) < 1e-3 && std::abs(unlimited_pixel.y-a.y) < 1e-3 &&
+              std::abs(unlimited_pixel.z-a.z) < 1e-3,
+          "zero attenuation distance keeps the existing no-absorption meaning");
+    auto textured_glass_scene = amber_scene;
+    mutate(textured_glass_scene, [&](auto &tx) { okay(tx.replace_mesh(f.front_mesh, uv_triangle())); });
+    const auto white = pixels(85, 1, 1, {{255, 255, 255, 255}});
+    const auto flat_normal = pixels(86, 1, 1, {{128, 128, 255, 255}});
+    auto glass_textures = std::make_shared<production::AuthoringTextureLibrary>();
+    okay(glass_textures->admit(white.record, white.encoded));
+    okay(glass_textures->admit(flat_normal.record, flat_normal.encoded));
+    auto textured_catalog = textured_glass_scene.material_catalog();
+    okay(textured_catalog.insert_texture(white.record));
+    okay(textured_catalog.insert_texture(flat_normal.record));
+    auto textured_glass = textured_catalog.materials().at(1);
+    textured_glass.revision = textured_glass.revision.next();
+    textured_glass.definition.base_color = {85, 9};
+    textured_glass.definition.metallic_roughness = {85, 9};
+    textured_glass.definition.occlusion = {85, 9};
+    textured_glass.definition.normal = {86, 9};
+    textured_glass.definition.normal_scale = 0;
+    okay(textured_catalog.replace_material(textured_glass));
+    set_materials(textured_glass_scene, std::move(textured_catalog));
+    auto textured_request = r;
+    textured_request.textures = glass_textures;
+    const auto textured_image = take(renderer.render(
+        std::make_shared<const project::ProjectDocument>(textured_glass_scene), textured_request)).image;
+    check(textured_image.objects[p] == f.front &&
+              std::abs(textured_image.linear_hdr[p].x - amber_pixel.x) < 1e-3 &&
+              std::abs(textured_image.linear_hdr[p].y - amber_pixel.y) < 1e-3 &&
+              std::abs(textured_image.linear_hdr[p].z - amber_pixel.z) < 1e-3,
+          "neutral authored glass textures preserve scene transmission and absorption");
+    check(glass_frame.refraction_resident_bytes == std::uint64_t(r.width)*r.height*20,
+          "refraction reports the full-resolution color and depth snapshot bytes");
+    auto dense_scene = f.document;
+    scene::ObjectId dense_label;
+    mutate(dense_scene, [&](auto &tx) {
+        for (unsigned i = 0; i < 260; ++i) {
+            const auto offscreen = take(tx.create_object("Offscreen identity", {{100, 0, 0}}));
+            okay(tx.attach_mesh(offscreen, f.back_mesh));
+        }
+        dense_label = take(tx.create_object("High ordinal label", {{0, 0, -1}}));
+        okay(tx.attach_mesh(dense_label, f.back_mesh));
+    });
+    auto dense_request = r;
+    dense_request.transform_overrides[f.back] = {{100, 0, 0}};
+    auto dense_uncovered = dense_request;
+    dense_uncovered.transform_overrides[f.front] = {{100, 0, 0}};
+    const auto dense_source = std::make_shared<const project::ProjectDocument>(dense_scene);
+    const auto dense_background = take(renderer.render(dense_source, dense_uncovered)).image;
+    const auto dense_glass = take(renderer.render(dense_source, dense_request)).image;
+    check(dense_background.objects[p] == dense_label && dense_glass.objects[p] == f.front &&
+              std::abs(dense_background.linear_hdr[p].x - dense_glass.linear_hdr[p].x) < 1e-3 &&
+              std::abs(dense_background.linear_hdr[p].y - dense_glass.linear_hdr[p].y) < 1e-3 &&
+              std::abs(dense_background.linear_hdr[p].z - dense_glass.linear_hdr[p].z) < 1e-3,
+          "scene refraction preserves high-ordinal opaque identity and front-glass picking");
+    auto close_request = r;
+    close_request.transform_overrides[f.back] = {{0, 0, -.003}};
+    const auto near_label = take(renderer.render(source, close_request)).image;
+    check(near_label.objects[p] == f.front && std::abs(near_label.linear_hdr[p].y-a.y) < 1e-3,
+          "refraction finds an opaque label three millimetres behind the surface");
+    auto edge_scene = f.document;
+    auto edge_catalog = edge_scene.material_catalog();
+    auto edge_glass = edge_catalog.materials().at(1);
+    edge_glass.revision = edge_glass.revision.next();
+    edge_glass.definition.ior = 1.5;
+    okay(edge_catalog.replace_material(edge_glass));
+    set_materials(edge_scene, std::move(edge_catalog));
+    auto edge_request = r;
+    edge_request.transform_overrides[f.front] = {{}, {0, std::sin(.2), 0, std::cos(.2)}};
+    edge_request.transform_overrides[f.back] = {{-.55, 0, -1}, {}, {.4, .4, 1}};
+    auto no_label_request = edge_request;
+    no_label_request.transform_overrides[f.back] = {{100, 0, -1}, {}, {.4, .4, 1}};
+    const auto edge_image = take(renderer.render(edge_scene, edge_request)).image;
+    const auto no_label_image = take(renderer.render(edge_scene, no_label_request)).image;
+    check(edge_image.objects[p] == f.front && no_label_image.objects[p] == f.front &&
+              std::abs(edge_image.linear_hdr[p].y - no_label_image.linear_hdr[p].y) < 1e-3,
+          "a projected silhouette entered after its depth is not a refracted surface hit");
+    auto valid_edge_request = edge_request;
+    valid_edge_request.transform_overrides[f.back] = {{-.26, 0, -1}, {}, {.4, .4, 1}};
+    const auto valid_edge = take(renderer.render(edge_scene, valid_edge_request)).image;
+    check(valid_edge.objects[p] == f.front && valid_edge.linear_hdr[p].y > no_label_image.linear_hdr[p].y + .1,
+          "a silhouette entered before its depth still transmits the real surface");
+    auto bounded = r;
+    bounded.refraction.snapshot_budget_bytes = 0;
+    const auto fallback = take(renderer.render(source, bounded));
+    check(fallback.refraction_resident_bytes == 0 && fallback.image.linear_hdr[p].y < 1e-3 &&
+              std::any_of(fallback.image.diagnostics.begin(), fallback.image.diagnostics.end(),
+                  [](const auto &s) { return s.find("environment-only") != std::string::npos; }),
+          "zero snapshot budget releases the snapshot and reports environment fallback");
+    check(std::any_of(fallback.image.diagnostics.begin(), fallback.image.diagnostics.end(),
+                      [](const auto &s) { return s.find("do not cast transparent shadows") != std::string::npos; }),
+          "environment fallback reports that transparent shadows are not modeled");
+    auto invalid = r;
+    invalid.refraction.steps = 3;
+    check(!renderer.render(source, invalid), "too few refraction steps are rejected");
+    invalid = r;
+    invalid.refraction.max_distance = std::numeric_limits<double>::quiet_NaN();
+    check(!renderer.render(source, invalid), "nonfinite refraction distance is rejected");
+    invalid = r;
+    invalid.refraction.snapshot_budget_bytes = 256ULL*1024*1024 + 1;
+    check(!renderer.render(source, invalid), "refraction snapshot budget cannot exceed its cap");
+    const auto restored = take(renderer.render(source, r));
+    check(std::abs(restored.image.linear_hdr[p].y-a.y) < 1e-3,
+          "valid refraction recovers after rejected settings and budget fallback");
+    auto foreground_request = r;
+    foreground_request.transform_overrides[f.back] = {{0, 0, 1}};
+    const auto foreground = take(renderer.render(source, foreground_request)).image;
+    check(foreground.objects[p] == f.back &&
+              std::abs(foreground.linear_hdr[p].y-a.y) < 1e-3,
+          "opaque foreground remains in front of the glass");
+    auto patterned = f.document;
+    mutate(patterned, [&](auto &tx) { okay(tx.replace_mesh(f.back_mesh, uv_triangle())); });
+    const auto label_pixels = pixels(84, 2, 2,
+        {{255, 0, 0, 255}, {0, 255, 0, 255}, {0, 0, 255, 255}, {255, 255, 0, 255}});
+    auto library = std::make_shared<production::AuthoringTextureLibrary>();
+    okay(library->admit(label_pixels.record, label_pixels.encoded));
+    auto patterned_materials = patterned.material_catalog();
+    okay(patterned_materials.insert_texture(label_pixels.record));
+    auto patterned_label = patterned_materials.materials().at(2);
+    patterned_label.revision = patterned_label.revision.next();
+    patterned_label.definition.emissive_factor = {1, 1, 1};
+    patterned_label.definition.emissive = {84, 9};
+    okay(patterned_materials.replace_material(patterned_label));
+    set_materials(patterned, std::move(patterned_materials));
+    auto bent_scene = patterned;
+    auto bent_materials = bent_scene.material_catalog();
+    auto bent_glass = bent_materials.materials().at(1);
+    bent_glass.revision = bent_glass.revision.next();
+    bent_glass.definition.ior = 1.5;
+    okay(bent_materials.replace_material(bent_glass));
+    set_materials(bent_scene, std::move(bent_materials));
+    auto pattern_request = r;
+    pattern_request.textures = library;
+    pattern_request.transform_overrides[f.front] = {{}, {0, std::sin(.2), 0, std::cos(.2)}};
+    const auto straight = take(renderer.render(
+        std::make_shared<const project::ProjectDocument>(patterned), pattern_request)).image;
+    const auto bent = take(renderer.render(
+        std::make_shared<const project::ProjectDocument>(bent_scene), pattern_request)).image;
+    double total_difference = 0;
+    std::size_t compared = 0;
+    for (std::size_t i = 0; i < straight.objects.size(); ++i)
+        if (straight.objects[i] == f.front && bent.objects[i] == f.front) {
+            total_difference += std::abs(straight.linear_hdr[i].x-bent.linear_hdr[i].x) +
+                std::abs(straight.linear_hdr[i].y-bent.linear_hdr[i].y) +
+                std::abs(straight.linear_hdr[i].z-bent.linear_hdr[i].z);
+            ++compared;
+        }
+    check(compared > 50 && total_difference > 1,
+          "changing IOR bends a textured opaque label through the glass");
+    auto uncovered_request = pattern_request;
+    uncovered_request.transform_overrides[f.front] = {{100, 0, 0}};
+    const auto uncovered = take(renderer.render(
+        std::make_shared<const project::ProjectDocument>(patterned), uncovered_request)).image;
+    const core::Quaternion tilt{0, std::sin(.2), 0, std::cos(.2)};
+    const auto normal = tilt.rotate({0, 0, 1});
+    const core::Vec3d incident{0, 0, -1};
+    constexpr double eta = 1. / 1.5;
+    const double cosine = core::dot(normal, incident);
+    const double discriminant = 1 - eta*eta*(1-cosine*cosine);
+    const auto ray = incident*eta - normal*(eta*cosine + std::sqrt(discriminant));
+    const double world_x = (32.5/64 - .5)*4;
+    const double world_y = (.5 - 32.5/64)*4;
+    const double world_z = -world_x*normal.x/normal.z;
+    const double travel = (-1-world_z)/ray.z;
+    const double hit_x = world_x + ray.x*travel;
+    const auto hit_pixel_x = static_cast<unsigned>(std::floor((hit_x/4 + .5)*64));
+    const auto hit_pixel = std::size_t(32)*64 + hit_pixel_x;
+    check(bent.objects[p] == f.front && uncovered.objects[hit_pixel] == f.back,
+          "analytic refraction control reaches the opaque label");
+    const auto expected = uncovered.linear_hdr[hit_pixel], actual = bent.linear_hdr[p];
+    check(std::abs(expected.x-actual.x) < 2e-3 && std::abs(expected.y-actual.y) < 2e-3 &&
+              std::abs(expected.z-actual.z) < 2e-3,
+          "refracted scene color agrees with the independently projected hit");
+    auto occluded_scene = bent_scene;
+    mutate(occluded_scene, [&](auto &tx) {
+        const auto blocker = take(tx.create_object("Foreground occluder",
+            {{hit_x, world_y, .3}, {}, {.05, .05, 1}}));
+        okay(tx.attach_mesh(blocker, f.back_mesh));
+    });
+    const auto occluded = take(renderer.render(
+        std::make_shared<const project::ProjectDocument>(occluded_scene), pattern_request)).image;
+    check(occluded.objects[p] == f.front &&
+              std::abs(occluded.linear_hdr[p].x) + std::abs(occluded.linear_hdr[p].y) +
+                  std::abs(occluded.linear_hdr[p].z) < 1e-3,
+          "foreground occlusion along the bent ray falls back instead of bleeding color");
+    auto temporal = r;
+    temporal.temporal.enabled = true;
+    temporal.temporal.session = 472;
+    static_cast<void>(take(renderer.render(source, temporal)));
+    const auto warm = take(renderer.render(source, temporal));
+    check(warm.temporal_history_eligible, "opaque history remains eligible around glass");
+    auto moved_label = temporal;
+    moved_label.transform_overrides[f.back] = {{100, 0, -1}};
+    const auto moved = take(renderer.render(source, moved_label));
+    auto current_request = moved_label;
+    current_request.temporal.enabled = false;
+    const auto current = take(renderer.render(source, current_request));
+    check(moved.image.objects[p] == f.front && current.image.objects[p] == f.front &&
+              std::abs(moved.image.linear_hdr[p].y-current.image.linear_hdr[p].y) < 1e-3,
+          "moving the background cannot reuse the glass surface's stale temporal color");
+}
+
 void native_glass_fresnel_cases(d3d12::AuthoringViewport &renderer) {
     auto e = asymmetric_environment();
     // A continuous longitude gradient makes both sides of the refracted ray
@@ -294,6 +719,7 @@ void native_glass_fresnel_cases(d3d12::AuthoringViewport &renderer) {
         }
     auto f = environment_fixture(e);
     auto r = request(f);
+    r.refraction.enabled = false; // This fixture isolates environment transmission.
     r.environment_lighting = take(production::compile_environment_lighting(e));
     // A perfectly reflecting dielectric cannot also transmit environment
     // energy, regardless of the separate authored refraction IOR. Compare the
@@ -1141,7 +1567,14 @@ int main(int argc, char **argv) {
         auto test_device = std::shared_ptr<d3d12::D3D12Device>(
             take(d3d12::D3D12Device::create({{}, false, true})));
         graphics_table_limits(*test_device);
+        graphics_eleven_texture_readback(*test_device);
         auto renderer = take(d3d12::AuthoringViewport::create_on_device(test_device));
+        if (argc == 2 && std::string_view(argv[1]) == "--scene-refraction-only") {
+            native_scene_refraction_cases(*renderer);
+            for (const auto &message : test_device->debug_receipts()) std::cerr << message << '\n';
+            check(test_device->debug_receipts().empty(), "scene refraction GPU debug validation is clean");
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--vertex-color-only") {
             native_vertex_color_cases(*renderer);
             return 0;
@@ -1375,6 +1808,7 @@ int main(int argc, char **argv) {
                                                      : std::filesystem::path{});
         native_glass_fresnel_cases(*renderer);
         native_scalar_anisotropy_cases(*renderer);
+        native_scene_refraction_cases(*renderer);
         {
             const auto empty = take(project::ProjectDocument::create("Empty GPU viewport"));
             production::AuthoringViewportRequest er;
