@@ -23,7 +23,11 @@ std::string hex_text(std::string_view text) {
     constexpr char digits[] = "0123456789abcdef";
     std::string result;
     result.reserve(text.size() * 2U);
-    for (unsigned char c : text) { result.push_back(digits[c >> 4U]); result.push_back(digits[c & 15U]); }
+    for (const char raw : text) {
+        const auto c = static_cast<unsigned char>(raw);
+        result.push_back(digits[c >> 4U]);
+        result.push_back(digits[c & 15U]);
+    }
     return result;
 }
 assets::Sha256Digest digest(std::string_view bytes) {

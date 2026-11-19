@@ -862,7 +862,8 @@ core::Result<std::string> mutation_snapshot_payload_v2(
     constexpr char digits[] = "0123456789abcdef";
     std::string hex;
     hex.reserve(provenance.size() * 2U);
-    for (const unsigned char c : provenance) {
+    for (const char raw : provenance) {
+        const auto c = static_cast<unsigned char>(raw);
         hex.push_back(digits[c >> 4U]);
         hex.push_back(digits[c & 15U]);
     }
@@ -982,7 +983,7 @@ bool journal_entry_matches_document(
 }
 
 core::Result<RecoveryJournalEntry> journal_entry_evidence(const journal::JournalEntry& entry) {
-    RecoveryJournalEntry result{entry.revision_before, entry.revision_after, entry.event_type};
+    RecoveryJournalEntry result{entry.revision_before, entry.revision_after, entry.event_type, {}, {}, {}};
     if (entry.event_type != kActionEvent) return core::Result<RecoveryJournalEntry>::success(std::move(result));
     const std::string_view payload(reinterpret_cast<const char*>(entry.payload.data()), entry.payload.size());
     const bool v2 = payload.starts_with("CARTOGRAPHER_APPLICATION_MUTATION_V2\n");
@@ -1007,7 +1008,9 @@ core::Result<RecoveryJournalEntry> journal_entry_evidence(const journal::Journal
         else if (name == "recovery") result.source = OperationSource::recovery;
         const auto hex = line().substr(std::string_view("provenance_hex=").size());
         result.provenance_id.reserve(hex.size() / 2U);
-        const auto nibble = [](char c) -> unsigned { return c <= '9' ? c - '0' : c - 'a' + 10U; };
+        const auto nibble = [](char c) -> unsigned {
+            return static_cast<unsigned>(c <= '9' ? c - '0' : c - 'a' + 10);
+        };
         for (std::size_t i = 0; i < hex.size(); i += 2U)
             result.provenance_id.push_back(static_cast<char>((nibble(hex[i]) << 4U) | nibble(hex[i + 1U])));
     }
@@ -1179,7 +1182,8 @@ core::Result<DispatchReceipt> ApplicationSession::store_unadmitted_mode_key_draf
         constexpr char digits[] = "0123456789abcdef";
         std::string output;
         output.reserve(input.size() * 2U);
-        for (const unsigned char byte : input) {
+        for (const char raw : input) {
+            const auto byte = static_cast<unsigned char>(raw);
             output.push_back(digits[byte >> 4U]);
             output.push_back(digits[byte & 15U]);
         }
@@ -1289,7 +1293,8 @@ core::Result<DispatchReceipt> ApplicationSession::clear_historical_autorig_ik_fk
     constexpr char hex_digits[] = "0123456789abcdef";
     std::string justification_hex;
     justification_hex.reserve(request.justification.size() * 2U);
-    for (const unsigned char byte : request.justification) {
+    for (const char raw : request.justification) {
+        const auto byte = static_cast<unsigned char>(raw);
         justification_hex.push_back(hex_digits[byte >> 4U]);
         justification_hex.push_back(hex_digits[byte & 15U]);
     }
@@ -1725,10 +1730,10 @@ core::Result<MeshCleanupIssueReport> ApplicationSession::inspect_mesh_cleanup_is
                     component.junctions.push_back(vertex);
                 }
                 for (const geometry::EdgeId neighbor : incident->second) {
-                    const auto remaining = remaining_boundary_edges.find(neighbor);
-                    if (remaining == remaining_boundary_edges.end()) continue;
+                    const auto remaining_edge = remaining_boundary_edges.find(neighbor);
+                    if (remaining_edge == remaining_boundary_edges.end()) continue;
                     pending.push_back(neighbor);
-                    remaining_boundary_edges.erase(remaining);
+                    remaining_boundary_edges.erase(remaining_edge);
                 }
             }
         }
@@ -1794,10 +1799,10 @@ core::Result<MeshCleanupIssueReport> ApplicationSession::inspect_mesh_cleanup_is
                 const auto current_adjacency = vertex_adjacency->second.find(current);
                 if (current_adjacency == vertex_adjacency->second.end()) continue;
                 for (const geometry::FaceId neighbor : current_adjacency->second) {
-                    const auto remaining = remaining_faces.find(neighbor);
-                    if (remaining == remaining_faces.end()) continue;
+                    const auto remaining_face = remaining_faces.find(neighbor);
+                    if (remaining_face == remaining_faces.end()) continue;
                     pending.push_back(neighbor);
-                    remaining_faces.erase(remaining);
+                    remaining_faces.erase(remaining_face);
                 }
             }
             std::sort(component.begin(), component.end());
@@ -1824,10 +1829,10 @@ core::Result<MeshCleanupIssueReport> ApplicationSession::inspect_mesh_cleanup_is
             const auto adjacent = face_adjacency.find(current);
             if (adjacent == face_adjacency.end()) continue;
             for (const geometry::FaceId neighbor : adjacent->second) {
-                const auto remaining = remaining_faces.find(neighbor);
-                if (remaining == remaining_faces.end()) continue;
+                const auto remaining_face = remaining_faces.find(neighbor);
+                if (remaining_face == remaining_faces.end()) continue;
                 pending.push_back(neighbor);
-                remaining_faces.erase(remaining);
+                remaining_faces.erase(remaining_face);
             }
         }
         std::sort(component.begin(), component.end());
@@ -2134,7 +2139,7 @@ core::Result<RecoveryInspection> inspect_recovery_unlocked(
                 inspection.state = RecoveryInspectionState::blocked;
                 inspection.diagnostic = evidence.error().with_context("recovery journal attribution");
                 inspection.journal_entries.push_back(RecoveryJournalEntry{
-                    entry.revision_before, entry.revision_after, entry.event_type});
+                    entry.revision_before, entry.revision_after, entry.event_type, {}, {}, {}});
             } else {
                 inspection.journal_entries.push_back(std::move(evidence.value()));
             }
@@ -9513,7 +9518,7 @@ core::Result<DispatchReceipt> ApplicationSession::rebase_condition_prefab(
     }
 
     for (const auto& source : resolved_sources) {
-        const auto decision = decisions.at(source.asset->id);
+        static_cast<void>(decisions.at(source.asset->id));
         const auto old_member = std::lower_bound(instance.members.begin(), instance.members.end(),
             source.asset->id, [](const auto& item, condition::Id id) {
                 return item.asset_id < id;
@@ -13415,7 +13420,8 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
                     instance.root_object_id, instance.members.size(), current,
                     current ? "Current · isolated mesh snapshot and source bindings match."
                         : !isolated ? "Legacy/unisolated · no independent geometry snapshot is recorded."
-                        : "Stale · prefab, source, geometry, or local placement changed."};
+                        : "Stale · prefab, source, geometry, or local placement changed.",
+                    false, 0U, {}, {}, {}, {}, {}};
                 view.member_asset_ids.reserve(instance.members.size());
                 for (const auto& member : instance.members) {
                     view.member_asset_ids.push_back(member.asset_id);
