@@ -412,7 +412,8 @@ int main(int argc, char **argv) {
             send(session, application::SaveProjectAction{project_path});
             const auto input = root / (binary ? "colors-input-binary.gltf" : "colors-input-json.gltf");
             { std::ofstream file(input, std::ios::binary);
-              file.write(reinterpret_cast<const char*>(colored_bytes.data()), colored_bytes.size());
+              file.write(reinterpret_cast<const char*>(colored_bytes.data()),
+                         static_cast<std::streamsize>(colored_bytes.size()));
               check(bool(file), "color input written"); }
             take(carto::testing::import_gltf_scene_file(session, input, true));
             const auto imported = document(session);
