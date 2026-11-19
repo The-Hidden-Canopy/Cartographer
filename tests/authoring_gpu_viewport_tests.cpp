@@ -632,7 +632,7 @@ void native_shadow_cases(d3d12::AuthoringViewport &renderer, const std::filesyst
     const auto cpu = take(production::render_authoring_viewport(f.document, r));
     const auto gpu = take(renderer.render(source, r));
     check(gpu.shadow_draw_calls == 2 &&
-              gpu.shadow_resident_bytes == std::uint64_t(128) * 128 * 8 + 128,
+              gpu.shadow_resident_bytes == std::uint64_t(128) * 128 * 8 + 256,
           "first shadow frame rasterizes authored casters within its resource budget");
     unsigned dark = 0, lit = 0;
     unsigned raw_lit=0,raw_dark=0,receivers=0;
@@ -1227,6 +1227,145 @@ int main(int argc, char **argv) {
             set_fixture_lights(lighting, {light});
             check(!renderer->render(lighting.document, request(lighting)),
                   "GPU viewport rejects active color-temperature intent");
+        }
+        {
+            auto lighting = fixture();
+            auto key = lighting.document.presentation_catalog().lights().at(lighting.light);
+            key.casts_shadows = false;
+            scene::ObjectId fill_object;
+            mutate(lighting.document, [&](auto &tx) {
+                fill_object = take(tx.create_object("Directional fill",
+                    {{}, {0, std::sin(.28), 0, std::cos(.28)}}));
+            });
+            auto fill = key;
+            fill.object = fill_object;
+            fill.identity = "viewport.fill";
+            fill.linear_color = {.3, .7, 1.};
+            fill.intensity = 3.;
+            set_fixture_lights(lighting, {key, fill});
+            auto r = request(lighting);
+            const auto source = std::make_shared<const project::ProjectDocument>(lighting.document);
+            const auto cpu = take(production::render_authoring_viewport(*source, r));
+            const auto both = take(renderer->render(source, r)).image;
+            compare(cpu, both);
+            auto key_only = lighting;
+            set_fixture_lights(key_only, {key});
+            const auto key_image = take(renderer->render(key_only.document, request(key_only))).image;
+            auto fill_only = lighting;
+            set_fixture_lights(fill_only, {fill});
+            const auto fill_image = take(renderer->render(fill_only.document, request(fill_only))).image;
+            const auto p = center(both);
+            const auto a = both.linear_hdr[p], b = key_image.linear_hdr[p], c = fill_image.linear_hdr[p];
+            check(std::abs(a.x-b.x-c.x) < 2e-3 && std::abs(a.y-b.y-c.y) < 2e-3 &&
+                      std::abs(a.z-b.z-c.z) < 2e-3,
+                  "two directional sources contribute independently in linear light");
+            core::Transform away;
+            away.rotation = {0, 1, 0, 0};
+            r.transform_overrides[fill_object] = away;
+            const auto moved = take(renderer->render(source, r)).image;
+            check(std::abs(moved.linear_hdr[p].x-b.x) < 2e-3 &&
+                      std::abs(moved.linear_hdr[p].y-b.y) < 2e-3 &&
+                      std::abs(moved.linear_hdr[p].z-b.z) < 2e-3,
+                  "transient fill rotation updates the cached light without changing the key");
+            r.transform_overrides.clear();
+            r.transform_overrides[lighting.light] = away;
+            const auto key_away = take(renderer->render(source, r)).image;
+            check(std::abs(key_away.linear_hdr[p].x-c.x) < 2e-3 &&
+                      std::abs(key_away.linear_hdr[p].y-c.y) < 2e-3 &&
+                      std::abs(key_away.linear_hdr[p].z-c.z) < 2e-3,
+                  "fill still illuminates when the primary source faces away");
+            auto temporal = request(lighting);
+            temporal.temporal.enabled = true;
+            temporal.temporal.session = 817;
+            static_cast<void>(take(renderer->render(source, temporal)));
+            const auto warm_lighting = take(renderer->render(source, temporal));
+            check(warm_lighting.temporal_history_eligible,
+                  "unchanged multi-light frame admits temporal history");
+            temporal.transform_overrides[fill_object] = away;
+            const auto relit = take(renderer->render(source, temporal));
+            auto current_request = temporal;
+            current_request.temporal.enabled = false;
+            const auto current = take(renderer->render(source, current_request));
+            check(!relit.temporal_history_eligible &&
+                      std::abs(relit.image.linear_hdr[p].x-current.image.linear_hdr[p].x) < 2e-3 &&
+                      std::abs(relit.image.linear_hdr[p].y-current.image.linear_hdr[p].y) < 2e-3 &&
+                      std::abs(relit.image.linear_hdr[p].z-current.image.linear_hdr[p].z) < 2e-3,
+                  "changing a secondary light invalidates stale temporal color");
+            auto brushed = lighting;
+            mutate(brushed.document, [&](auto &tx) {
+                okay(tx.replace_mesh(brushed.front_mesh, anisotropy_triangle(true, false, false, false, false)));
+            });
+            auto brushed_catalog = brushed.document.material_catalog();
+            auto brushed_material = brushed_catalog.materials().at(1);
+            brushed_material.revision = brushed_material.revision.next();
+            brushed_material.definition.metallic = 1.;
+            brushed_material.definition.roughness = .35;
+            brushed_material.definition.anisotropy = .8;
+            brushed_material.definition.anisotropy_rotation = .4;
+            okay(brushed_catalog.replace_material(brushed_material));
+            set_materials(brushed.document, std::move(brushed_catalog));
+            auto brushed_request = request(brushed);
+            brushed_request.transform_overrides[brushed.front] =
+                {{}, {.12, .18, 0, std::sqrt(1 - .12*.12 - .18*.18)}};
+            const auto brushed_both = take(renderer->render(brushed.document, brushed_request)).image;
+            auto brushed_key = brushed;
+            set_fixture_lights(brushed_key, {key});
+            const auto brushed_key_image = take(renderer->render(brushed_key.document, brushed_request)).image;
+            auto brushed_fill = brushed;
+            set_fixture_lights(brushed_fill, {fill});
+            const auto brushed_fill_image = take(renderer->render(brushed_fill.document, brushed_request)).image;
+            const auto ab = brushed_both.linear_hdr[p], ak = brushed_key_image.linear_hdr[p],
+                       af = brushed_fill_image.linear_hdr[p];
+            check(brushed_both.objects[p] == brushed.front && af.x + af.y + af.z > 1e-4 &&
+                      std::abs(ab.x-ak.x-af.x) < 2e-3 && std::abs(ab.y-ak.y-af.y) < 2e-3 &&
+                      std::abs(ab.z-ak.z-af.z) < 2e-3,
+                  "additional directional lighting preserves anisotropic metallic response");
+            auto shadowed = lighting;
+            key.casts_shadows = fill.casts_shadows = true;
+            set_fixture_lights(shadowed, {key, fill});
+            auto shadow_request = request(shadowed);
+            shadow_request.shadows.enabled = true;
+            const auto refused = renderer->render(shadowed.document, shadow_request);
+            check(!refused && refused.error().message.find("one shadow-casting") != std::string::npos,
+                  "multiple shadow maps are explicitly rejected rather than silently omitted");
+            key.casts_shadows = false;
+            set_fixture_lights(shadowed, {key, fill});
+            const auto shadow_source = std::make_shared<const project::ProjectDocument>(shadowed.document);
+            shadow_request.shadows.resolution = 128;
+            const auto mixed = take(renderer->render(shadow_source, shadow_request));
+            auto fill_shadow_only = shadowed;
+            set_fixture_lights(fill_shadow_only, {fill});
+            const auto shadow_fill = take(renderer->render(fill_shadow_only.document, shadow_request));
+            const auto combined = mixed.image.linear_hdr[p], isolated = shadow_fill.image.linear_hdr[p];
+            check(mixed.shadow_draw_calls > 0 &&
+                      std::abs(combined.x-b.x-isolated.x) < 2e-3 &&
+                      std::abs(combined.y-b.y-isolated.y) < 2e-3 &&
+                      std::abs(combined.z-b.z-isolated.z) < 2e-3,
+                  "the shadow-casting fill is selected for the map while the key remains lit");
+            const auto warm_mixed = take(renderer->render(shadow_source, shadow_request));
+            check(warm_mixed.shadow_draw_calls == 0 &&
+                      warm_mixed.image.display_rgba8 == mixed.image.display_rgba8,
+                  "unchanged multiple-light scene reuses its shadow map with identical output");
+            key.casts_shadows = fill.casts_shadows = false;
+            std::vector<project::AuthoredLight> lights{key, fill};
+            mutate(lighting.document, [&](auto &tx) {
+                for (unsigned i = 0; i < 3; ++i) {
+                    auto light = key;
+                    light.object = take(tx.create_object("Additional directional source"));
+                    light.identity = "viewport.extra." + std::to_string(i);
+                    lights.push_back(light);
+                }
+            });
+            auto four = lights;
+            four.pop_back();
+            set_fixture_lights(lighting, four);
+            const auto four_cpu = take(production::render_authoring_viewport(lighting.document, request(lighting)));
+            const auto four_gpu = take(renderer->render(lighting.document, request(lighting))).image;
+            compare(four_cpu, four_gpu);
+            set_fixture_lights(lighting, lights);
+            const auto overflow = renderer->render(lighting.document, request(lighting));
+            check(!overflow && overflow.error().message.find("at most four") != std::string::npos,
+                  "GPU viewport rejects the fifth active directional source");
         }
         native_surface_cases(*renderer,
                              argc > 1 ? std::filesystem::path(argv[1]) : std::filesystem::path{});

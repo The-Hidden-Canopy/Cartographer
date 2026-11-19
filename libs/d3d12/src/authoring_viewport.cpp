@@ -149,10 +149,16 @@ struct Draw {
     bool material_uv_is_secondary = false;
 };
 struct Prepared {
+    struct DirectionalLight {
+        scene::ObjectId object;
+        render::PbrLight light;
+        bool casts_shadows = false;
+    };
     assets::Sha256Digest source_digest;
     production::AuthoringView view;
     render::PbrLight light{{0, 0, 1}, {0, 0, 0}};
     bool casts_shadows = false;
+    std::vector<DirectionalLight> directional_lights;
     std::vector<Draw> draws;
 };
 using MeshArtifactCache =
@@ -181,18 +187,19 @@ Prepared prepare(const project::ProjectDocument &document,
     timing.prepare_validate_ms += elapsed(phase);
     Prepared out;
     out.view = resolve_view(document, request);
-    std::size_t lights = 0;
     for (const auto &[id, l] : document.presentation_catalog().lights()) {
         const auto *object = document.scene().find(id);
         if (!object || !object->visible)
             continue;
         if (!need(production::authoring_light_is_active(l)))
             continue;
-        if (l.kind != project::AuthoredLightKind::directional || ++lights > 1)
-            throw std::runtime_error("GPU G1 supports one directional light");
-        out.light = {need(document.scene().world_transform(id)).rotation.rotate({0, 0, 1}),
-                     l.linear_color * l.intensity};
-        out.casts_shadows = l.casts_shadows;
+        if (l.kind != project::AuthoredLightKind::directional)
+            throw std::runtime_error("GPU viewport supports directional lights only");
+        if (out.directional_lights.size() == 4U)
+            throw std::runtime_error("GPU viewport supports at most four directional lights");
+        out.directional_lights.push_back({id,
+            {need(document.scene().world_transform(id)).rotation.rotate({0, 0, 1}),
+             l.linear_color * l.intensity}, l.casts_shadows});
     }
     phase = Clock::now();
     const auto canonical = document.serialize();
@@ -795,7 +802,7 @@ struct AuthoringViewport::Impl {
         }
         shadow_enabled = fit.has_value();
         const auto extent = shadow_enabled ? request.shadows.resolution : 1U;
-        std::vector<std::array<float, 4>> words(8);
+        std::vector<std::array<float, 4>> words(16);
         if (fit) {
             shadow_vp = camera_matrix(fit->view, 1);
             for (unsigned row = 0; row < 4; ++row)
@@ -812,10 +819,18 @@ struct AuthoringViewport::Impl {
             words[7] = {narrow(std::cos(e->rotation_radians)),
                         narrow(std::sin(e->rotation_radians)), narrow(e->intensity),
                         environment_enabled ? 1.F : 0.F};
+        for (std::size_t i = 1; i < scene.directional_lights.size(); ++i) {
+            const auto &light = scene.directional_lights[i].light;
+            words[8 + (i - 1) * 2] = {narrow(light.direction_to_light.x),
+                narrow(light.direction_to_light.y), narrow(light.direction_to_light.z), 1.F};
+            words[9 + (i - 1) * 2] = {narrow(light.radiance.x), narrow(light.radiance.y),
+                narrow(light.radiance.z), 0.F};
+        }
         auto shadow_words = words;
         shadow_words[4] = {};
         shadow_words[5][2] = shadow_words[5][3] = 0;
         shadow_words[7] = {};
+        for (std::size_t i = 8; i < shadow_words.size(); ++i) shadow_words[i] = {};
         auto signature = bytes(shadow_words);
         for (const auto &draw : scene.draws) {
             for (const auto &key : {draw.geometry_key, draw.surface_key}) {
@@ -844,7 +859,7 @@ struct AuthoringViewport::Impl {
         if (words != lighting_words || !lighting || shadow_extent != extent) {
             auto candidate = std::make_shared<Resources>(device);
             const auto data = candidate->texture(
-                {8, 1, 1, 1, 1, gpu::Format::rgba32_float, gpu::TextureDimension::texture_2d,
+                {16, 1, 1, 1, 1, gpu::Format::rgba32_float, gpu::TextureDimension::texture_2d,
                  gpu::TextureUsage::sampled | gpu::TextureUsage::transfer_destination});
             Resources staging(*device);
             const auto upload =
@@ -931,7 +946,7 @@ struct AuthoringViewport::Impl {
             shadow_shader_read = true;
             frame.lighting_upload_bytes = 256;
         }
-        frame.shadow_resident_bytes = std::uint64_t(extent) * extent * 8 + 128;
+        frame.shadow_resident_bytes = std::uint64_t(extent) * extent * 8 + 256;
         frame.logical_resident_bytes += frame.shadow_resident_bytes;
         frame.lighting_update_milliseconds = elapsed(started);
     }
@@ -1963,19 +1978,28 @@ core::Result<AuthoringGpuFrame> AuthoringViewport::render_impl(
                         impl_->optimized && impl_->cache_meshes ? &impl_->mesh_artifacts : nullptr);
         // Light transform previews share the same transient override boundary
         // as mesh edits; an immutable document cache must not freeze them.
-        for (const auto &[id, light] : source.presentation_catalog().lights()) {
-            const auto *object = source.scene().find(id);
-            if (!object || !object->visible)
-                continue;
-            if (!need(production::authoring_light_is_active(light)))
-                continue;
-            auto transform = need(source.scene().world_transform(id));
-            if (const auto override = request.transform_overrides.find(id);
+        for (auto &light : scene.directional_lights) {
+            auto transform = need(source.scene().world_transform(light.object));
+            if (const auto override = request.transform_overrides.find(light.object);
                 override != request.transform_overrides.end())
                 transform = override->second;
             if (!transform.finite())
                 throw std::runtime_error("GPU light transform is invalid");
-            scene.light.direction_to_light = transform.rotation.rotate({0, 0, 1});
+            light.light.direction_to_light = transform.rotation.rotate({0, 0, 1});
+        }
+        if (request.shadows.enabled) {
+            const auto shadow_count = std::count_if(scene.directional_lights.begin(),
+                scene.directional_lights.end(), [](const auto &light) { return light.casts_shadows; });
+            if (shadow_count > 1)
+                throw std::runtime_error("GPU viewport supports one shadow-casting directional light");
+            const auto shadow = std::find_if(scene.directional_lights.begin(),
+                scene.directional_lights.end(), [](const auto &light) { return light.casts_shadows; });
+            if (shadow != scene.directional_lights.end())
+                std::iter_swap(scene.directional_lights.begin(), shadow);
+        }
+        if (!scene.directional_lights.empty()) {
+            scene.light = scene.directional_lights.front().light;
+            scene.casts_shadows = scene.directional_lights.front().casts_shadows;
         }
         image.view = scene.view;
         if (std::any_of(scene.draws.begin(), scene.draws.end(),

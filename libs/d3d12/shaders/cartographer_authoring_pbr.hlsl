@@ -307,8 +307,56 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID,
 #else
     const float shadow = saturate(light_radiance_range.w);
 #endif
-    const float3 direct = (diffuse + specular + clearcoat_specular) *
-        (n_dot_l * light_radiance_range.rgb * shadow);
+    float3 direct = (n_dot_l > 0.0 && n_dot_v > 0.0)
+        ? (diffuse + specular + clearcoat_specular) * (n_dot_l * light_radiance_range.rgb * shadow)
+        : 0.0;
+#ifdef CARTO_AUTHORING_VIEWPORT
+    // The primary source above owns the single shadow map. Additional active
+    // directional sources are admitted only when they do not need another map.
+    [unroll] for (uint light_index = 0; light_index < 3; ++light_index) {
+        const float4 packed_direction = light_word(8 + 2 * light_index);
+        if (packed_direction.w == 0) continue;
+        const float3 extra_light = normalize(packed_direction.xyz);
+        const float extra_n_dot_l = max(dot(normal, extra_light), 0.0);
+        if (extra_n_dot_l <= 0 || n_dot_v <= 0) continue;
+        const float3 extra_sum = view + extra_light;
+        const float3 extra_half = dot(extra_sum, extra_sum) > 1e-12 ? normalize(extra_sum) : normal;
+        const float extra_n_dot_h = max(dot(normal, extra_half), 0.0);
+        const float extra_v_dot_h = max(dot(view, extra_half), 0.0);
+        const float3 extra_fresnel = fresnel_schlick(extra_v_dot_h, f0);
+        const float extra_coat_fresnel = 0.04 + 0.96 * pow(1.0 - extra_v_dot_h, 5.0);
+        const float extra_attenuation = saturate(1.0 - clearcoat * extra_coat_fresnel);
+        float extra_distribution = distribution_ggx(normal, extra_half, roughness);
+#ifdef CARTO_AUTHORING_SURFACE
+        if (anisotropy > 0) {
+            const float3 geometric_tangent = normalize(input.world_tangent -
+                geometric_normal * dot(geometric_normal, input.world_tangent));
+            const float3 t0 = authoring_transport_tangent(geometric_normal, geometric_tangent, normal);
+            const float3 b0 = cross(normal, t0) * input.tangent_sign;
+            const float c = cos(material.anisotropy_rotation), s = sin(material.anisotropy_rotation);
+            const float3 t = normalize(t0 * c + b0 * s), b = normalize(cross(normal, t)) * input.tangent_sign;
+            const float alpha = max(roughness * roughness, 0.045 * 0.045);
+            const float at = lerp(alpha, 1.0, anisotropy * anisotropy), ab = alpha;
+            const float3 h = float3(dot(extra_half, t), dot(extra_half, b), extra_n_dot_h);
+            const float d = h.x*h.x/(at*at) + h.y*h.y/(ab*ab) + h.z*h.z;
+            extra_distribution = 1.0/(3.14159265*at*ab*d*d);
+        }
+#endif
+        const float extra_geometry = geometry_schlick_ggx(extra_n_dot_l, roughness) *
+            geometry_schlick_ggx(n_dot_v, roughness);
+        const float3 extra_specular = extra_fresnel * extra_distribution * extra_geometry *
+            extra_attenuation / max(4.0 * extra_n_dot_l * n_dot_v, 1e-12);
+        const float3 extra_diffuse = (1.0-extra_fresnel) * (1.0-metallic) * (1.0-transmission) *
+            base_color * extra_attenuation / 3.14159265;
+        const float extra_coat_distribution = distribution_ggx(normal, extra_half, clearcoat_roughness);
+        const float extra_coat_geometry = geometry_schlick_ggx(extra_n_dot_l, clearcoat_roughness) *
+            geometry_schlick_ggx(n_dot_v, clearcoat_roughness);
+        const float3 extra_coat = clearcoat * extra_coat_fresnel * extra_coat_distribution *
+            extra_coat_geometry / max(4.0 * extra_n_dot_l * n_dot_v, 1e-12);
+        direct += (extra_diffuse + extra_specular + extra_coat) *
+            (extra_n_dot_l * light_word(9 + 2 * light_index).rgb);
+    }
+#endif
 #ifdef CARTO_AUTHORING_SURFACE
     const float3 emissive=material.emission;
     const float alpha=material.base.a * input.color.a;
@@ -331,7 +379,7 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID,
     // Direct-light material evaluation always produces unexposed linear HDR.
     // Environment light is not replaced by an ambient color/AO surrogate.
     // Camera exposure, tone mapping and encoding belong to the display pass.
-    float3 hdr = ((n_dot_l > 0.0 && n_dot_v > 0.0) ? direct : 0.0) + emissive;
+    float3 hdr = direct + emissive;
 #ifdef CARTO_AUTHORING_VIEWPORT
 #ifdef CARTO_AUTHORING_SURFACE
     const float environment_ao=material.ao;
