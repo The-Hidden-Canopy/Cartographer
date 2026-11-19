@@ -220,7 +220,7 @@ int main(int argc, char** argv) {
             reusable = std::move(frame.image);
         }
         if (assets::sha256(read_bounded(project_path, 128U * 1024U * 1024U)) != source_digest ||
-            assets::sha256(read_bounded(hdr_path, 32U * 1024U * 1024U)) != decoded.source_digest)
+            assets::sha256(read_bounded(hdr_path, assets::kMaxHdrEnvironmentSourceBytes)) != decoded.source_digest)
             throw std::runtime_error("review source changed during capture; incomplete evidence retained");
         receipt << "device=" << device_name << '\n';
         auto receipt_file = output_new(root / "receipt.txt");

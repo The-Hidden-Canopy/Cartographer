@@ -28,15 +28,16 @@ def main():
         parser.add_argument(name, type=Path)
     parser.add_argument("camera", nargs=7, help="target xyz, distance, yaw, pitch, vertical FOV")
     parser.add_argument("--displaced-object", type=int, help="visible mesh object for diagnostic isolation")
+    parser.add_argument("--large-hdr", type=Path, help="encoded HDR over 32 MiB for the review source-boundary regression")
     args = parser.parse_args()
     args.new_parent.mkdir(exist_ok=False)
     before = hashlib.sha256(args.project.read_bytes()).hexdigest()
     hdr_digest = hashlib.sha256(args.hdr.read_bytes()).hexdigest()
 
     def invoke(name, width="160", height="90", frames="4", temporal="off", camera=None,
-               refraction=None, hidden=None, high_hdr=False):
+               refraction=None, hidden=None, high_hdr=False, hdr_path=None):
         root = args.new_parent / name
-        command = [str(args.executable), str(args.project), str(args.hdr), str(root), width, height,
+        command = [str(args.executable), str(args.project), str(hdr_path or args.hdr), str(root), width, height,
                    *(camera or args.camera), frames, temporal]
         if refraction is not None or hidden is not None:
             command.append(refraction or "scene")
@@ -45,6 +46,22 @@ def main():
         if high_hdr:
             command.append("--hdr-high")
         return root, subprocess.run(command, capture_output=True, text=True, check=False)
+
+    if args.large_hdr is not None:
+        require(32 * 1024 * 1024 < args.large_hdr.stat().st_size <= 64 * 1024 * 1024,
+                "large HDR fixture must exceed the former limit and fit the current limit")
+        large_digest = hashlib.sha256(args.large_hdr.read_bytes()).hexdigest()
+        large_root, large = invoke("large-hdr", width="64", height="64", frames="1",
+                                   refraction="scene", high_hdr=True, hdr_path=args.large_hdr)
+        require(large.returncode == 0, f"large HDR capture failed: {large.stdout}\n{large.stderr}")
+        large_receipt = (large_root / "receipt.txt").read_text()
+        require(f"hdr_source_sha256={large_digest}" in large_receipt and
+                "hdr_source_extent=4096x2048" in large_receipt and
+                "hdr_lighting_grid=512x256" in large_receipt and
+                "hdr_lighting_quality=high" in large_receipt,
+                "large HDR capture receipt is incomplete")
+        require(hashlib.sha256(args.large_hdr.read_bytes()).hexdigest() == large_digest,
+                "large HDR source changed during capture")
 
     root, result = invoke("off")
     require(result.returncode == 0, f"capture failed: {result.stdout}\n{result.stderr}")
