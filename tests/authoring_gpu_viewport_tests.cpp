@@ -612,6 +612,34 @@ void native_shadow_cases(d3d12::AuthoringViewport &renderer, const std::filesyst
             cutout_gpu.image.linear_hdr[p].x > gpu.image.linear_hdr[p].x + .1)
             ++holes;
     check(holes > 3, "native decoded alpha mask transmits spatial light through caster holes");
+    auto vertex_masked = f;
+    auto colored_caster = triangle();
+    auto colors = colored_caster.attributes();
+    okay(colors.set_domain_count(attributes::AttributeDomain::corner, 3));
+    okay(colors.add_layer({{"caster.color", attributes::AttributeDomain::corner,
+                            attributes::AttributeType::color4},
+                           {core::Vec4d{1, 1, 1, 0}, core::Vec4d{1, 1, 1, 0},
+                            core::Vec4d{1, 1, 1, 0}}}));
+    okay(colored_caster.set_attribute_payload(std::move(colors), {}));
+    mutate(vertex_masked.document, [&](auto &tx) {
+        okay(tx.replace_mesh(vertex_masked.front_mesh, colored_caster));
+    });
+    auto vertex_catalog = vertex_masked.document.material_catalog();
+    auto vertex_material = vertex_catalog.materials().at(1U);
+    vertex_material.revision = vertex_material.revision.next();
+    vertex_material.definition.alpha_mode = render::AlphaMode::masked;
+    vertex_material.definition.alpha_cutoff = .5;
+    okay(vertex_catalog.replace_material(vertex_material));
+    set_materials(vertex_masked.document, std::move(vertex_catalog));
+    const auto vertex_cpu = take(production::render_authoring_viewport(vertex_masked.document, r));
+    const auto vertex_gpu = take(renderer.render(vertex_masked.document, r)).image;
+    unsigned vertex_holes = 0;
+    for (std::size_t p = 0; p < cpu.objects.size(); ++p)
+        if (cpu.objects[p] == f.back && vertex_cpu.objects[p] == f.back &&
+            vertex_cpu.linear_hdr[p].x > cpu.linear_hdr[p].x + .15 &&
+            vertex_gpu.objects[p] == f.back && vertex_gpu.linear_hdr[p].x > gpu.image.linear_hdr[p].x + .1)
+            ++vertex_holes;
+    check(vertex_holes > 3, "vertex alpha removes the caster from the native shadow map");
     auto reopened = std::make_shared<const project::ProjectDocument>(
         take(project::ProjectDocument::deserialize(masked.document.serialize())));
     check(take(renderer.render(reopened, mask_request)).image.display_rgba8 ==
@@ -924,6 +952,68 @@ int capture_authored_project(const std::filesystem::path &project_path,
                  "separate\n";
     return 0;
 }
+void native_vertex_color_cases(d3d12::AuthoringViewport &renderer) {
+    for (const auto domain : {attributes::AttributeDomain::vertex, attributes::AttributeDomain::corner}) {
+        auto f = fixture();
+        auto mesh = triangle();
+        auto payload = mesh.attributes();
+        okay(payload.set_domain_count(domain, 3));
+        okay(payload.add_layer({{"authored.color", domain, attributes::AttributeType::color4},
+                               {core::Vec4d{1, .2, .1, 0}, core::Vec4d{.2, 1, .1, 1},
+                                core::Vec4d{.2, .1, 1, 1}}}));
+        okay(mesh.set_attribute_payload(std::move(payload), {}));
+        mutate(f.document, [&](auto &tx) { okay(tx.replace_mesh(f.front_mesh, mesh)); });
+        auto catalog = f.document.material_catalog();
+        auto material = catalog.materials().at(1U);
+        material.revision = material.revision.next();
+        material.definition.base_color_factor = {1, 1, 1, 1};
+        material.definition.alpha_mode = render::AlphaMode::masked;
+        material.definition.alpha_cutoff = .5;
+        okay(catalog.replace_material(material));
+        set_materials(f.document, catalog);
+        const auto r = request(f);
+        const auto cpu = take(production::render_authoring_viewport(f.document, r));
+        const auto gpu = take(renderer.render(f.document, r)).image;
+        compare(cpu, gpu);
+        check(std::count(gpu.objects.begin(), gpu.objects.end(), f.front) > 50 &&
+                  std::count(gpu.objects.begin(), gpu.objects.end(), f.back) > 50,
+              "interpolated vertex alpha masks only part of the front surface");
+        auto neutral = f.document;
+        mutate(neutral, [&](auto &tx) { okay(tx.replace_mesh(f.front_mesh, triangle())); });
+        const auto uncolored = take(renderer.render(neutral, r)).image;
+        std::size_t tinted = 0;
+        for (std::size_t p = 0; p < gpu.objects.size(); ++p)
+            if (gpu.objects[p] == f.front && uncolored.objects[p] == f.front &&
+                std::abs(gpu.linear_hdr[p].x - uncolored.linear_hdr[p].x) > .01)
+                ++tinted;
+        check(tinted > 50, "vertex RGB visibly modulates the authored material in linear light");
+        const auto reopened = take(project::ProjectDocument::deserialize(f.document.serialize()));
+        check(take(renderer.render(reopened, r)).image.display_rgba8 == gpu.display_rgba8,
+              "authored colors survive save and reload");
+
+        auto ambiguous = mesh;
+        auto extra = ambiguous.attributes();
+        okay(extra.add_layer({{"second.color", domain, attributes::AttributeType::color4},
+                              {core::Vec4d{1, 1, 1, 1}, core::Vec4d{1, 1, 1, 1},
+                               core::Vec4d{1, 1, 1, 1}}}));
+        okay(ambiguous.set_attribute_payload(std::move(extra), {}));
+        mutate(f.document, [&](auto &tx) { okay(tx.replace_mesh(f.front_mesh, ambiguous)); });
+        check(!production::render_authoring_viewport(f.document, r) && !renderer.render(f.document, r),
+              "ambiguous color layers fail rather than silently selecting one");
+    }
+    auto invalid = fixture();
+    auto invalid_mesh = triangle();
+    auto face_payload = invalid_mesh.attributes();
+    okay(face_payload.add_layer({{"face.color", attributes::AttributeDomain::face,
+                                  attributes::AttributeType::color4},
+                                 {core::Vec4d{1, 0, 0, 1}}}));
+    okay(invalid_mesh.set_attribute_payload(std::move(face_payload), {}));
+    mutate(invalid.document, [&](auto &tx) { okay(tx.replace_mesh(invalid.front_mesh, invalid_mesh)); });
+    const auto invalid_request = request(invalid);
+    check(!production::render_authoring_viewport(invalid.document, invalid_request) &&
+              !renderer.render(invalid.document, invalid_request),
+          "unsupported face-domain color is refused by both renderers");
+}
 int main(int argc, char **argv) {
     try {
         if (argc > 1 && std::string_view(argv[1]) == "--project") {
@@ -953,6 +1043,11 @@ int main(int argc, char **argv) {
             take(d3d12::D3D12Device::create({{}, false, true})));
         graphics_table_limits(*test_device);
         auto renderer = take(d3d12::AuthoringViewport::create_on_device(test_device));
+        if (argc == 2 && std::string_view(argv[1]) == "--vertex-color-only") {
+            native_vertex_color_cases(*renderer);
+            return 0;
+        }
+        native_vertex_color_cases(*renderer);
         if (argc == 2 && std::string_view(argv[1]) == "--anisotropy-only") {
             native_scalar_anisotropy_cases(*renderer);
             return 0;

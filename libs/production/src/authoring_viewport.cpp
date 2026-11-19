@@ -31,11 +31,17 @@ struct Vertex {
     core::Vec2d uv;
     Vec3d tangent;
     double tangent_sign = 1;
+    core::Vec4d color{1, 1, 1, 1};
 };
+core::Vec4d color_mix(core::Vec4d a, core::Vec4d b, double t) {
+    return {a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t,
+            a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t};
+}
 Vertex mix(const Vertex &a, const Vertex &b, double t) {
     return {a.world * (1.0 - t) + b.world * t,   a.normal * (1.0 - t) + b.normal * t,
             a.camera * (1.0 - t) + b.camera * t, a.uv * (1 - t) + b.uv * t,
-            a.tangent * (1 - t) + b.tangent * t, a.tangent_sign * (1 - t) + b.tangent_sign * t};
+            a.tangent * (1 - t) + b.tangent * t, a.tangent_sign * (1 - t) + b.tangent_sign * t,
+            color_mix(a.color, b.color, t)};
 }
 // Clip before perspective division. Interpolated varyings remain in world
 // space until perspective-correct interpolation at the sample location.
@@ -285,6 +291,9 @@ render_reference(const project::ProjectDocument &document, const AuthoringViewpo
         auto slots=authoring_material_slot_layer(mesh->second);
         if(!slots)return Result::failure(slots.error());
         options.material_slot_layer=slots.value();
+        auto colors = authoring_vertex_color_layer(mesh->second);
+        if (!colors) return Result::failure(colors.error());
+        options.vertex_color_layer = colors.value();
         const auto base_key = std::tuple{*object.mesh_asset, render::UvSetId{0}, false};
         auto compiled = compiled_meshes.find(base_key);
         if (compiled == compiled_meshes.end()) {
@@ -398,7 +407,8 @@ render_reference(const project::ProjectDocument &document, const AuthoringViewpo
                                 invalid("normal-map tangent transform overflow"));
                     }
                     polygon.push_back(
-                        {world, normal, camera, vertex.uv.value_or(core::Vec2d{}), tangent, sign});
+                        {world, normal, camera, vertex.uv.value_or(core::Vec2d{}), tangent, sign,
+                         vertex.color.value_or(core::Vec4d{1, 1, 1, 1})});
                 }
                 if (program.normal_mapping() &&
                     (polygon[0].tangent_sign != polygon[1].tangent_sign ||
@@ -479,7 +489,17 @@ render_reference(const project::ProjectDocument &document, const AuthoringViewpo
                                     return Result::failure(evaluated.error());
                                 sampled = std::move(evaluated.value());
                             }
-                            const auto &material = sampled->material;
+                            auto material = sampled->material;
+                            const auto component = [&](auto member) {
+                                return std::clamp(v[0].color.*member * w[0] +
+                                                      v[1].color.*member * w[1] +
+                                                      v[2].color.*member * w[2],
+                                                  0.0, 1.0);
+                            };
+                            material.base_color_factor.x *= component(&core::Vec4d::x);
+                            material.base_color_factor.y *= component(&core::Vec4d::y);
+                            material.base_color_factor.z *= component(&core::Vec4d::z);
+                            material.base_color_factor.w *= component(&core::Vec4d::w);
                             if (material.alpha_mode == render::AlphaMode::masked &&
                                 material.base_color_factor.w < material.alpha_cutoff)
                                 continue;

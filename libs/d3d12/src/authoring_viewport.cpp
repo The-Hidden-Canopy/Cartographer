@@ -33,6 +33,13 @@ namespace carto::d3d12 {
 namespace {
 using Clock = std::chrono::steady_clock;
 using core::Vec3d;
+// Private authoring vertex ABI; the public 52-byte PBR upload ABI is unchanged.
+struct AuthoringUploadVertex {
+    production::PbrUploadVertex pbr;
+    std::array<float, 4> color;
+};
+static_assert(offsetof(AuthoringUploadVertex, color) == 52);
+static_assert(sizeof(AuthoringUploadVertex) == 68);
 // Logical payload bound, excluding driver allocation alignment and staging.
 // A complete 4096-square RGBA8 chain needs about 85.4 MiB. Allow layered
 // material sets while retaining aggregate admission before GPU allocation.
@@ -213,6 +220,7 @@ Prepared prepare(const project::ProjectDocument &document,
         options.uv1_set = uv1;
         options.generate_tangents = tangents;
         options.material_slot_layer = need(production::authoring_material_slot_layer(mesh));
+        options.vertex_color_layer = need(production::authoring_vertex_color_layer(mesh));
         auto artifact = std::make_shared<production::RenderMeshArtifact>(
             need(production::compile_render_mesh_artifact(source, mesh, options)));
         ++timing.mesh_compile_count;
@@ -957,11 +965,12 @@ struct AuthoringViewport::Impl {
             desc.depth_compare = gpu::CompareOp::less;
             // Light radiance moved to t6: 52+9+1=62 DWORDs.
             desc.push_constant_bytes = 208;
-            desc.vertex_stride_bytes = 52;
+            desc.vertex_stride_bytes = sizeof(AuthoringUploadVertex);
             desc.vertex_attributes = {{"POSITION", 0, gpu::VertexFormat::float4, 0, 0},
                                       {"NORMAL", 0, gpu::VertexFormat::float3, 16, 0},
                                       {"TEXCOORD", 0, gpu::VertexFormat::float2, 28, 0},
-                                      {"TANGENT", 0, gpu::VertexFormat::float4, 36, 0}};
+                                      {"TANGENT", 0, gpu::VertexFormat::float4, 36, 0},
+                                      {"COLOR", 0, gpu::VertexFormat::float4, 52, 0}};
             const auto candidate_pbr = need(device->create_pipeline(desc));
             desc.debug_name = "authoring.shadow.surface";
             desc.color_format = gpu::Format::r32_float;
@@ -1174,11 +1183,12 @@ struct AuthoringViewport::Impl {
         desc.depth_write = true;
         desc.depth_compare = gpu::CompareOp::less;
         desc.push_constant_bytes = 216;
-        desc.vertex_stride_bytes = 52;
+        desc.vertex_stride_bytes = sizeof(AuthoringUploadVertex);
         desc.vertex_attributes = {{"POSITION", 0, gpu::VertexFormat::float4, 0, 0},
                                   {"NORMAL", 0, gpu::VertexFormat::float3, 16, 0},
                                   {"TEXCOORD", 0, gpu::VertexFormat::float2, 28, 0},
-                                  {"TANGENT", 0, gpu::VertexFormat::float4, 36, 0}};
+                                  {"TANGENT", 0, gpu::VertexFormat::float4, 36, 0},
+                                  {"COLOR", 0, gpu::VertexFormat::float4, 52, 0}};
         pbr = need(device->create_pipeline(desc));
         desc.debug_name = "authoring.identity";
         if (!optimized) {
@@ -1355,9 +1365,10 @@ struct AuthoringViewport::Impl {
                 used.insert(draw.geometry_key);
                 continue;
             }
-            std::vector<production::PbrUploadVertex> vertices;
+            std::vector<AuthoringUploadVertex> vertices;
             for (const auto &v : draw.mesh->vertices) {
-                production::PbrUploadVertex packed{};
+                AuthoringUploadVertex upload{};
+                auto &packed = upload.pbr;
                 packed.position = {narrow(v.position.x), narrow(v.position.y), narrow(v.position.z),
                                    1};
                 packed.normal = {narrow(v.normal.x), narrow(v.normal.y), narrow(v.normal.z)};
@@ -1375,7 +1386,9 @@ struct AuthoringViewport::Impl {
                                                      narrow(v.tangent->z), narrow(v.tangent->w)}
                               : std::array<float, 4>{narrow(tangent.x), narrow(tangent.y),
                                                      narrow(tangent.z), 1};
-                vertices.push_back(packed);
+                const auto color = v.color.value_or(core::Vec4d{1, 1, 1, 1});
+                upload.color = {narrow(color.x), narrow(color.y), narrow(color.z), narrow(color.w)};
+                vertices.push_back(upload);
             }
             auto vertex_bytes = bytes(vertices), index_bytes = bytes(draw.mesh->indices),
                  key_bytes = vertex_bytes;
@@ -2187,7 +2200,8 @@ core::Result<AuthoringGpuFrame> AuthoringViewport::render_impl(
                     m.alpha_mode == render::AlphaMode::masked ? -narrow(m.alpha_cutoff) : 1;
                 constants[52] = narrow(m.clearcoat);
                 constants[53] = narrow(m.clearcoat_roughness);
-                commands.append(device_ir::CmdBindVertexBuffer{mesh.vertex, 0, 52});
+                commands.append(device_ir::CmdBindVertexBuffer{
+                    mesh.vertex, 0, sizeof(AuthoringUploadVertex)});
                 commands.append(
                     device_ir::CmdBindIndexBuffer{mesh.index, 0, device_ir::IndexFormat::uint32});
                 auto push = bytes(constants);

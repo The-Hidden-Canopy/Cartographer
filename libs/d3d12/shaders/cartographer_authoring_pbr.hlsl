@@ -72,6 +72,9 @@ struct VertexInput
     float3 normal : NORMAL;
     float2 uv : TEXCOORD0;
     float4 tangent : TANGENT;
+#ifdef CARTO_AUTHORING_VIEWPORT
+    float4 color : COLOR0;
+#endif
 };
 
 struct VertexOutput
@@ -83,6 +86,9 @@ struct VertexOutput
     float3 world_tangent : TEXCOORD3;
     float tangent_sign : TEXCOORD4;
     nointerpolation float orientation : TEXCOORD5;
+#ifdef CARTO_AUTHORING_VIEWPORT
+    float4 color : COLOR0;
+#endif
 };
 
 VertexOutput VSMain(VertexInput input)
@@ -105,6 +111,9 @@ VertexOutput VSMain(VertexInput input)
     output.world_tangent = normalize(mul((float3x3)model, input.tangent.xyz));
     output.tangent_sign = input.tangent.w * orientation;
     output.orientation = orientation;
+#ifdef CARTO_AUTHORING_VIEWPORT
+    output.color = input.color;
+#endif
     return output;
 }
 
@@ -210,7 +219,7 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID,
     const float n_dot_v = max(dot(normal, view), 0.0);
 #ifdef CARTO_AUTHORING_SURFACE
     const float4 sampled_base=1;
-    const float3 base_color=material.base.rgb;
+    const float3 base_color=material.base.rgb * input.color.rgb;
     const float metallic=material.metallic,roughness=material.roughness;
 #else
 #ifdef CARTO_FUSED_IDENTITY
@@ -218,7 +227,11 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID,
 #else
     const float4 sampled_base = base_color_texture.Sample(linear_clamp_sampler, input.uv);
 #endif
+#ifdef CARTO_AUTHORING_VIEWPORT
+    const float3 base_color = sampled_base.rgb * base_color_factor.rgb * input.color.rgb;
+#else
     const float3 base_color = sampled_base.rgb * base_color_factor.rgb;
+#endif
 #ifdef CARTO_FUSED_IDENTITY
     const float metallic = saturate(surface_factors.x);
     const float roughness = saturate(surface_factors.y);
@@ -298,14 +311,18 @@ float4 PSMain(VertexOutput input, uint primitive : SV_PrimitiveID,
         (n_dot_l * light_radiance_range.rgb * shadow);
 #ifdef CARTO_AUTHORING_SURFACE
     const float3 emissive=material.emission;
-    const float alpha=material.base.a;
+    const float alpha=material.base.a * input.color.a;
 #else
 #ifdef CARTO_FUSED_IDENTITY
     const float3 emissive = emissive_radiance_and_f0.rgb;
 #else
     const float3 emissive = emissive_texture.Sample(linear_clamp_sampler, input.uv).rgb * emissive_radiance_and_f0.rgb;
 #endif
+#ifdef CARTO_AUTHORING_VIEWPORT
+    const float alpha = sampled_base.a * base_color_factor.a * input.color.a;
+#else
     const float alpha = sampled_base.a * base_color_factor.a;
+#endif
 #endif
     // A negative light-direction w encodes masked alpha and its cutoff. The
     // positive path remains opaque/blended-compatible for the current pass.
@@ -368,11 +385,11 @@ float4 ShadowMain(VertexOutput input) : SV_TARGET {
         const EvaluatedMaterial m=evaluate_material(input.uv,base_color_factor,
             emissive_radiance_and_f0.rgb,surface_factors,emissive_radiance_and_f0.w);
         if(!m.valid) return float4(-1,0,0,1);
-        const float alpha=m.base.a;
+        const float alpha=m.base.a * input.color.a;
 #elif defined(CARTO_FUSED_IDENTITY)
-        const float alpha=base_color_factor.a;
+        const float alpha=base_color_factor.a * input.color.a;
 #else
-        const float alpha=base_color_texture.Sample(linear_clamp_sampler,input.uv).a*base_color_factor.a;
+        const float alpha=base_color_texture.Sample(linear_clamp_sampler,input.uv).a*base_color_factor.a*input.color.a;
 #endif
         if(alpha < -light_direction_intensity.w) discard;
     }
@@ -383,7 +400,7 @@ float4 ShadowMain(VertexOutput input) : SV_TARGET {
 float4 IdentityMain(VertexOutput input, uint primitive : SV_PrimitiveID) : SV_TARGET
 {
     if (light_direction_intensity.w < 0.0 &&
-        base_color_factor.a < -light_direction_intensity.w) discard;
+        base_color_factor.a * input.color.a < -light_direction_intensity.w) discard;
     // Bounded draw/primitive ordinals are exactly representable in float32.
     // The host resolves them to full-width authored object and face IDs.
     return float4(camera_position_and_view.w + 1.0, primitive + 1.0, 0.0, 1.0);

@@ -16,6 +16,22 @@ core::Result<std::optional<std::string>> authoring_material_slot_layer(const geo
         condition?std::optional<std::string>{"condition.material_region"}:std::nullopt);
 }
 
+core::Result<std::optional<std::string>> authoring_vertex_color_layer(const geometry::EditableMesh& mesh) {
+    std::optional<std::string> selected;
+    for (const auto& [id, layer] : mesh.attributes().layers()) {
+        if (layer.descriptor.type != attributes::AttributeType::color4) continue;
+        if (layer.descriptor.domain != attributes::AttributeDomain::vertex &&
+            layer.descriptor.domain != attributes::AttributeDomain::corner)
+            return core::Result<std::optional<std::string>>::failure(
+                {core::ErrorCode::validation_failed, "authoring viewport requires vertex- or corner-domain color4"});
+        if (selected)
+            return core::Result<std::optional<std::string>>::failure(
+                {core::ErrorCode::validation_failed, "authoring viewport cannot select among multiple color layers"});
+        selected = id;
+    }
+    return core::Result<std::optional<std::string>>::success(std::move(selected));
+}
+
 core::Result<render::StandardMaterial>
 resolve_authoring_material(const project::MaterialCatalog &catalog,
                            render::MaterialId material_id,
