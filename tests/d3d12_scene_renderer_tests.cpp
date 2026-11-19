@@ -2139,9 +2139,9 @@ production::RenderMeshArtifact triangle(bool sloped = false) {
     const core::Vec3d normal = sloped ? core::Vec3d{h, 0.0, h} : core::Vec3d{0.0, 0.0, 1.0};
     const core::Vec4d tangent = sloped ? core::Vec4d{h, 0.0, -h, 1.0} : core::Vec4d{1.0, 0.0, 0.0, 1.0};
     mesh.vertices = {
-        {{1U}, {-0.7, -0.7, sloped ? 0.7 : 0.0}, normal, core::Vec2d{0.0, 1.0}, {}, {}, tangent},
-        {{2U}, {0.7, -0.7, sloped ? -0.7 : 0.0}, normal, core::Vec2d{1.0, 1.0}, {}, {}, tangent},
-        {{3U}, {0.0, 0.7, 0.0}, normal, core::Vec2d{0.5, 0.0}, {}, {}, tangent}};
+        {{1U}, {-0.7, -0.7, sloped ? 0.7 : 0.0}, normal, core::Vec2d{0.0, 1.0}, {}, {}, tangent, {}},
+        {{2U}, {0.7, -0.7, sloped ? -0.7 : 0.0}, normal, core::Vec2d{1.0, 1.0}, {}, {}, tangent, {}},
+        {{3U}, {0.0, 0.7, 0.0}, normal, core::Vec2d{0.5, 0.0}, {}, {}, tangent, {}}};
     mesh.indices = {0U, 1U, 2U}; mesh.triangle_faces = {{1U}};
     mesh.submeshes = {{std::nullopt, 0U, 3U}};
     require(static_cast<bool>(mesh.validate()), "authored test triangle validates");
@@ -2592,7 +2592,7 @@ d3d12::SceneRenderTexture texture(std::uint64_t id, std::array<std::uint8_t, 4U>
     tga.insert(tga.end(), {rgba[2U], rgba[1U], rgba[0U], rgba[3U]});
     const auto decoded = take(assets::decode_tga_rgba8(tga));
     auto mips = take(assets::generate_rgba8_mips(decoded, {semantic, assets::expected_color_space(semantic)}));
-    return {id, decoded.admission.source.digest, std::move(mips)};
+    return {id, decoded.admission.source.digest, std::move(mips), {}, assets::TextureSemantic::emissive};
 }
 d3d12::SceneRenderTexture texture_grid(std::uint64_t id,
     assets::TextureSemantic semantic = assets::TextureSemantic::base_color) {
@@ -2607,7 +2607,7 @@ d3d12::SceneRenderTexture texture_grid(std::uint64_t id,
     const auto decoded = take(assets::decode_tga_rgba8(tga));
     auto mips = take(assets::generate_rgba8_mips(decoded,
         {semantic, assets::expected_color_space(semantic)}));
-    return {id, decoded.admission.source.digest, std::move(mips)};
+    return {id, decoded.admission.source.digest, std::move(mips), {}, assets::TextureSemantic::emissive};
 }
 void rejects_stale_foreign_and_unsupported_inputs() {
     const auto valid = request(); require(static_cast<bool>(valid.validate()), "valid capture admits");
@@ -4372,11 +4372,11 @@ void explicit_temporal_resolve_uses_bound_history_and_resets_on_cut(
                         neighborhood_max = std::max(neighborhood_max, sample);
                     }
                 }
-                const float history = previous.linear_hdr_rgba[pixel + channel];
+                const float history_value = previous.linear_hdr_rgba[pixel + channel];
                 const float bounded_history = std::clamp(
-                    history, neighborhood_min, neighborhood_max);
+                    history_value, neighborhood_min, neighborhood_max);
                 history_neighborhood_clamped = history_neighborhood_clamped ||
-                    bounded_history != history;
+                    bounded_history != history_value;
                 const float expected = current.linear_hdr_rgba[pixel + channel] *
                     0.25F + bounded_history * 0.75F;
                 maximum_temporal_error = std::max(maximum_temporal_error,
