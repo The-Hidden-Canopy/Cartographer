@@ -48,6 +48,40 @@ template<std::size_t N> std::array<double,N> numbers(const std::string& text, bo
     for(auto& v:a)if(!(in>>v)||!std::isfinite(v)||v<0||(!allow_zero&&v==0))throw std::runtime_error("invalid HDR numeric metadata");
     std::string extra;if(in>>extra)throw std::runtime_error("trailing HDR numeric metadata");return a;
 }
+
+struct AxisContribution { std::uint32_t index = 0; double weight = 0; };
+struct SourcePixelWeights {
+    std::array<AxisContribution, 2> contributions{};
+    unsigned count = 0;
+};
+
+// For the streaming path the output grid is at least four times smaller than
+// the source, so a source pixel overlaps at most two bins along either axis.
+std::vector<SourcePixelWeights> streaming_weights(std::uint32_t source_extent,
+                                                  std::uint32_t target_extent,
+                                                  double scale, bool latitude) {
+    std::vector<SourcePixelWeights> result(source_extent);
+    for (std::uint32_t pixel = 0; pixel < source_extent; ++pixel) {
+        const int nearest = int(std::floor(double(pixel) / scale));
+        for (int bin = std::max(0, nearest - 1);
+             bin <= std::min(int(target_extent) - 1, nearest + 1); ++bin) {
+            const double lo = std::max(double(pixel), double(bin) * scale);
+            const double hi = std::min(double(pixel + 1), double(bin + 1) * scale);
+            if (hi <= lo) continue;
+            const double weight = latitude
+                ? std::cos(lo * std::numbers::pi / source_extent) -
+                      std::cos(hi * std::numbers::pi / source_extent)
+                : hi - lo;
+            auto &entry = result[pixel];
+            if (entry.count == entry.contributions.size() || !(weight > 0))
+                throw std::runtime_error("HDR resampling exceeded its bounded source footprint");
+            entry.contributions[entry.count++] = {std::uint32_t(bin), weight};
+        }
+        if (result[pixel].count == 0)
+            throw std::runtime_error("HDR resampling could not map a source pixel");
+    }
+    return result;
+}
 }
 
 core::Result<HdrEnvironmentImage> decode_hdr_environment_with_quality(
@@ -55,7 +89,7 @@ core::Result<HdrEnvironmentImage> decode_hdr_environment_with_quality(
     try {
         if (quality != HdrLightingQuality::standard && quality != HdrLightingQuality::high)
             throw std::runtime_error("unknown HDR lighting quality");
-        if(bytes.empty()||bytes.size()>32U*1024U*1024U)throw std::runtime_error("HDR source exceeds 32 MiB or is empty");
+        if(bytes.empty()||bytes.size()>kMaxHdrEnvironmentSourceBytes)throw std::runtime_error("HDR source exceeds 64 MiB or is empty");
         std::size_t offset=0;
         const auto line=[&]() {
             const auto begin=offset;
@@ -88,7 +122,7 @@ core::Result<HdrEnvironmentImage> decode_hdr_environment_with_quality(
         std::string ys,xs,extra;std::uint32_t h=0,w=0;std::istringstream resolution(line());
         resolution.imbue(std::locale::classic());
         if(!(resolution>>ys>>h>>xs>>w)||(resolution>>extra)||(ys!="-Y"&&ys!="+Y")||(xs!="+X"&&xs!="-X")||
-            h<2||w!=2*h||w>2048||h>1024)throw std::runtime_error("HDR environment requires Y-first 2:1 lat-long, at most 2048x1024");
+            h<2||w!=2*h||w>4096||h>2048)throw std::runtime_error("HDR environment requires Y-first 2:1 lat-long, at most 4096x2048");
         const auto source_matrix=rgb_xyz(source);
         constexpr std::array<double,8> rec709{.64,.33,.30,.60,.15,.06,.3127,.3290};
         const auto destination_matrix=inverse(rgb_xyz(rec709));
@@ -97,7 +131,22 @@ core::Result<HdrEnvironmentImage> decode_hdr_environment_with_quality(
         const auto from_white=mul(bradford,xyz(source[6],source[7]));
         const auto to_white=mul(bradford,xyz(rec709[6],rec709[7]));
         for(double v:from_white)if(v<=1e-9)throw std::runtime_error("invalid HDR white point");
-        std::vector<core::Vec3d> pixels(std::size_t(w)*h);
+        HdrEnvironmentImage result;result.source_width=w;result.source_height=h;
+        const unsigned max_height = quality == HdrLightingQuality::high ? 256U : 128U;
+        result.height=std::min(h,max_height);result.width=2*result.height;
+        result.linear_radiance.resize(std::size_t(result.width)*result.height);
+        const double scale=double(h)/result.height;
+        const bool stream = w > 2048U;
+        std::vector<core::Vec3d> pixels;
+        std::vector<double> accumulated_weights;
+        std::vector<SourcePixelWeights> horizontal_weights, latitude_weights;
+        if (stream) {
+            horizontal_weights = streaming_weights(w, result.width, scale, false);
+            latitude_weights = streaming_weights(h, result.height, scale, true);
+            accumulated_weights.resize(result.linear_radiance.size());
+        } else {
+            pixels.resize(std::size_t(w)*h);
+        }
         std::vector<std::array<std::uint8_t,4>> row(w);
         const auto byte=[&]() {if(offset>=bytes.size())throw std::runtime_error("truncated HDR pixels");return bytes[offset++];};
         for(std::uint32_t y=0;y<h;++y) {
@@ -125,15 +174,32 @@ core::Result<HdrEnvironmentImage> decode_hdr_environment_with_quality(
                 for(double c:working)if(!std::isfinite(c)||c < -1e-7||c>1e6)
                     throw std::runtime_error("HDR radiance exceeds the supported nonnegative linear Rec.709 gamut/range");
                 const auto dx=xs=="+X"?x:w-1-x,dy=ys=="-Y"?y:h-1-y;
-                pixels[std::size_t(dy)*w+dx]={std::max(0.,working[0]),std::max(0.,working[1]),std::max(0.,working[2])};
+                const core::Vec3d pixel{std::max(0.,working[0]),std::max(0.,working[1]),std::max(0.,working[2])};
+                if (!stream) {
+                    pixels[std::size_t(dy)*w+dx]=pixel;
+                } else {
+                    const auto &columns = horizontal_weights[dx];
+                    const auto &rows = latitude_weights[dy];
+                    for (unsigned yi=0; yi<rows.count; ++yi)
+                        for (unsigned xi=0; xi<columns.count; ++xi) {
+                            const auto index=std::size_t(rows.contributions[yi].index)*result.width+
+                                             columns.contributions[xi].index;
+                            const double weight=rows.contributions[yi].weight*columns.contributions[xi].weight;
+                            result.linear_radiance[index]=result.linear_radiance[index]+pixel*weight;
+                            accumulated_weights[index]+=weight;
+                        }
+                }
             }
         }
         if(offset!=bytes.size())throw std::runtime_error("trailing data after HDR image");
-        HdrEnvironmentImage result;result.source_digest=sha256(bytes);result.source_width=w;result.source_height=h;
-        const unsigned max_height = quality == HdrLightingQuality::high ? 256U : 128U;
-        result.height=std::min(h,max_height);result.width=2*result.height;result.linear_radiance.resize(std::size_t(result.width)*result.height);
-        const double scale=double(h)/result.height;
-        for(unsigned y=0;y<result.height;++y)for(unsigned x=0;x<result.width;++x) {
+        result.source_digest=sha256(bytes);
+        if (stream) {
+            for (std::size_t i=0; i<result.linear_radiance.size(); ++i) {
+                if (!(accumulated_weights[i] > 0))
+                    throw std::runtime_error("HDR resampling left an empty lighting bin");
+                result.linear_radiance[i]=result.linear_radiance[i]*(1/accumulated_weights[i]);
+            }
+        } else for(unsigned y=0;y<result.height;++y)for(unsigned x=0;x<result.width;++x) {
             core::Vec3d sum{};double weight=0;
             const double x0=x*scale,x1=(x+1)*scale,y0=y*scale,y1=(y+1)*scale;
             for(unsigned sy=unsigned(y0);sy<std::min(h,unsigned(std::ceil(y1)));++sy) {

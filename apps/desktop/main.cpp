@@ -10928,8 +10928,8 @@ struct DesktopState {
             if (path) {
                 std::ifstream input(*path, std::ios::binary | std::ios::ate);
                 const auto length = input ? input.tellg() : std::streampos(-1);
-                if (length <= 0 || length > std::streamoff(32U * 1024U * 1024U)) {
-                    action_feedback = "HDR source must be readable and at most 32 MiB; existing lighting retained.";
+                if (length <= 0 || length > std::streamoff(carto::assets::kMaxHdrEnvironmentSourceBytes)) {
+                    action_feedback = "HDR source must be readable and at most 64 MiB; existing lighting retained.";
                     action_feedback_error = true;
                 } else {
                     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(length));

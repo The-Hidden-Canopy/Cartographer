@@ -2,6 +2,7 @@
 #include "authoring_shadow_fixture.hpp"
 #include "authoring_surface_fixture.hpp"
 #include "authoring_triangle_budget_fixture.hpp"
+#include <carto/assets/hdr_environment.hpp>
 #include <carto/d3d12/authoring_viewport.hpp>
 #include <carto/d3d12/device.hpp>
 #include <carto/device_ir/command.hpp>
@@ -11,6 +12,22 @@
 #include <iostream>
 
 namespace {
+std::vector<std::uint8_t> constant_4k_hdr() {
+    const std::string header = "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n"
+        "PRIMARIES=.64 .33 .30 .60 .15 .06 .3127 .3290\n\n-Y 2048 +X 4096\n";
+    std::vector<std::uint8_t> encoded(header.begin(), header.end());
+    for (unsigned y=0; y<2048; ++y) {
+        encoded.insert(encoded.end(), {2,2,16,0});
+        for (unsigned channel=0; channel<4; ++channel)
+            for (unsigned x=0; x<4096;) {
+                const auto count=std::min(4096U-x,127U);
+                encoded.push_back(static_cast<std::uint8_t>(128+count));
+                encoded.push_back(static_cast<std::uint8_t>(channel==3 ? 130 : 64+channel*32));
+                x+=count;
+            }
+    }
+    return encoded;
+}
 void graphics_table_limits(d3d12::D3D12Device &device) {
     const std::string source =
         "float4 VSMain(uint v:SV_VertexID):SV_POSITION{return float4(0,0,0,1);}\n"
@@ -571,6 +588,28 @@ void native_environment_cases(d3d12::AuthoringViewport &renderer,
               << "; upload_bytes=" << finer_gpu.environment_upload_bytes
               << "; upload_gpu_ms=" << finer_gpu.environment_gpu_upload_milliseconds
               << "; raster_gpu_ms=" << finer_gpu.gpu_milliseconds << '\n';
+    const auto encoded_4k = constant_4k_hdr();
+    const auto decoded_4k = take(assets::decode_hdr_environment_with_quality(
+        encoded_4k, assets::HdrLightingQuality::high));
+    auto imported_4k = e;
+    imported_4k.identity = "hdr." + decoded_4k.source_digest.hex();
+    imported_4k.width = decoded_4k.width;
+    imported_4k.height = decoded_4k.height;
+    imported_4k.linear_radiance = decoded_4k.linear_radiance;
+    auto imported_fixture = environment_fixture(imported_4k);
+    auto imported_request = request(imported_fixture);
+    auto imported_cpu_request = imported_request;
+    imported_cpu_request.environment_lighting = take(production::compile_environment_lighting(
+        imported_4k, production::EnvironmentLightingQuality::standard));
+    const auto imported_cpu = take(production::render_authoring_viewport(
+        imported_fixture.document, imported_cpu_request));
+    const auto imported_gpu = take(renderer.render(
+        std::make_shared<const project::ProjectDocument>(imported_fixture.document), imported_request));
+    compare(imported_cpu, imported_gpu.image);
+    check(decoded_4k.source_width == 4096 && decoded_4k.source_height == 2048 &&
+              imported_gpu.environment_upload_bytes == 512U*591U*16U &&
+              imported_gpu.environment_resident_bytes == imported_gpu.environment_upload_bytes,
+          "decoded 4K HDR reaches the native viewport through the bounded ultra atlas");
     if (!output.empty()) {
         std::filesystem::create_directories(output);
         static_cast<void>(take(f.document.save_atomic(output / "environment-gpu.carto")));

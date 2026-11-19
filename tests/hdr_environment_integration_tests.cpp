@@ -22,6 +22,49 @@ std::vector<std::uint8_t> image(unsigned w,unsigned h,bool rle=false,std::string
     }
     return b;
 }
+std::vector<std::uint8_t> striped_image(unsigned w, unsigned h,
+                                        std::string_view y_axis, std::string_view x_axis) {
+    const auto header=std::string("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n")+primaries+"\n"+
+        std::string(y_axis)+" "+std::to_string(h)+" "+std::string(x_axis)+" "+std::to_string(w)+"\n";
+    std::vector<std::uint8_t> out(header.begin(),header.end());
+    for (unsigned y=0; y<h; ++y) {
+        const auto logical_y = y_axis == "-Y" ? y : h-1-y;
+        out.insert(out.end(),{2,2,static_cast<std::uint8_t>(w>>8),static_cast<std::uint8_t>(w)});
+        for (unsigned c=0; c<4; ++c) {
+            const auto value = [&](unsigned x) -> std::uint8_t {
+                const auto logical_x = x_axis == "+X" ? x : w-1-x;
+                if (c==0) return static_cast<std::uint8_t>(logical_x < w/3 ? 64 : 128);
+                if (c==1) return static_cast<std::uint8_t>(64 + logical_y%128);
+                return static_cast<std::uint8_t>(c==2 ? 64 : 130);
+            };
+            for (unsigned x=0; x<w;) {
+                const auto v=value(x);
+                unsigned count=1;
+                while (count<127 && x+count<w && value(x+count)==v) ++count;
+                out.push_back(static_cast<std::uint8_t>(128+count));
+                out.push_back(v);
+                x+=count;
+            }
+        }
+    }
+    return out;
+}
+core::Vec3d stripe_reference(unsigned source_width, unsigned source_height,
+                             unsigned target_height, unsigned x, unsigned y) {
+    const double scale=double(source_height)/target_height;
+    const double x0=x*scale,x1=(x+1)*scale,y0=y*scale,y1=(y+1)*scale;
+    core::Vec3d sum{}; double weight=0;
+    for (unsigned sy=unsigned(y0); sy<std::min(source_height,unsigned(std::ceil(y1))); ++sy) {
+        const double latitude=std::cos(std::max(y0,double(sy))*std::numbers::pi/source_height)-
+            std::cos(std::min(y1,double(sy+1))*std::numbers::pi/source_height);
+        for (unsigned sx=unsigned(x0); sx<std::min(source_width,unsigned(std::ceil(x1))); ++sx) {
+            const double area=(std::min(x1,double(sx+1))-std::max(x0,double(sx)))*latitude;
+            sum=sum+core::Vec3d{sx<source_width/3 ? 1. : 2., 1.+double(sy%128)/64., 1.}*area;
+            weight+=area;
+        }
+    }
+    return sum*(1/weight);
+}
 void near(double a,double b,const char* label){check(std::abs(a-b)<1e-8,label);}
 void send(application::ApplicationSession& s,const application::ApplicationAction& a){take(application::testing::dispatch(s,a));}
 double rendered_radiance(application::ApplicationSession& s) {
@@ -97,6 +140,100 @@ int main(){try {
     check(!assets::decode_hdr_environment(image(6,2)),"non lat-long extent rejected");
     const auto large=take(assets::decode_hdr_environment(image(512,256,true)));
     check(large.width==256&&large.height==128&&large.source_width==512,"higher-detail bounded lighting grid");
+    {
+        const auto four_k_source = image(4096,2048,true);
+        const auto began = std::chrono::steady_clock::now();
+        const auto four_k = take(assets::decode_hdr_environment_with_quality(
+            four_k_source, assets::HdrLightingQuality::high));
+        const auto decode_ms = std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-began).count();
+        check(four_k.source_width == 4096 && four_k.source_height == 2048 &&
+                  four_k.width == 512 && four_k.height == 256,
+              "4K HDR sources produce a bounded high-detail lighting grid");
+        double source_energy=0, output_energy=0;
+        for (unsigned y=0; y<2048; ++y)
+            source_energy+=(1+double(y%128)/64)*
+                (std::cos(y*std::numbers::pi/2048)-std::cos((y+1)*std::numbers::pi/2048));
+        for (unsigned y=0; y<256; ++y)
+            output_energy+=four_k.linear_radiance[y*512].x*
+                (std::cos(y*std::numbers::pi/256)-std::cos((y+1)*std::numbers::pi/256));
+        near(source_energy,output_energy,"4K streaming preserves solid-angle weighted energy");
+        const auto standard = take(assets::decode_hdr_environment(four_k_source));
+        check(standard.width==256 && standard.height==128,
+              "4K HDR sources retain the standard lower-memory grid option");
+        const auto calibrated_4k = take(assets::decode_hdr_environment_with_quality(
+            image(4096,2048,true,primaries+"EXPOSURE=2\nCOLORCORR=2 1 0.5\n"),
+            assets::HdrLightingQuality::high));
+        for (unsigned y : {0U,63U,128U,255U}) {
+            const auto index=std::size_t(y)*four_k.width+256U;
+            near(calibrated_4k.linear_radiance[index].x, four_k.linear_radiance[index].x/4,
+                 "4K streaming removes red exposure and color correction once");
+            near(calibrated_4k.linear_radiance[index].y, four_k.linear_radiance[index].y/2,
+                 "4K streaming removes green exposure and color correction once");
+            near(calibrated_4k.linear_radiance[index].z, four_k.linear_radiance[index].z,
+                 "4K streaming removes blue exposure and color correction once");
+        }
+        const auto uncompressed_source = image(4096,2048,false);
+        check(uncompressed_source.size()>32U*1024U*1024U &&
+                  uncompressed_source.size()<assets::kMaxHdrEnvironmentSourceBytes,
+              "uncompressed 4K RGBE fits the explicit encoded-input budget");
+        const auto uncompressed = take(assets::decode_hdr_environment_with_quality(
+            uncompressed_source, assets::HdrLightingQuality::high));
+        for (unsigned y : {0U, 1U, 63U, 128U, 254U, 255U})
+            for (unsigned x : {0U, 127U, 256U, 511U}) {
+                const auto index=std::size_t(y)*four_k.width+x;
+                check((four_k.linear_radiance[index]-uncompressed.linear_radiance[index]).length()<1e-8,
+                      "4K flat and RLE sources decode to the same lighting grid");
+            }
+        check(!assets::decode_hdr_environment_with_quality(
+                  std::span(four_k_source).first(four_k_source.size()-1), assets::HdrLightingQuality::high),
+              "truncated 4K sources fail without producing a partial grid");
+        project::AuthoredEnvironment imported;
+        imported.identity="hdr."+four_k.source_digest.hex();
+        imported.width=four_k.width; imported.height=four_k.height;
+        imported.linear_radiance=four_k.linear_radiance;
+        project::PresentationCatalog catalog;
+        okay(catalog.set_environment(imported));
+        const auto serialized=catalog.serialize();
+        check(serialized.starts_with("CARTOGRAPHER_PRESENTATION_CATALOG 7\n"),
+              "a high-detail 4K import uses the versioned catalog");
+        application::ApplicationSession session;
+        const auto snapshot=session.snapshot();
+        send(session,application::SetPresentationCatalogAction{
+            snapshot.project_generation,snapshot.project_revision,catalog});
+        const auto path=std::filesystem::temp_directory_path()/
+            ("cartographer-hdr-4k-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".carto");
+        send(session,application::SaveProjectAction{path,std::nullopt,{},{},false});
+        check(take(project::ProjectDocument::load(path)).presentation_catalog().serialize()==serialized,
+              "a decoded 4K HDR source survives project save and reload");
+        std::cout << "4K HDR streaming: encoded_bytes=" << four_k_source.size()
+                  << "; grid_bytes=" << four_k.linear_radiance.size()*sizeof(core::Vec3d)
+                  << "; decode_ms=" << decode_ms << '\n';
+    }
+    {
+        constexpr unsigned w=2050,h=1025;
+        const auto forward_stripes = take(assets::decode_hdr_environment_with_quality(
+            striped_image(w,h,"-Y","+X"), assets::HdrLightingQuality::high));
+        const auto reversed = take(assets::decode_hdr_environment_with_quality(
+            striped_image(w,h,"+Y","-X"), assets::HdrLightingQuality::high));
+        const unsigned split=(w/3)*forward_stripes.width/w;
+        for (unsigned y : {0U,1U,63U,128U,254U,255U})
+            for (unsigned x : {0U,split-1,split,split+1,511U}) {
+                const auto index=std::size_t(y)*forward_stripes.width+x;
+                const auto expected=stripe_reference(w,h,forward_stripes.height,x,y);
+                check((forward_stripes.linear_radiance[index]-expected).length()<1e-8,
+                      "fractional 4K-path bins agree with independent solid-angle integration");
+                check((forward_stripes.linear_radiance[index]-reversed.linear_radiance[index]).length()<1e-8,
+                      "streamed HDR axis flips preserve the same normalized directions");
+            }
+        const std::string beyond="#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 2049 +X 4098\n";
+        check(!assets::decode_hdr_environment(std::span(
+                  reinterpret_cast<const std::uint8_t*>(beyond.data()),beyond.size())),
+              "HDR dimensions beyond the 4K source bound fail explicitly");
+        const std::vector<std::uint8_t> oversized(assets::kMaxHdrEnvironmentSourceBytes+1U);
+        check(!assets::decode_hdr_environment(oversized),
+              "HDR input beyond the encoded byte budget is rejected before decoding");
+    }
     double input_energy=0,output_energy=0;
     for(unsigned y=0;y<256;++y)input_energy+=(1+double(y%128)/64)*(std::cos(y*std::numbers::pi/256)-std::cos((y+1)*std::numbers::pi/256));
     for(unsigned y=0;y<128;++y)output_energy+=large.linear_radiance[y*256].x*(std::cos(y*std::numbers::pi/128)-std::cos((y+1)*std::numbers::pi/128));

@@ -45,9 +45,10 @@ atlas layout and retains a higher-resolution source when explicitly requested.
 
 ## Remaining limits
 
-The HDR decoder still rejects sources above 2048×1024 and inputs above 32 MiB;
-it does not yet stream 4K HDR files. The high-detail desktop choice has not
-been exercised interactively. Existing compiler warnings remain in unrelated
+At this checkpoint the HDR decoder rejected sources above 2048×1024 and inputs
+above 32 MiB. The later [4K streaming follow-up](authoring-hdr-4k-stream-20261119.md)
+raises those input limits while retaining bounded lighting grids. The high-detail
+desktop choice has not been exercised interactively. Existing compiler warnings remain in unrelated
 application and bundled UI sources. The bottle's scene-refraction band and
 gray appearance, offscreen and layered refraction, transparent shadows,
 cross-engine matched captures, motion and isolated performance acceptance are
