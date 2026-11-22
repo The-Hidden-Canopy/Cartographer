@@ -921,9 +921,79 @@ void authoring_region_aliases_prepare_and_missing_regions_refuse() {
         "refused preparation selects no revision");
 }
 
+// Scratch-only fragment for tests/preparation_operation_tests.cpp.
+// Insert immediately before its anonymous namespace closes; reuse two_region_quad().
+void write_native_v4_revision_pair(const std::filesystem::path& root) {
+    using namespace carto;
+    static_assert(project::MaterialCatalog::kSchemaVersion == 4U,
+                  "Use Cartographer 8f80444380dd914b2511ad6d5ed46cff968203a2");
+    require(std::filesystem::create_directory(root), "fresh existing-parent scratch root required");
+    project::ProjectDocument doc;
+    journal::Journal journal(root / "draft.journal");
+    auto seed = project::ProjectTransaction::begin(doc, journal, "prepared-fixture");
+    require(bool(seed), "begin fixture transaction");
+    require(bool(seed.value().insert_mesh(10U, two_region_quad())), "insert stable mesh 10");
+    require(bool(seed.value().insert_object(scene::SceneObject{
+        scene::ObjectId{20U}, "Prepared paint panel", {}, std::nullopt, 10U, true, false})),
+        "insert sole stable object 20");
+    project::MaterialCatalog catalog;
+    render::MaterialAsset paint;
+    paint.id = 300U;
+    paint.name = "Fixture paint";
+    paint.revision = core::Revision{1U};
+    paint.definition.roughness = 0.35;
+    paint.definition.clearcoat = 0.75;
+    paint.definition.clearcoat_roughness = 0.25;
+    paint.definition.base_color_factor = {1.0, 1.0, 1.0, 1.0};
+    render::MaterialAsset rubber;
+    rubber.id = 301U;
+    rubber.name = "Fixture rubber";
+    rubber.revision = core::Revision{1U};
+    rubber.definition.roughness = 0.8;
+    require(bool(catalog.insert_material(paint)) && bool(catalog.insert_material(rubber)),
+        "insert original scalar materials");
+    project::MaterialVariant satin;
+    satin.id = 77U;
+    satin.name = "Fixture satin";
+    satin.base_material = 300U;
+    satin.revision = core::Revision{1U};
+    satin.permitted_mesh_assets = {10U};
+    satin.overrides.roughness = 0.65;
+    require(bool(catalog.insert_variant(satin)) &&
+        bool(catalog.insert_assignment({{10U, 7U}, 300U, 77U})) &&
+        bool(catalog.insert_assignment({{10U, 8U}, 301U, std::nullopt})) &&
+        bool(seed.value().set_material_catalog(catalog)) &&
+        bool(seed.value().commit("fixture-create")),
+        "commit mesh, root and scalar materials");
+    require(doc.revision().value() == 3U, "expected revision 3 after real authoring operations");
+
+    // Real catalog edits to reach protocol fixture revision 9. No raw revision/manifest rewriting.
+    auto edit = [&](const core::Vec4d color, std::uint64_t revision) {
+        paint.definition.base_color_factor = color;
+        paint.revision = core::Revision{revision};
+        require(bool(catalog.replace_material(paint)), "replace matched paint identity");
+        auto change = project::ProjectTransaction::begin(doc, journal, "prepared-fixture");
+        require(bool(change) && bool(change.value().set_material_catalog(catalog)) &&
+            bool(change.value().commit("fixture-paint-color")), "commit material-only change");
+    };
+    for (std::uint64_t i = 0; i < 6; ++i)
+        edit({0.5 + static_cast<double>(i) / 16.0, 0.8, 0.7, 1.0}, i + 2U);
+    require(doc.revision().value() == 9U &&
+        bool(doc.save_atomic(root / "r9.carto")), "save native revision 9");
+    const auto ns = doc.source_namespace();
+    edit({0.25, 0.5, 0.75, 1.0}, 8U);
+    require(doc.revision().value() == 10U && doc.source_namespace() == ns &&
+        bool(doc.save_atomic(root / "r10.carto")), "save same-namespace native revision 10");
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 3 && std::string_view(argv[1]) == "--write-v4-pair") {
+        write_native_v4_revision_pair(argv[2]);
+        return EXIT_SUCCESS;
+    }
+    if (argc != 1) return EXIT_FAILURE;
     one_operation_is_shared_complete_and_last_valid();
     authoring_region_aliases_prepare_and_missing_regions_refuse();
     invalid_or_stale_requests_fail_before_mutation();
