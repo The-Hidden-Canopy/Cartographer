@@ -124,10 +124,13 @@ def original_boxes(variant):
               "wheels": wheels, "front-clip": clip}
     return [(panel, box, region) for panel in PANELS for box, region in merged[panel]]
 
+# Center + half extents of the three authored shell-split boxes (front
+# structure in body, door band in doors, rear structure in body). fold_shell
+# unions these; it must never hardcode the result.
 SHELL_SPLIT = (
-    (0, -0.075, -1.7625, 0.95, 0.175, 1.1875),
+    (0, -0.075, -1.4625, 0.95, 0.175, 0.8875),
     (0, -0.075, 0, 0.95, 0.175, 1.175),
-    (0, -0.075, 1.7625, 0.95, 0.175, 1.1875),
+    (0, -0.075, 1.4625, 0.95, 0.175, 0.8875),
 )
 
 FAILURES = []
@@ -380,7 +383,10 @@ def fold_shell(tagged_boxes):
 
     ``tagged_boxes`` is a list of ``(panel, (center, half, region))``. The
     split boxes live in the body and doors panels; the folded shell is
-    reported under the body panel.
+    reported under the body panel. The folded extents are the union of the
+    three authored boxes, computed here — never hardcoded — so the fidelity
+    proof only passes when the authored source actually reconstructs the
+    original WWK blockout shell.
     """
     split = {tuple(round(value, 6) for value in candidate[:3]): candidate
              for candidate in SHELL_SPLIT}
@@ -393,8 +399,23 @@ def fold_shell(tagged_boxes):
         return tagged_boxes
     kept = [(panel, box) for panel, box in tagged_boxes
             if tuple(round(value, 6) for value in box[0]) not in split]
-    shell = ((0.0, -0.075, 0.0), (0.95, 0.175, 2.35),
-             found[tuple(round(v, 6) for v in SHELL_SPLIT[0][:3])][1][2])
+    boxes = [box for _panel, box in found.values()]
+    # The three slabs must share one x/y cross-section and form a single
+    # contiguous z-solid; otherwise they are not a fold of one shell box.
+    cross_sections = {(box[0][0], box[0][1], box[1][0], box[1][1])
+                      for box in boxes}
+    intervals = sorted((box[0][2] - box[1][2], box[0][2] + box[1][2])
+                       for box in boxes)
+    if len(cross_sections) != 1 or any(
+            intervals[index][1] < intervals[index + 1][0] - 1e-9
+            for index in range(len(intervals) - 1)):
+        return tagged_boxes
+    x_center, y_center, x_half, y_half = next(iter(cross_sections))
+    z_min = intervals[0][0]
+    z_max = intervals[-1][1]
+    region = found[tuple(round(v, 6) for v in SHELL_SPLIT[0][:3])][1][2]
+    shell = ((x_center, y_center, (z_min + z_max) / 2),
+             (x_half, y_half, (z_max - z_min) / 2), region)
     return kept + [("body", shell)]
 
 
