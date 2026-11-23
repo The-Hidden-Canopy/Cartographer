@@ -335,7 +335,7 @@ render_reference(const project::ProjectDocument &document, const AuthoringViewpo
                 const auto key = std::pair{assignment->second.material, assignment->second.variant};
                 auto ready = programs.find(key);
                 if (ready == programs.end()) {
-                    if (programs.size() == 32)
+                    if (programs.size() >= kAuthoringMaxMaterialPrograms)
                         return Result::failure(
                             invalid("reference viewport material program budget exceeded"));
                     auto resolved = compile_authoring_material(catalog, key.first, key.second,

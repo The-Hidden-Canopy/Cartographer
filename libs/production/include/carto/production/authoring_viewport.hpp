@@ -24,6 +24,11 @@ inline constexpr std::uint64_t kAuthoringNativeAttachmentBudget = 1024ULL * 1024
 // per-mesh, primitive-ID, geometry
 // cache and material-residency bounds remain independent admission gates.
 inline constexpr std::uint64_t kAuthoringMaxSceneTriangles = 4'194'304ULL;
+inline constexpr std::size_t kAuthoringMaxMaterialPrograms = 64;
+inline constexpr std::uint64_t kAuthoringDefaultGeometryBytes = 64ULL * 1024 * 1024;
+// Detailed articulated assets may opt into a larger prepared-geometry cache.
+// The default request and per-request accounting still bound ordinary views.
+inline constexpr std::uint64_t kAuthoringMaxGeometryBytes = 160ULL * 1024 * 1024;
 // Native material draws are separately bounded; instanced detailed component
 // pairs may share geometry while retaining independent transforms and regions.
 inline constexpr std::uint64_t kAuthoringNativeMaxDraws = 4'096ULL;
@@ -99,6 +104,8 @@ struct AuthoringViewportRequest {
         std::uint64_t session = 0;
         render::TemporalReprojectionSettings settings;
     } temporal;
+    // Native prepared and resident geometry, including immutable-snapshot cache hits.
+    std::uint64_t native_geometry_byte_budget = kAuthoringDefaultGeometryBytes;
 };
 
 struct DirectionalShadowFrame {

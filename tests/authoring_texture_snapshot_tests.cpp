@@ -53,6 +53,21 @@ int main() {
         }
         check(bool(frozen->prepare(original_pixels.record, semantic, color_space)),
               "snapshot must outlive the original library");
+        production::AuthoringTextureLibrary many;
+        auto tile = missing.record;
+        for (unsigned id = 1; id <= 64; ++id) {
+            tile.id = id;
+            okay(many.admit(tile, missing.encoded));
+        }
+        auto filled = take(many.snapshot());
+        check(filled->resident_bytes() == 64 * 4 && bool(filled->prepare(tile, semantic, color_space)),
+              "all 64 source entries must survive the snapshot");
+        tile.id = 65;
+        check(!many.admit(tile, missing.encoded) && many.resident_bytes() == 64 * 4,
+              "overflow must preserve every admitted source");
+        okay(many.admit(replacement.record, replacement.encoded));
+        check(many.resident_bytes() == 63 * 4 + 8,
+              "a full library still accepts a replacement and accounts its new size");
         return 0;
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';

@@ -41,6 +41,7 @@ assets::TextureSourceLimits authoring_texture_limits() {
 }
 namespace {
 constexpr std::uint64_t kDecodedBudget = 256U * 1024U * 1024U, kMipBudget = 352U * 1024U * 1024U;
+constexpr std::size_t kTextureSourceBudget = 64;
 struct BoundTexture {
     render::TextureRef binding;
     project::SamplerIntent sampler;
@@ -232,7 +233,7 @@ core::Result<void> AuthoringTextureLibrary::admit(const project::TextureSourceRe
         std::lock_guard lock(impl_->mutex);
         auto old = impl_->entries.find(record.id);
         const auto prior = old == impl_->entries.end() ? 0U : old->second.decoded.pixels.size();
-        if ((old == impl_->entries.end() && impl_->entries.size() == 16) ||
+        if ((old == impl_->entries.end() && impl_->entries.size() >= kTextureSourceBudget) ||
             impl_->decoded_bytes - prior + decoded.pixels.size() > kDecodedBudget)
             throw std::runtime_error("decoded texture library budget exceeded");
         std::uint64_t retired = 0;
@@ -293,7 +294,7 @@ AuthoringTextureLibrary::snapshot() const {
     try {
         auto copy = std::make_shared<AuthoringTextureLibrary>();
         std::lock_guard lock(impl_->mutex);
-        if (impl_->entries.size() > 16U || impl_->decoded_bytes > kDecodedBudget)
+        if (impl_->entries.size() > kTextureSourceBudget || impl_->decoded_bytes > kDecodedBudget)
             return Result::failure(invalid("decoded library exceeds its snapshot budget"));
         std::uint64_t copied_bytes = 0;
         for (const auto &[id, entry] : impl_->entries) {

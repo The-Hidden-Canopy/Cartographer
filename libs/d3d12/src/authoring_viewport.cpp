@@ -154,6 +154,7 @@ struct Prepared {
         render::PbrLight light;
         bool casts_shadows = false;
     };
+    std::uint64_t geometry_bytes = 0;
     assets::Sha256Digest source_digest;
     production::AuthoringView view;
     render::PbrLight light{{0, 0, 1}, {0, 0, 0}};
@@ -218,7 +219,7 @@ Prepared prepare(const project::ProjectDocument &document,
     std::map<std::pair<render::MaterialId, std::optional<project::MaterialVariantId>>,
              std::shared_ptr<const production::AuthoringMaterialGpuPacket>>
         packets;
-    std::uint64_t triangles = 0, geometry_bytes = 0;
+    std::uint64_t triangles = 0;
     const auto compile_artifact = [&](std::uint64_t id, std::optional<render::UvSetId> uv,
                                       bool tangents, std::optional<render::UvSetId> uv1 = {}) {
         const auto &mesh = document.meshes().at(id);
@@ -257,10 +258,12 @@ Prepared prepare(const project::ProjectDocument &document,
             }
         if (!artifact)
             artifact = candidate ? std::move(candidate) : compile_artifact(id, uv, tangents, uv1);
-        geometry_bytes += artifact->vertices.size() * sizeof(production::RenderMeshVertex) +
+        out.geometry_bytes += artifact->vertices.size() * sizeof(production::RenderMeshVertex) +
                           artifact->indices.size() * 4;
-        if (geometry_bytes > 64U * 1024U * 1024U)
-            throw std::runtime_error("GPU prepared geometry byte budget exceeded");
+        if (out.geometry_bytes > request.native_geometry_byte_budget)
+            throw std::runtime_error("GPU prepared geometry byte budget exceeded at mesh " + std::to_string(id) +
+                                     " (" + std::to_string(out.geometry_bytes) + " bytes, limit " +
+                                     std::to_string(request.native_geometry_byte_budget) + ")");
         next_cache.emplace(key, artifact);
         return artifact;
     };
@@ -299,32 +302,45 @@ Prepared prepare(const project::ProjectDocument &document,
         triangles += base->indices.size() / 3;
         if (triangles > production::kAuthoringMaxSceneTriangles)
             throw std::runtime_error("GPU viewport triangle budget exceeded");
+        // All regions of a mesh using the same primary chart can share its tangent
+        // stream. Determine the richest required layout before admitting geometry
+        // so material-slot traversal order cannot duplicate the complete mesh.
+        std::set<render::UvSetId> tangent_charts;
+        const auto &catalog = document.material_catalog();
+        for (const auto &region : base->submeshes) {
+            const auto assignment = catalog.assignments().find(
+                {*object.mesh_asset,region.material_slot.value_or(0)});
+            if (assignment == catalog.assignments().end()) continue;
+            const auto key = std::pair{assignment->second.material,assignment->second.variant};
+            auto ready = programs.find(key);
+            if (ready == programs.end()) {
+                if (programs.size() >= production::kAuthoringMaxMaterialPrograms)
+                    throw std::runtime_error(
+                        "GPU viewport material program budget exceeded");
+                ready =
+                    programs
+                        .emplace(key,
+                                 need(production::compile_authoring_material(
+                                     catalog, key.first, key.second, request.textures.get())))
+                        .first;
+                packets.emplace(key,
+                                std::make_shared<const production::AuthoringMaterialGpuPacket>(
+                                    need(ready->second.gpu_packet())));
+            }
+            const auto &program = ready->second;
+            if (program.normal_mapping() && program.uv_set())
+                tangent_charts.insert(*program.uv_set());
+        }
         for (const auto &submesh : base->submeshes) {
             phase = Clock::now();
             production::AuthoringMaterialProgram program;
             std::shared_ptr<const production::AuthoringMaterialGpuPacket> packet;
             render::StandardMaterial material;
-            const auto &catalog = document.material_catalog();
             if (const auto assignment = catalog.assignments().find(
                     {*object.mesh_asset, submesh.material_slot.value_or(0)});
                 assignment != catalog.assignments().end()) {
                 const auto key = std::pair{assignment->second.material, assignment->second.variant};
-                auto ready = programs.find(key);
-                if (ready == programs.end()) {
-                    if (programs.size() == 32)
-                        throw std::runtime_error(
-                            "GPU viewport supports at most 32 material programs");
-                    ready =
-                        programs
-                            .emplace(key,
-                                     need(production::compile_authoring_material(
-                                         catalog, key.first, key.second, request.textures.get())))
-                            .first;
-                    packets.emplace(key,
-                                    std::make_shared<const production::AuthoringMaterialGpuPacket>(
-                                        need(ready->second.gpu_packet())));
-                }
-                program = ready->second;
+                program = programs.at(key);
                 packet = packets.at(key);
                 material = packet->material;
                 // The constant shader has no transmission lane. Even a
@@ -351,7 +367,7 @@ Prepared prepare(const project::ProjectDocument &document,
                 active = artifact_for(*object.mesh_asset, render::kUv0, true, secondary);
                 material_uv_is_secondary = secondary.has_value();
             } else {
-                active = artifact_for(*object.mesh_asset, material_uv, program.normal_mapping(), {},
+                active = artifact_for(*object.mesh_asset, material_uv, material_uv && tangent_charts.contains(*material_uv), {},
                                       !material_uv && cold_untextured_layout ? base : nullptr);
             }
             if (active != base) {
@@ -1079,8 +1095,8 @@ struct AuthoringViewport::Impl {
         };
         for (const auto &draw : scene.draws) {
             if (!draw.surface || !admitted_sets.insert(draw.surface_key).second) continue;
-            if (admitted_sets.size() > 32)
-                throw std::runtime_error("GPU material residency exceeds 32 programs");
+            if (admitted_sets.size() > production::kAuthoringMaxMaterialPrograms)
+                throw std::runtime_error("GPU material residency program budget exceeded");
             admit_bytes(draw.surface->words.size() * 16U);
             for (const auto &map : draw.surface->maps)
                 if (map && admitted_maps.insert(map->artifact_digest.hex()).second)
@@ -1178,8 +1194,8 @@ struct AuthoringViewport::Impl {
                 set->program = upload(set->resources, desc, bytes(packet.words), nullptr);
                 next_sets.emplace(key, std::move(set));
             }
-        if (next_sets.size() > 32)
-            throw std::runtime_error("GPU material residency exceeds 32 programs");
+        if (next_sets.size() > production::kAuthoringMaxMaterialPrograms)
+            throw std::runtime_error("GPU material residency program budget exceeded");
         for (const auto &[key, map] : next_textures) {
             static_cast<void>(key);
             frame.material_resident_bytes += map->size;
@@ -1436,7 +1452,7 @@ struct AuthoringViewport::Impl {
         height = h;
         ++generation;
     }
-    void geometry(Prepared &scene, AuthoringGpuFrame &frame) {
+    void geometry(Prepared &scene, AuthoringGpuFrame &frame,std::uint64_t byte_budget) {
         std::set<std::string> used;
         for (auto &draw : scene.draws) {
             if (optimized && !draw.geometry_key.empty() && meshes.contains(draw.geometry_key)) {
@@ -1477,7 +1493,7 @@ struct AuthoringViewport::Impl {
                 auto candidate = std::make_unique<Mesh>();
                 candidate->resources = std::make_unique<Resources>(*device);
                 candidate->size = key_bytes.size();
-                if (candidate->size > 64U * 1024U * 1024U)
+                if (candidate->size > byte_budget)
                     throw std::runtime_error("GPU mesh upload byte budget exceeded");
                 candidate->vertex = candidate->resources->buffer(
                     {vertex_bytes.size(), gpu::MemoryClass::upload,
@@ -1508,7 +1524,7 @@ struct AuthoringViewport::Impl {
             static_cast<void>(key);
             frame.logical_resident_bytes += mesh->size;
         }
-        if (frame.logical_resident_bytes > 64U * 1024U * 1024U)
+        if (frame.logical_resident_bytes > byte_budget)
             throw std::runtime_error("GPU geometry residency payload budget exceeded");
     }
 };
@@ -2011,6 +2027,8 @@ core::Result<AuthoringGpuFrame> AuthoringViewport::render_impl(
                 throw std::runtime_error("native temporal renderer/atlas extent exceeds supported bounds");
         }
         const auto started = Clock::now();
+        if (request.native_geometry_byte_budget > production::kAuthoringMaxGeometryBytes)
+            throw std::runtime_error("GPU geometry byte budget request exceeds maximum");
         const bool snapshot_cached = impl_->optimized && immutable_source;
         Prepared scene;
         if (snapshot_cached) {
@@ -2024,6 +2042,8 @@ core::Result<AuthoringGpuFrame> AuthoringViewport::render_impl(
                 impl_->cached_source = immutable_source;
                 impl_->cached_textures = request.textures;
             }
+            if (impl_->cached_scene.geometry_bytes > request.native_geometry_byte_budget)
+                throw std::runtime_error("GPU prepared geometry byte budget exceeded");
             scene = impl_->cached_scene;
             scene.view = resolve_view(source, request);
             for (auto &draw : scene.draws) {
@@ -2098,7 +2118,7 @@ core::Result<AuthoringGpuFrame> AuthoringViewport::render_impl(
         }
         frame.host_timeline.resources_ready = elapsed(entry);
         const auto geometry_started = Clock::now();
-        impl_->geometry(scene, frame);
+        impl_->geometry(scene, frame, request.native_geometry_byte_budget);
         if (snapshot_cached)
             for (std::size_t i = 0; i < scene.draws.size(); ++i)
                 impl_->cached_scene.draws[i].geometry_key = scene.draws[i].geometry_key;

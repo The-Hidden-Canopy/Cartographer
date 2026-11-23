@@ -112,7 +112,27 @@ void independent_geometry_budget(d3d12::AuthoringViewport& renderer) {
           "failed preparation preserves the previous target and warm geometry cache");
     check(source_digest(good.document) == before && source_digest(overflow.document) == overflow_before,
           "admission, rejection and recovery never mutate source documents");
-    std::cout << "PASS textured storage within bound, actual overflow, warm reuse and recovery\n";
+    auto expanded = r;
+    expanded.native_geometry_byte_budget = production::kAuthoringMaxGeometryBytes;
+    const auto large = std::make_shared<const project::ProjectDocument>(overflow.document);
+    const auto detailed = take(renderer.render(large, expanded));
+    check(detailed.image.objects[center(detailed.image)] == overflow.front,
+          "explicit detail budget admits textured geometry above the default");
+    auto articulated = r;
+    articulated.native_geometry_byte_budget = 144ULL * 1024 * 1024;
+    same_image(detailed.image, take(renderer.render(large, articulated)).image);
+    const auto tightened = renderer.render(large, r);
+    check(!tightened && tightened.error().message.find("prepared geometry byte budget") != std::string::npos,
+          "the same immutable source respects a lower budget on a warm frame");
+    ++expanded.native_geometry_byte_budget;
+    const auto unbounded = renderer.render(large, expanded);
+    check(!unbounded && unbounded.error().message.find("budget request exceeds maximum") != std::string::npos,
+          "a request above the authoring maximum is refused");
+    --expanded.native_geometry_byte_budget;
+    const auto detailed_warm = take(renderer.render(large, expanded));
+    same_image(detailed.image, detailed_warm.image);
+    check(detailed_warm.geometry_upload_bytes == 0, "failed requests preserve the admitted geometry");
+    std::cout << "PASS textured storage within bound, explicit detail budget, warm refusal and recovery\n";
 }
 
 void shared_geometry_material_orders(d3d12::AuthoringViewport& renderer) {
@@ -149,6 +169,103 @@ void shared_geometry_material_orders(d3d12::AuthoringViewport& renderer) {
         check(source_digest(f.document) == before, "shared-geometry material traversal preserves source");
     }
     std::cout << "PASS shared geometry with textured/untextured materials in both orders\n";
+}
+
+void material_program_boundary(d3d12::AuthoringViewport& renderer) {
+    auto f = fixture();
+    const auto add_programs = [&](std::size_t first, std::size_t last) {
+        mutate(f.document, [&](auto& tx) {
+            auto catalog = f.document.material_catalog();
+            for (auto id = first; id <= last; ++id) {
+                auto material = catalog.materials().at(1);
+                material.id = id;
+                material.name = "Surface " + std::to_string(id);
+                material.definition.roughness = .2 + .008 * static_cast<double>(id);
+                okay(catalog.insert_material(material));
+                const auto mesh = take(tx.add_mesh(triangle()));
+                okay(tx.attach_mesh(take(tx.create_object(material.name)), mesh));
+                okay(catalog.insert_assignment({{mesh, 1U}, id, {}}));
+            }
+            okay(tx.set_material_catalog(std::move(catalog)));
+        });
+    };
+    const auto limit = production::kAuthoringMaxMaterialPrograms;
+    add_programs(3, limit);
+    const auto accepted = f.document;
+    const auto frame = take(renderer.render(accepted, request(f)));
+    const auto reference = take(production::render_authoring_viewport(accepted, request(f)));
+    add_programs(limit + 1, limit + 1);
+    const auto refused = renderer.render(f.document, request(f));
+    check(!refused && refused.error().message.find("material program budget") != std::string::npos,
+          "a scene one material above the limit is refused");
+    const auto reference_refused = production::render_authoring_viewport(f.document, request(f));
+    check(!reference_refused && reference_refused.error().message.find("material program budget") != std::string::npos,
+          "the reference viewport enforces the same material limit");
+    same_image(reference, take(production::render_authoring_viewport(accepted, request(f))));
+    same_image(frame.image, take(renderer.render(accepted, request(f))).image);
+    std::cout << "PASS material program boundary and recovery\n";
+}
+
+void mixed_tangent_region_budget(d3d12::AuthoringViewport& renderer) {
+    const auto color = pixels(101, 1, 1, {{130, 115, 90, 255}});
+    const auto normal = pixels(102, 1, 1, {{128, 128, 255, 255}});
+    auto library = std::make_shared<production::AuthoringTextureLibrary>();
+    okay(library->admit(color.record, color.encoded));
+    okay(library->admit(normal.record, normal.encoded));
+    for (const bool normal_first : {false,true}) {
+        auto f = fixture();
+        mutate(f.document, [&](auto& tx) {
+            auto mesh = islands(0, 2);
+            auto attrs = mesh.attributes();
+            auto slots = *attrs.find("cartographer.material_slot");
+            slots.values[1] = std::uint32_t{2};
+            okay(attrs.remove_layer("cartographer.material_slot"));
+            okay(attrs.add_layer(std::move(slots)));
+            okay(mesh.set_attribute_payload(std::move(attrs), mesh.uv_sets()));
+            okay(tx.replace_mesh(f.back_mesh, mesh));
+            auto placement=f.document.scene().find(f.back)->local_transform;
+            placement.translation={-5000.9,-5000.2,.5};
+            placement.scale={500,500,500};
+            okay(tx.set_object_transform(f.back,placement));
+            auto catalog = f.document.material_catalog();
+            okay(catalog.insert_texture(color.record));
+            okay(catalog.insert_texture(normal.record));
+            auto mat = catalog.materials().at(2);
+            mat.definition.base_color = {color.record.id, 9};
+            if (normal_first) mat.definition.normal = {normal.record.id, 9};
+            mat.revision = mat.revision.next();
+            okay(catalog.replace_material(mat));
+            mat.id = 3;
+            mat.name = "Second region";
+            if (normal_first) mat.definition.normal = {};
+            else mat.definition.normal = {normal.record.id, 9};
+            okay(catalog.insert_material(mat));
+            okay(catalog.insert_assignment({{f.back_mesh, 2}, 3, {}}));
+            okay(tx.set_material_catalog(std::move(catalog)));
+        });
+        auto r = request(f);
+        r.textures = library;
+        r.native_geometry_byte_budget = 3 * triangle_bytes;
+        const auto source = std::make_shared<const project::ProjectDocument>(f.document);
+        const auto frame = take(renderer.render(source, r));
+        check(frame.image.objects[center(frame.image)]==f.front, "visible anchor survives mixed layouts");
+        const auto reference=take(production::render_authoring_viewport(f.document,r));
+        std::array<unsigned,2> checked{};
+        for(std::size_t i=0;i<frame.image.objects.size();++i) {
+            if(frame.image.objects[i]!=f.back || reference.objects[i]!=f.back)continue;
+            check(frame.image.faces[i]==reference.faces[i], "shared chart preserves the source face");
+            ++checked.at(frame.image.faces[i].value-1);
+            for(std::size_t c=0;c<3;++c)
+                check(std::abs(int(frame.image.display_rgba8[4*i+c])-int(reference.display_rgba8[4*i+c]))<=1,
+                      "shared tangent layout preserves normal-mapped and diffuse shading");
+        }
+        check(checked[0]>5 && checked[1]>5, "both mixed-material regions were sampled");
+        --r.native_geometry_byte_budget;
+        const auto rejected = renderer.render(source, r);
+        check(!rejected && rejected.error().message.find("prepared geometry byte budget")!=std::string::npos,
+              "mixed regions on a warm snapshot charge one complete artifact");
+    }
+    std::cout << "PASS mixed normal and pigment regions share one chart layout in either order\n";
 }
 
 void aggregate_instance_work(d3d12::AuthoringViewport& renderer) {
@@ -254,6 +371,8 @@ int main() try {
     auto device = std::shared_ptr<d3d12::D3D12Device>(take(d3d12::D3D12Device::create({{}, false, true})));
     auto renderer = take(d3d12::AuthoringViewport::create_on_device(device));
     shared_geometry_material_orders(*renderer);
+    material_program_boundary(*renderer);
+    mixed_tangent_region_budget(*renderer);
     independent_geometry_budget(*renderer);
     aggregate_instance_work(*renderer);
     native_draw_work(*renderer);
