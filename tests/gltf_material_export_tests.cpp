@@ -488,6 +488,60 @@ std::vector<std::uint8_t> budget_source_tga(unsigned index) {
     return bytes;
 }
 
+void transmissive_ior_and_f0_are_not_conflated(const std::filesystem::path &root) {
+    project::MaterialCatalog c;
+    render::StandardMaterial glass;
+    glass.ior = 1.5;
+    glass.dielectric_f0 = .02;
+    glass.transmission = 1.0;
+    glass.thickness = .003;
+    okay(c.insert_material({31, "Default IOR with independent F0", glass, {}}));
+    auto impossible = glass;
+    impossible.ior = 1.0;
+    impossible.dielectric_f0 = .04;
+    okay(c.insert_material({32, "Unity IOR with nonzero F0", impossible, {}}));
+    okay(c.insert_assignment({{1, 1}, 31, {}}));
+    okay(c.insert_assignment({{1, 2}, 32, {}}));
+    const auto doc = material_scene(c, root / "independent-f0.carto");
+    const auto original = doc.serialize();
+    for (const auto extension : {std::string_view{".gltf"}, std::string_view{".glb"}}) {
+        const auto output = root / (std::string("independent-f0") + std::string(extension));
+        const auto report = extension == ".gltf" ? take(io::export_gltf(doc, output, {}))
+                                                   : take(io::export_glb(doc, output, {}));
+        const Payload payload(output);
+        const auto materials = array(member(payload.json, "materials"));
+        check(materials.size() == 2, "both optical materials export");
+        const auto first = member(materials[0], "extensions");
+        near(scalar(member(first, "KHR_materials_ior"), "ior"), 1.5,
+             "transmission preserves the authored default IOR");
+        near(scalar(member(first, "KHR_materials_specular"), "specularFactor"), .5,
+             "independent reflectance uses the glTF specular factor");
+        near(scalar(member(member(materials[1], "extensions"), "KHR_materials_ior"), "ior"), 1.0,
+             "unity optical IOR is preserved in standard glTF");
+        check(std::any_of(report.warnings.begin(), report.warnings.end(), [](const auto &warning) {
+                  return warning.find("dielectric reflectance") != std::string::npos &&
+                         warning.find("clamped") != std::string::npos;
+              }), "unity IOR with nonzero reflectance must be reported as a lossy projection");
+        const auto raw = read(output);
+        const auto bytes = std::span(reinterpret_cast<const std::uint8_t *>(raw.data()), raw.size());
+        const auto imported = take(io::import_gltf_materials(bytes));
+        auto material = imported.catalog.materials().begin();
+        near(material->second.definition.ior, 1.5, "transmission IOR survives reimport");
+        near(material->second.definition.dielectric_f0, .02, "representable independent F0 survives reimport");
+        ++material;
+        check(material != imported.catalog.materials().end(), "unity IOR material survives reimport");
+        near(material->second.definition.ior, 1.0, "unity IOR survives reimport");
+        near(material->second.definition.dielectric_f0, 0.0, "reported F0 clamp matches standard glTF reimport");
+        const auto scene = take(io::import_gltf_scene(bytes));
+        check(!scene.meshes.empty() && scene.materials.catalog.materials().size() == 2,
+              "complete optical scene and materials reimport");
+        const auto &scene_glass = scene.materials.catalog.materials().begin()->second.definition;
+        near(scene_glass.ior, 1.5, "scene reimport preserves optical IOR");
+        near(scene_glass.dielectric_f0, .02, "scene reimport preserves representable F0");
+    }
+    check(doc.serialize() == original, "optical export does not mutate its authoring source");
+}
+
 int main(int argc, char **argv) {
     try {
         auto root = std::filesystem::temp_directory_path() /
@@ -539,6 +593,9 @@ int main(int argc, char **argv) {
             inspect(Payload(root / "desktop-options.glb"), decoded.pixels);
             check(d.serialize() == before, "desktop export options leave the source unchanged");
         }
+        check(std::any_of(a.warnings.begin(), a.warnings.end(), [](const auto& warning) {
+            return warning.find("opaque material IOR is projected") != std::string::npos;
+        }), "legacy opaque IOR projection must be disclosed");
         if (argc == 3 && std::string_view(argv[1]) == "--fixture") {
             assets::BlobStore store(root / ".carto-assets" / "source-blobs");
             take(store.put(tga, "image/x-tga"));
@@ -581,6 +638,7 @@ int main(int argc, char **argv) {
         inspect(gltf, decoded.pixels);
         inspect(glb, decoded.pixels);
         material_v5_round_trips_through_gltf(root);
+        transmissive_ior_and_f0_are_not_conflated(root);
         {
             auto invalid = read(root / "material.gltf");
             const auto begin = invalid.find("\"emissiveFactor\":[");

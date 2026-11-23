@@ -569,24 +569,31 @@ struct GltfMaterialWriter::Impl {
             report.warnings.push_back(
                 "BLEND alpha is exported as authored; the native authoring renderer "
                 "does not yet validate blended appearance");
-        // Pre-V5 materials (IOR left at 1.5) keep the reflectance-derived IOR,
-        // so their export is unchanged. An authored IOR is exported as is, and
-        // KHR_materials_specular carries any reflectance that IOR does not imply.
-        const bool authored_ior = m.ior != 1.5;
+        // Preserve the source IOR whenever it affects transmission or volume,
+        // including an explicitly authored value equal to the default. Opaque
+        // pre-V5 materials retain their reflectance-derived projection, with
+        // an explicit warning when that changes their IOR in standard glTF.
+        const bool optical_volume = m.transmission != 0.0 || !transmission_info.empty() ||
+            m.thickness != 0.0 || !thickness_info.empty() || m.attenuation_distance != 0.0 ||
+            m.attenuation_color.x != 1.0 || m.attenuation_color.y != 1.0 || m.attenuation_color.z != 1.0;
+        const bool authored_ior = m.ior != 1.5 || optical_volume;
         const double root = std::sqrt(m.dielectric_f0);
         const double ior = authored_ior ? m.ior : (1 + root) / (1 - root);
         const bool use_ior = authored_ior || m.dielectric_f0 != 0.04;
+        if (!authored_ior && m.dielectric_f0 != 0.04)
+            report.warnings.push_back("Loss: opaque material IOR is projected from reflectance in standard glTF; "
+                                      "Cartographer reimport restores its default source IOR.");
         double specular_factor = 1.0;
         if (authored_ior) {
             const double ior_f0 = std::pow((m.ior - 1.0) / (m.ior + 1.0), 2.0);
-            specular_factor = ior_f0 > 0.0 ? m.dielectric_f0 / ior_f0 : 1.0;
-            if (specular_factor > 1.0) {
+            if (ior_f0 > 0.0) specular_factor = m.dielectric_f0 / ior_f0;
+            if ((ior_f0 == 0.0 && m.dielectric_f0 > 0.0) || specular_factor > 1.0) {
                 report.warnings.push_back("Loss: dielectric reflectance exceeds what IOR " + std::to_string(m.ior) +
                     " implies and KHR_materials_specular cannot raise it; exported reflectance is clamped.");
                 specular_factor = 1.0;
             }
         }
-        const bool use_specular = authored_ior && std::abs(specular_factor - 1.0) > 1e-9;
+        const bool use_specular = authored_ior && specular_factor != 1.0;
         const bool use_transmission = m.transmission != 0.0 || !transmission_info.empty();
         const bool use_volume = m.thickness != 0.0 || !thickness_info.empty() || m.attenuation_distance != 0.0 ||
             m.attenuation_color.x != 1.0 || m.attenuation_color.y != 1.0 || m.attenuation_color.z != 1.0;
