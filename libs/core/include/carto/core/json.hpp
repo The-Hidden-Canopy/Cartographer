@@ -22,6 +22,18 @@ struct Member {
     std::string_view raw_value;
 };
 
+enum class BoundedArrayElement { number, unsigned_pair_object };
+
+// Explicit exceptions for particular schema paths. Above the ordinary array
+// bound, pair-object rules admit only two named unsigned-integer keys.
+struct BoundedArrayRule {
+    std::vector<std::string_view> path;
+    std::size_t limit = 0U;
+    BoundedArrayElement element = BoundedArrayElement::number;
+    std::string_view first_key;
+    std::string_view second_key;
+};
+
 namespace detail {
 
 inline Diagnostic malformed(std::string message) {
@@ -135,10 +147,8 @@ inline Result<std::string> decode_string_token(std::string_view token) {
 
 class Parser {
 public:
-    explicit Parser(std::string_view text, std::vector<std::string_view> large_numeric_array_path = {},
-                    std::size_t large_numeric_array_limit = 0U)
-        : text_(text), large_numeric_array_path_(std::move(large_numeric_array_path)),
-          large_numeric_array_limit_(large_numeric_array_limit) {}
+    explicit Parser(std::string_view text, std::vector<BoundedArrayRule> array_rules = {})
+        : text_(text), array_rules_(std::move(array_rules)) {}
 
     [[nodiscard]] Result<std::vector<Member>> parse_object() {
         skip_space();
@@ -246,7 +256,54 @@ private:
         return Result<void>::success();
     }
 
-    [[nodiscard]] Result<void> parse_array_body(bool large_numeric_array = false) {
+    [[nodiscard]] Result<void> parse_unsigned_pair_object(const BoundedArrayRule& rule) {
+        if (depth_ >= kMaxDepth || cursor_ >= text_.size() || text_[cursor_] != '{' ||
+            rule.first_key.empty() || rule.second_key.empty() || rule.first_key == rule.second_key) {
+            return Result<void>::failure(malformed("JSON bounded pair entry is invalid"));
+        }
+        ++cursor_;
+        bool first = false, second = false;
+        for (unsigned index = 0U; index < 2U; ++index) {
+            skip_space();
+            const auto token = parse_string_token();
+            if (!token) return Result<void>::failure(token.error());
+            const auto key = decode_string_token(token.value());
+            if (!key) return Result<void>::failure(key.error());
+            bool* seen = key.value() == rule.first_key ? &first :
+                key.value() == rule.second_key ? &second : nullptr;
+            if (seen == nullptr || *seen)
+                return Result<void>::failure(malformed("JSON bounded pair has an unknown or duplicate key"));
+            *seen = true;
+            skip_space();
+            if (cursor_ >= text_.size() || text_[cursor_++] != ':')
+                return Result<void>::failure(malformed("JSON bounded pair has no colon"));
+            skip_space();
+            const auto start = cursor_;
+            if (cursor_ >= text_.size() || text_[cursor_] < '0' || text_[cursor_] > '9')
+                return Result<void>::failure(malformed("JSON bounded pair requires unsigned integers"));
+            if (auto number = parse_number(); !number) return number;
+            std::uint64_t value = 0U;
+            const auto result = std::from_chars(text_.data() + start, text_.data() + cursor_, value);
+            if (result.ec != std::errc{} || result.ptr != text_.data() + cursor_)
+                return Result<void>::failure(malformed("JSON bounded pair integer is invalid"));
+            skip_space();
+            const char expected = index == 0U ? ',' : '}';
+            if (cursor_ >= text_.size() || text_[cursor_++] != expected)
+                return Result<void>::failure(malformed("JSON bounded pair has invalid members"));
+        }
+        return Result<void>::success();
+    }
+
+    [[nodiscard]] Result<void> parse_array_body(const BoundedArrayRule* rule = nullptr) {
+        // Keep the legacy parser's behavior for ordinary-size metadata, even
+        // when the exporter-specific large-array rule is more restrictive.
+        if (rule && rule->element == BoundedArrayElement::unsigned_pair_object &&
+            rule->limit >= kMaxMembers) {
+            const auto start = cursor_;
+            const auto ordinary = parse_array_body();
+            if (ordinary) return ordinary;
+            cursor_ = start;
+        }
         if (depth_ >= kMaxDepth) {
             return Result<void>::failure(malformed("JSON nesting exceeds the safety limit"));
         }
@@ -263,16 +320,18 @@ private:
         }
         std::size_t elements = 0U;
         while (true) {
-            if (++elements > (large_numeric_array ? large_numeric_array_limit_ : kMaxMembers)) {
+            if (++elements > (rule ? rule->limit : kMaxMembers)) {
                 return Result<void>::failure(malformed("JSON array exceeds the member limit"));
             }
-            // The exception is only for scalar numeric provenance, never nested
-            // objects or arrays that could multiply parser work or allocations.
-            if (large_numeric_array && (cursor_ >= text_.size() ||
+            // Exceptions admit only scalar numbers or strict flat pairs, never
+            // arbitrary nested objects or arrays that multiply parser work.
+            if (rule && rule->element == BoundedArrayElement::number && (cursor_ >= text_.size() ||
                 (text_[cursor_] != '-' && (text_[cursor_] < '0' || text_[cursor_] > '9')))) {
                 return Result<void>::failure(malformed("JSON provenance array must contain numbers"));
             }
-            if (auto result = parse_value(); !result) return result;
+            const auto result = rule && rule->element == BoundedArrayElement::unsigned_pair_object
+                ? parse_unsigned_pair_object(*rule) : parse_value();
+            if (!result) return result;
             skip_space();
             if (cursor_ >= text_.size()) {
                 return Result<void>::failure(malformed("JSON array is unterminated"));
@@ -354,11 +413,12 @@ private:
             skip_space();
             const std::size_t value_start = cursor_;
             path_.push_back(key.value());
-            const bool large_array = !large_numeric_array_path_.empty() &&
-                path_.size() == large_numeric_array_path_.size() &&
-                std::equal(path_.begin(), path_.end(), large_numeric_array_path_.begin()) &&
-                cursor_ < text_.size() && text_[cursor_] == '[';
-            auto parsed = large_array ? parse_array_body(true) : parse_value();
+            const auto rule = std::find_if(array_rules_.begin(), array_rules_.end(), [this](const auto& candidate) {
+                return !candidate.path.empty() && path_.size() == candidate.path.size() &&
+                    std::equal(path_.begin(), path_.end(), candidate.path.begin());
+            });
+            auto parsed = rule != array_rules_.end() && cursor_ < text_.size() && text_[cursor_] == '['
+                ? parse_array_body(&*rule) : parse_value();
             path_.pop_back();
             if (!parsed) return Result<std::vector<Member>>::failure(parsed.error());
             const std::size_t value_end = cursor_;
@@ -385,9 +445,8 @@ private:
     }
 
     std::string_view text_;
-    std::vector<std::string_view> large_numeric_array_path_;
+    std::vector<BoundedArrayRule> array_rules_;
     std::vector<std::string> path_;
-    std::size_t large_numeric_array_limit_;
     std::size_t cursor_ = 0U;
     std::size_t depth_ = 0U;
 };
@@ -401,7 +460,12 @@ private:
 // Opt-in for one path to a numeric array; all other JSON safety limits remain unchanged.
 [[nodiscard]] inline Result<std::vector<Member>> parse_object_with_numeric_array_limit(
     std::string_view text, std::vector<std::string_view> path, std::size_t limit) {
-    return detail::Parser(text, std::move(path), limit).parse_object();
+    return detail::Parser(text, {{std::move(path), limit, BoundedArrayElement::number, {}, {}}}).parse_object();
+}
+
+[[nodiscard]] inline Result<std::vector<Member>> parse_object_with_array_rules(
+    std::string_view text, std::vector<BoundedArrayRule> rules) {
+    return detail::Parser(text, std::move(rules)).parse_object();
 }
 
 [[nodiscard]] inline Result<std::string> decode_string(std::string_view token) {

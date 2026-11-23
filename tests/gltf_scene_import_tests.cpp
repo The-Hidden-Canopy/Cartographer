@@ -208,6 +208,56 @@ int main(int argc, char **argv) {
         const auto with_metadata = replace(fixture(), "\"indices\":4,\"material\":0}",
                   std::string("\"indices\":4,\"material\":0,\"extras\":") + metadata + "}");
         check(bool(io::import_gltf_scene(with_metadata)), "large provenance scene imports");
+        const auto face_array = [](std::size_t count) {
+            std::string values = "[";
+            for (std::size_t i = 0; i < count; ++i) {
+                if (i) values += ',';
+                values += "{\"id\":1,\"region\":222}";
+            }
+            return values + "]";
+        };
+        using Element = core::json::BoundedArrayElement;
+        const std::vector<core::json::BoundedArrayRule> pair_rule{{
+            {"condition_material_region", "faces"}, 4097U,
+            Element::unsigned_pair_object, "id", "region"}};
+        const auto face_metadata = std::string("{\"condition_material_region\":{\"faces\":") +
+            face_array(4097U) + "}}";
+        check(!core::json::parse_object(face_metadata) &&
+              bool(core::json::parse_object_with_array_rules(face_metadata, pair_rule)),
+              "only the opted-in flat face-pair path admits more than 4096 entries");
+        check(bool(core::json::parse_object_with_array_rules(
+                  "{\"condition_material_region\":{\"faces\":[{\"future_metadata\":[1]}]}}", pair_rule)),
+              "ordinary-sized metadata retains the legacy permissive behavior");
+        for (const auto bad : {
+                "{\"id\":1,\"region\":[1]}", "{\"id\":1,\"id\":2}",
+                "{\"id\":1,\"region\":2,\"extra\":3}", "{\"id\":-1,\"region\":2}",
+                "{\"id\":1.5,\"region\":2}", "{\"id\":18446744073709551616,\"region\":2}"}) {
+            auto prefix = face_array(4096U);
+            prefix.pop_back();
+            const auto invalid = std::string("{\"condition_material_region\":{\"faces\":") +
+                prefix + "," + bad + "]}}";
+            check(!core::json::parse_object_with_array_rules(invalid, pair_rule),
+                  "face provenance refuses nested, duplicate, extra or invalid scalar members");
+        }
+        check(!core::json::parse_object_with_array_rules(
+                  std::string("{\"condition_material_region\":{\"faces\":") + face_array(4098U) + "}}", pair_rule),
+              "face provenance retains its explicit element bound");
+        const std::vector<core::json::BoundedArrayRule> importer_limit{{
+            {"condition_material_region", "faces"}, 200000U,
+            Element::unsigned_pair_object, "id", "region"}};
+        check(!core::json::parse_object_with_array_rules(
+                  std::string("{\"condition_material_region\":{\"faces\":") + face_array(200001U) + "}}", importer_limit),
+              "the importer's 200000-face boundary is enforced");
+        check(!core::json::parse_object_with_array_rules(
+                  std::string("{\"unrelated\":") + face_array(4097U) + "}", pair_rule),
+              "unrelated object arrays keep their ordinary bound");
+        const auto both_regions = replace(fixture(), "\"indices\":4,\"material\":0}]}",
+            std::string("\"indices\":4,\"material\":0,\"extras\":") + face_metadata +
+            "}],\"extras\":" + face_metadata + "}");
+        const auto imported_regions = take(io::import_gltf_scene(both_regions));
+        check(std::any_of(imported_regions.warnings.begin(), imported_regions.warnings.end(),
+                  [](const auto& warning) { return warning.find("not reconstructed") != std::string::npos; }),
+              "large exporter face metadata imports with an explicit provenance-loss warning");
         const auto root =
             std::filesystem::temp_directory_path() /
             ("static-gltf-import-" +

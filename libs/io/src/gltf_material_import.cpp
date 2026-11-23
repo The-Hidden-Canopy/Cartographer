@@ -31,10 +31,27 @@ template <class T> T need(core::Result<T> r) {
 }
 using Object = std::vector<core::json::Member>;
 Object object(std::string_view s) { return need(core::json::parse_object(s)); }
-// Allow only the exporter provenance path, capped at the face admission limit.
-// Each caller supplies the remaining path when reparsing a nested object.
+// Allow only exporter provenance paths, capped at the face admission limit.
+// Each caller supplies the remaining numeric path when reparsing an object.
 Object provenance_object(std::string_view s, std::vector<std::string_view> path) {
-    return need(core::json::parse_object_with_numeric_array_limit(s, std::move(path), 200000U));
+    using Rule = core::json::BoundedArrayRule;
+    using Element = core::json::BoundedArrayElement;
+    std::vector<Rule> rules;
+    auto parent = path;
+    if (!path.empty()) {
+        rules.push_back({path, 200000U, Element::number, {}, {}});
+        parent.pop_back();
+    }
+    auto region = parent;
+    region.insert(region.end(), {"condition_material_region", "faces"});
+    rules.push_back({std::move(region), 200000U, Element::unsigned_pair_object, "id", "region"});
+    const auto primitive = std::find(path.begin(), path.end(), "primitives");
+    if (primitive != path.end()) {
+        std::vector<std::string_view> mesh_region(path.begin(), primitive);
+        mesh_region.insert(mesh_region.end(), {"extras", "condition_material_region", "faces"});
+        rules.push_back({std::move(mesh_region), 200000U, Element::unsigned_pair_object, "id", "region"});
+    }
+    return need(core::json::parse_object_with_array_rules(s, std::move(rules)));
 }
 std::string_view get(const Object &o, std::string_view key, std::string_view fallback = "") {
     const auto *p = core::json::find_member(o, key);
@@ -813,7 +830,7 @@ core::Result<ImportedGltfScene> import_gltf_scene(std::span<const std::uint8_t> 
             fields(source, {"name", "primitives", "extras"});
             if (const auto extra = get(source, "extras"); !extra.empty() && extra.front() == '{')
                 omitted_source_regions = omitted_source_regions ||
-                    !get(object(extra), "condition_material_region").empty();
+                    !get(provenance_object(extra, {}), "condition_material_region").empty();
             std::vector<geometry::Vertex> vertices;
             std::vector<geometry::Face> faces;
             std::vector<attributes::AttributeValue> normals, tangents, uvs, slots, colors;
