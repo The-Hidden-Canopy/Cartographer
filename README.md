@@ -476,3 +476,7 @@ Source released in this repository is licensed under the tracked
 assets held outside this repository, and third-party provenance still requires
 review before publication. The project follows the
 [Open Canopy Contract](OPEN_CANOPY_CONTRACT.md).
+
+## Download availability
+
+Official Hidden Canopy catalog: [Current download availability](https://thehiddencanopy.com/downloads.html#cartographer-coming-soon). Source/build instructions above remain the reference for this repository.
